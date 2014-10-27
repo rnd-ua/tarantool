@@ -394,7 +394,6 @@ static void* raft_writer_thread(void*) {
 }
 
 void raft_write_wal_remote(uint64_t gsn, uint32_t server_id) {
-  sleep(5);
   raft_state.host_index[server_id].buffer.server_id = RAFT_SERVER_ID;
   raft_state.host_index[server_id].buffer.lsn = gsn;
   tt_pthread_mutex_lock(&proxy_wal_writer.mutex);
