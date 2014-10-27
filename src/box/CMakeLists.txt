@@ -54,6 +54,9 @@ add_library(box
     replica.cc
     replication.cc
     bsync.cc
+    raft_common.cc
+    raft_session.cc
+    raft.cc
     ${lua_sources}
     lua/call.cc
     lua/tuple.cc

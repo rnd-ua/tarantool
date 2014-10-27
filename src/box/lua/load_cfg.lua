@@ -72,6 +72,14 @@ local default_cfg = {
     bsync_election_timeout  = 5.0,
     bsync_slow_host_timeout = 30.0,
     bsync_operation_timeout = 10.0,
+    enable_raft             = 0,
+    raft_read_timeout       = 3100,
+    raft_write_timeout      = 3100,
+    raft_connect_timeout    = 3100,
+    raft_resolve_timeout    = 3100,
+    raft_reconnect_timeout  = 3100,
+    raft_replica            = "",
+    raft_local              = "",
 }
 
 -- see template_cfg below
@@ -127,6 +135,14 @@ local template_cfg = {
     bsync_election_timeout  = 'number',
     bsync_slow_host_timeout = 'number',
     bsync_operation_timeout = 'number',
+    enable_raft             = 'number',
+    raft_read_timeout       = 'number',
+    raft_write_timeout      = 'number',
+    raft_connect_timeout    = 'number',
+    raft_resolve_timeout    = 'number',
+    raft_reconnect_timeout  = 'number',
+    raft_replica            = 'string',
+    raft_local              = 'string',
 }
 
 local function normalize_uri(port)

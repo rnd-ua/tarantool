@@ -41,17 +41,17 @@ raft_session::raft_session(tcp::socket socket)
   : opened_(true), reconnect_wait_(false), active_write_(false)
   , socket_(std::move(socket)), resolver_(socket.get_io_service())
   , timer_(socket.get_io_service()), reconnect_timeout_(boost::posix_time::not_a_date_time)
-  , i_host_(raft_state.host_map.end())
+  , host_(NULL)
 {
   init_handlers();
   do_read_header();
 }
 
-raft_session::raft_session(typename raft_host_map_t::iterator i_host)
+raft_session::raft_session(uint32_t server_id)
   : opened_(false), reconnect_wait_(false), active_write_(false)
   , socket_(raft_state.io_service), resolver_(raft_state.io_service)
   , timer_(raft_state.io_service), reconnect_timeout_(raft_state.reconnect_timeout)
-  , i_host_(i_host)
+  , host_(&raft_state.host_index[server_id])
 {
   init_handlers();
   do_connect();
@@ -66,6 +66,8 @@ void raft_session::init_handlers() {
   handlers_[raft_mtype_body] = &raft_session::handle_body;
   handlers_[raft_mtype_submit] = &raft_session::handle_submit;
   handlers_[raft_mtype_reject] = &raft_session::handle_reject;
+  handlers_[raft_mtype_proxy_request] = &raft_session::handle_proxy_request;
+  handlers_[raft_mtype_proxy_response] = &raft_session::handle_proxy_response;
 }
 
 void raft_session::reconnect() {
@@ -78,8 +80,8 @@ void raft_session::reconnect() {
 void raft_session::do_connect() {
   try {
     tcp::endpoint endpoint;
-    endpoint.address(boost::asio::ip::address::from_string(i_host_->second.host));
-    endpoint.port(i_host_->second.port);
+    endpoint.address(boost::asio::ip::address::from_string(host_->host));
+    endpoint.port(host_->port);
     start_timeout(raft_state.connect_timeout);
     socket_.async_connect(endpoint, [this](boost::system::error_code ec) {
       CANCEL_TIMER
@@ -88,7 +90,7 @@ void raft_session::do_connect() {
     });
   } catch (...) {
     start_timeout(raft_state.resolve_timeout);
-    resolver_.async_resolve(i_host_->second.host,
+    resolver_.async_resolve(host_->host,
       [this] (boost::system::error_code ec, tcp::resolver::iterator it) {
         if (ec != boost::asio::error::operation_aborted) timer_.cancel();
         if (!ec) do_connect(it); else fault(ec);
@@ -109,131 +111,105 @@ void raft_session::do_connect(tcp::resolver::iterator it) {
 
 void raft_session::handle_connect() {
   opened_ = true;
-  send(raft_mtype_hello, &raft_state.host_index[raft_state.local_id]->second.full_name[0],
-    raft_state.host_index[raft_state.local_id]->second.full_name.size());
+  send_hello();
   on_connected();
 }
 
-
-void raft_session::send(const raft_msg_body& b) {
+void raft_session::send(uint8_t type, const raft_msg_body& b) {
   enum { HEADER_LEN_MAX = 64 };
-  struct iovec* vec = (struct iovec*)calloc(b.body->bodycnt + 1, sizeof(iovec));
-  vec[0].iov_len = sizeof(raft_header) + HEADER_LEN_MAX;
-  vec[0].iov_base = calloc(vec[0].iov_len, 1);
-  char* begin = ((char*)vec[0].iov_base) + sizeof(raft_header);
+  char* buff = (char*)calloc(sizeof(raft_header) + HEADER_LEN_MAX, 1);
+  char* begin = buff + sizeof(raft_header);
   char* pos = begin;
-  ((raft_header*)vec[0].iov_base)->type = raft_mtype_body;
+  ((raft_header*)buff)->type = type;
   pos = mp_encode_uint(pos, b.gsn);
   pos = mp_encode_uint(pos, b.body->lsn);
   pos = mp_encode_uint(pos, b.body->server_id);
   pos = mp_encode_uint(pos, b.body->sync);
   pos = mp_encode_uint(pos, b.body->type);
-//    pos = mp_encode_double(pos, b.body->tm);
+  pos = mp_encode_double(pos, b.body->tm);
   pos = mp_encode_uint(pos, b.body->bodycnt);
   for (int i = 0; i < b.body->bodycnt; ++i) {
     pos = mp_encode_uint(pos, b.body->body[i].iov_len);
   }
-  vec[0].iov_len = pos - (char*)vec[0].iov_base;
-  ((raft_header*)vec[0].iov_base)->length = (uint32_t)(pos - begin);
+  ((raft_header*)buff)->length = (uint32_t)(pos - begin);
+  write_queue_.push(boost::asio::const_buffer(buff, pos - buff));
   for (int i = 0; i < b.body->bodycnt; ++i) {
-    vec[i+1].iov_len = b.body->body[i].iov_len;
-    vec[i+1].iov_base = calloc(vec[i+1].iov_len, 1);
-    memcpy(vec[i+1].iov_base, b.body->body[i].iov_base, vec[i+1].iov_len);
-    ((raft_header*)vec[0].iov_base)->length += vec[i+1].iov_len;
+    void* body_buff = calloc(b.body->body[i].iov_len, 1);
+    memcpy(body_buff, b.body->body[i].iov_base, b.body->body[i].iov_len);
+    write_queue_.push(std::move(boost::asio::const_buffer(body_buff, b.body->body[i].iov_len)));
+    ((raft_header*)buff)->length += b.body->body[i].iov_len;
   }
   say_info("[%tX] send message to %s, type %d, size %d",
-      (ptrdiff_t)this, i_host_->second.full_name.c_str(), ((raft_header*)vec[0].iov_base)->type,
-      (int)((raft_header*)vec[0].iov_base)->length);
-  ((raft_header*)vec[0].iov_base)->length = htonl(((raft_header*)vec[0].iov_base)->length);
-  write_queue_.emplace_front(b.body->bodycnt + 1, vec);
-  do_send();
-}
-
-void raft_session::send(uint8_t type, const void* data, std::size_t length) {
-  assert(this == i_host_->second.out_session.get());
-  say_debug("[%tX] send message to %s, type %d, size %d", (ptrdiff_t)this, i_host_->second.full_name.c_str(), (int)type, (int)length);
-  push_write_queue(type, data, length);
+      (ptrdiff_t)this, host_->full_name.c_str(), type,
+      (int)((raft_header*)buff)->length);
+  ((raft_header*)buff)->length = htonl(((raft_header*)buff)->length);
   do_send();
 }
 
 void raft_session::send(uint8_t type) {
-  assert(this == i_host_->second.out_session.get());
-  say_debug("[%tX] send message to %s, type %d, size 0", (ptrdiff_t)this, i_host_->second.full_name.c_str(), (int)type);
-  push_write_queue(type, 0, 0);
+  assert(this == host_->out_session.get());
+  say_debug("[%tX] send message to %s, type %d, size 0", (ptrdiff_t)this, host_->full_name.c_str(), (int)type);
+  char* buff = (char*)calloc(1, sizeof(raft_header));
+  ((raft_header*)buff)->type = type;
+  ((raft_header*)buff)->length = 0;
+  write_queue_.push(boost::asio::const_buffer(buff, sizeof(raft_header)));
+  do_send();
+}
+
+void raft_session::send(uint8_t type, uint64_t gsn) {
+  char* buff = (char*)calloc(sizeof(raft_header) + sizeof(uint64_t), 1);
+  char* begin = buff + sizeof(raft_header);
+  char* pos = mp_encode_uint(begin, gsn);
+  say_debug("[%tX] send message to %s, type %d, size %d",
+      (ptrdiff_t)this, host_->full_name.c_str(), (int)type, (int)(pos - begin));
+  ((raft_header*)buff)->type = type;
+  ((raft_header*)buff)->length = htonl((uint32_t)(pos - begin));
+  write_queue_.push(boost::asio::const_buffer(buff, pos - buff));
   do_send();
 }
 
 void raft_session::send(uint8_t type, const raft_msg_info& h) {
-  struct iovec* vec = (struct iovec*)calloc(1, sizeof(iovec));
-  vec[0].iov_len = sizeof(raft_header) + sizeof(raft_msg_info);
-  vec[0].iov_base = calloc(vec[0].iov_len, 1);
-  char* begin = ((char*)vec[0].iov_base) + sizeof(raft_header);
+  char* buff = (char*)calloc(sizeof(raft_header) + sizeof(raft_msg_info), 1);
+  char* begin = buff + sizeof(raft_header);
   char* pos = begin;
-  ((raft_header*)vec[0].iov_base)->type = type;
   pos = mp_encode_uint(pos, h.gsn);
   pos = mp_encode_uint(pos, h.lsn);
   pos = mp_encode_uint(pos, h.server_id);
   say_debug("[%tX] send message to %s, type %d, size %d",
-      (ptrdiff_t)this, i_host_->second.full_name.c_str(), (int)type, (int)(pos - begin));
-  ((raft_header*)vec[0].iov_base)->length = htonl((uint32_t)(pos - begin));
-  vec[0].iov_len = pos - (char*)vec[0].iov_base;
-  write_queue_.emplace_front(1, vec);
+      (ptrdiff_t)this, host_->full_name.c_str(), (int)type, (int)(pos - begin));
+  ((raft_header*)buff)->type = type;
+  ((raft_header*)buff)->length = htonl((uint32_t)(pos - begin));
+  write_queue_.push(boost::asio::const_buffer(buff, pos - buff));
   do_send();
 }
 
-void raft_session::do_send(int part) {
+void raft_session::send_hello() {
+  char* buff = (char*)calloc(sizeof(raft_header) + sizeof(raft_host_state), 1);
+  char* begin = buff + sizeof(raft_header);
+  char* pos = begin;
+  pos = mp_encode_uint(pos, raft_state.local_id);
+  pos = mp_encode_uint(pos, raft_state.max_gsn);
+  say_debug("[%tX] send message to %s, type %d, size %d",
+      (ptrdiff_t)this, host_->full_name.c_str(), raft_mtype_hello, (int)(pos - begin));
+  ((raft_header*)buff)->type = raft_mtype_hello;
+  ((raft_header*)buff)->length = htonl((uint32_t)(pos - begin));
+  write_queue_.push(boost::asio::const_buffer(buff, pos - buff));
+  do_send();
+}
+
+void raft_session::do_send() {
+  if (active_write_ || write_queue_.size() == 0) return;
+  active_write_ = true;
+  write_buff_ = write_queue_.split();
   start_timeout(raft_state.write_timeout);
-  boost::asio::async_write(socket_,
-    boost::asio::buffer(write_queue_.back().second[part].iov_base, write_queue_.back().second[part].iov_len),
-    boost::asio::transfer_all(),
-    [this, part] (boost::system::error_code ec, std::size_t /*length*/) {
+  boost::asio::async_write(socket_, write_buff_, boost::asio::transfer_at_least(write_buff_.size()),
+    [this](boost::system::error_code ec, std::size_t /*length*/) {
       CANCEL_TIMER
-      if (!ec) {
-        if (write_queue_.back().first > (part + 1)) do_send(part + 1);
-        else {
-          handle_send(ec);
-        }
-      } else {
-        fault(ec);
-      }
+      write_buff_.clear();
+      active_write_ = false;
+      if (!ec) socket_.get_io_service().post(boost::bind(&raft_session::do_send, this));
+      else fault(ec);
     });
-}
-
-void raft_session::push_write_queue(uint8_t type, const void* data, std::size_t size) {
-  assert(size < UINT32_MAX);
-  struct iovec* vec = NULL;
-  if (data) vec = (struct iovec*)calloc(2, sizeof(iovec));
-  else vec = (struct iovec*)calloc(1, sizeof(iovec));
-  vec[0].iov_len = sizeof(raft_header);
-  vec[0].iov_base = calloc(1, sizeof(raft_header));
-  ((raft_header*)vec[0].iov_base)->type = type;
-  ((raft_header*)vec[0].iov_base)->length = htonl((uint32_t)size);
-  if (data) {
-    vec[1].iov_len = size;
-    vec[1].iov_base = calloc(size, 1);
-    memcpy(vec[1].iov_base, data, size);
-    write_queue_.emplace_front(2, vec);
-  } else {
-    write_queue_.emplace_front(1, vec);
-  }
-}
-
-void raft_session::pop_write_queue() {
-  for (int i = 0; i < write_queue_.back().first; ++i) {
-    free(write_queue_.back().second[i].iov_base);
-  }
-  free(write_queue_.back().second);
-  write_queue_.pop_back();
-}
-
-void raft_session::handle_send(boost::system::error_code ec) {
-  active_write_ = false;
-  pop_write_queue();
-  if (!ec) {
-    socket_.get_io_service().post(boost::bind(&raft_session::do_send, this));
-  } else {
-    fault(ec);
-  }
 }
 
 uint64_t raft_session::decode(xrow_header* b) {
@@ -243,7 +219,7 @@ uint64_t raft_session::decode(xrow_header* b) {
   b->server_id = mp_decode_uint(&pos);
   b->sync = mp_decode_uint(&pos);
   b->type = mp_decode_uint(&pos);
-//    b->tm = mp_decode_double(&pos);
+  b->tm = mp_decode_double(&pos);
   b->bodycnt = mp_decode_uint(&pos);
   b->body[0].iov_len = 0;
   for (auto i = 0; i < b->bodycnt; ++i) b->body[0].iov_len += mp_decode_uint(&pos);
@@ -261,6 +237,17 @@ void raft_session::decode(raft_msg_info* info) {
   info->gsn = mp_decode_uint(&pos);
   info->lsn = mp_decode_uint(&pos);
   info->server_id = mp_decode_uint(&pos);
+}
+
+void raft_session::decode(raft_host_state* state) {
+  const char* pos = &read_buff_[0];
+  state->server_id = mp_decode_uint(&pos);
+  state->gsn = mp_decode_uint(&pos);
+}
+
+uint64_t raft_session::decode_gsn() {
+  const char* pos = &read_buff_[0];
+  return mp_decode_uint(&pos);
 }
 
 void raft_session::do_read_header() {
@@ -293,9 +280,9 @@ void raft_session::handle_read(boost::system::error_code ec, std::size_t length)
   CANCEL_TIMER
   if (!ec) {
     assert(length == read_buff_.size());
-    if (i_host_ != raft_state.host_map.end()) {
+    if (host_) {
       say_debug("[%tX] receive message from %s, code %d, size %d",
-          (ptrdiff_t)this, i_host_->second.full_name.c_str(), (int) read_header_.type, (int)length);
+          (ptrdiff_t)this, host_->full_name.c_str(), (int) read_header_.type, (int)length);
     }
     assert(read_header_.type < raft_mtype_count);
     (this->*handlers_[read_header_.type])();
@@ -306,22 +293,24 @@ void raft_session::handle_read(boost::system::error_code ec, std::size_t length)
 }
 
 void raft_session::handle_hello() {
-  std::string remote_host(read_buff_.begin(), read_buff_.end());
-  i_host_ = raft_state.host_map.find(remote_host);
-  assert(i_host_ != raft_state.host_map.end());
-  i_host_->second.in_session.reset(this);
+  raft_host_state state;
+  decode(&state);
+  assert(state.server_id < raft_state.host_index.size());
+  host_ = &raft_state.host_index[state.server_id];
+  raft_state.host_state.insert(state);
+  host_->in_session.reset(this);
   on_connected();
-  if (i_host_->second.out_session) i_host_->second.out_session->reconnect();
+  if (host_->out_session) host_->out_session->reconnect();
 }
 
 void raft_session::handle_leader_promise() {
-  if (i_host_->second.id == raft_state.max_connected_id && raft_state.state == raft_state_initial) {
+  if (host_->id == raft_state.max_connected_id && raft_state.state == raft_state_initial) {
     raft_state.state = raft_state_leader_accept;
     say_info("[%tX] raft state changed to leader_accept, possible leader are '%s'",
-        (ptrdiff_t)this, raft_state.host_index[raft_state.max_connected_id]->second.full_name.c_str());
-    i_host_->second.out_session->send(raft_mtype_leader_accept);
+        (ptrdiff_t)this, raft_state.host_index[raft_state.max_connected_id].full_name.c_str());
+    host_->out_session->send(raft_mtype_leader_accept);
   } else {
-    i_host_->second.out_session->send(raft_mtype_leader_reject);
+    host_->out_session->send(raft_mtype_leader_reject);
   }
 }
 
@@ -332,18 +321,18 @@ void raft_session::handle_leader_accept() {
 
     raft_state.gsn = raft_state.max_gsn;
     say_info("[%tX] raft state changed to ready, new leader are '%s', max_gsn=%d",
-        (ptrdiff_t)this, raft_state.host_index[raft_state.leader_id]->second.full_name.c_str(), (int)raft_state.max_gsn);
+        (ptrdiff_t)this, raft_state.host_index[raft_state.leader_id].full_name.c_str(), (int)raft_state.max_gsn);
     for (auto& host : raft_state.host_index)
-      if (!host->second.local && host->second.connected == 2)
-        host->second.out_session->send(raft_mtype_leader_submit);
+      if (!host.local && host.connected == 2)
+        host.out_session->send(raft_mtype_leader_submit);
   }
 }
 
 void raft_session::handle_leader_submit() {
   raft_state.state = raft_state_ready;
-  raft_state.leader_id = i_host_->second.id;
+  raft_state.leader_id = host_->id;
   say_info("[%tX] raft state changed to ready, new leader are '%s'",
-      (ptrdiff_t)this, raft_state.host_index[raft_state.leader_id]->second.full_name.c_str());
+      (ptrdiff_t)this, raft_state.host_index[raft_state.leader_id].full_name.c_str());
 }
 
 void raft_session::handle_leader_reject() {
@@ -354,53 +343,74 @@ void raft_session::handle_leader_reject() {
 }
 
 void raft_session::handle_body() {
-  uint64_t gsn = decode(&i_host_->second.buffer);
-  if (gsn) {
-    raft_msg_info info(gsn, i_host_->second.buffer.lsn, i_host_->second.buffer.server_id);
-    raft_write_wal(gsn, i_host_->second.id);
-    i_host_->second.out_session->send(raft_mtype_submit, info);
-  } else if (raft_state.local_id == raft_state.leader_id) {
-    // check conflicts and send submit or reject
-    gsn = ++raft_state.gsn;
-    raft_msg_info info(gsn, i_host_->second.buffer.lsn, i_host_->second.buffer.server_id);
-    raft_write_wal(gsn, i_host_->second.id);
-    for (auto& host : raft_state.host_index)
-      if (!host->second.local && host->second.connected == 2)
-        host->second.out_session->send(raft_mtype_submit, info);
+  uint64_t gsn = decode(&host_->buffer);
+  if (host_->id == raft_state.leader_id) {
+    raft_state.gsn = gsn;
+    raft_write_wal_remote(gsn, host_->id);
+  } else {
+    say_error("[%tX] receive insert operation from slave %s, gsn %td, lsn %td", (ptrdiff_t)this, host_->full_name.c_str(), gsn, host_->buffer.lsn);
   }
 }
 
 void raft_session::handle_submit() {
-  raft_msg_info info;
-  decode(&info);
-  raft_write_wal(info.gsn, info.server_id - 1);
-  if ((info.server_id - 1) != raft_state.local_id) {
-    const xrow_header* h = &raft_state.host_index[info.server_id - 1]->second.buffer;
-    for (auto i = 0; i < h->bodycnt; ++i) {
-      free(h->body[i].iov_base);
+  uint64_t gsn = decode_gsn();
+  if (raft_state.leader_id != raft_state.local_id) {
+    say_error("[%tX] slave receive submit with gsn %td from %s", (ptrdiff_t)this, gsn, host_->full_name.c_str());
+    return;
+  }
+  auto& index = raft_state.operation_index.get<raft_local_state::gsn_hash>();
+  auto i_op = index.find(gsn);
+  if (i_op != index.end()) {
+    if (++i_op->submitted > raft_state.host_index.size() / 2) {
+      raft_write_wal_local(*i_op.operator->());
+      index.erase(i_op);
+    } else {
+      say_debug("[%tX] leader received submit with gsn %td from %s status is %d", (ptrdiff_t)this, gsn, host_->full_name.c_str(), (int)i_op->submitted);
     }
+  } else {
+    say_warn("[%tX] leader received unknown submit with gsn %td from %s", (ptrdiff_t)this, gsn, host_->full_name.c_str());
   }
 }
 
 void raft_session::handle_reject() {
-  raft_msg_info info;
-  decode(&info);
-  if ((info.server_id - 1) == raft_state.local_id) {
-    // rollback operations
+  uint64_t gsn = decode_gsn();
+  if (raft_state.leader_id != raft_state.local_id) {
+    // TODO : reject all operations [gsn, ...)
   } else {
-    const xrow_header* h = &raft_state.host_index[info.server_id - 1]->second.buffer;
-    for (auto i = 0; i < h->bodycnt; ++i) {
-      free(h->body[i].iov_base);
+    auto& index = raft_state.operation_index.get<raft_local_state::gsn_hash>();
+    auto i_op = index.find(gsn);
+    if (i_op != index.end()) {
+      if (++i_op->rejected > raft_state.host_index.size() / 2) {
+        for (raft_host_data& host : raft_state.host_index) {
+          if (!host.local) host.out_session->send(raft_mtype_reject, gsn);
+        }
+        raft_rollback_local(gsn);
+      }
+    } else {
+      say_warn("[%tX] leader received unknown reject with gsn %td from %s", (ptrdiff_t)this, gsn, host_->full_name.c_str());
     }
   }
 }
 
-void raft_session::fault(boost::system::error_code ec) {
-  if (i_host_ == raft_state.host_map.end()) {
-    say_error("[%tX] fault network with unknown, reason: '%s', code: %d", (ptrdiff_t)this, ec.message().c_str(), ec.value());
+void raft_session::handle_proxy_request() {
+  decode(&host_->buffer);
+  if (raft_state.leader_id != raft_state.local_id) {
+    say_warn("[%tX] slave received proxy request with lsn %td from %s", (ptrdiff_t)this, host_->buffer.lsn, host_->full_name.c_str());
   } else {
-    say_error("[%tX] fault network with %s:%d, reason: '%s', code: %d", (ptrdiff_t)this, i_host_->second.host.c_str(),
-        i_host_->second.port, ec.message().c_str(), ec.value());
+    raft_write_wal_remote(++raft_state.gsn, host_->id);
+  }
+}
+
+void raft_session::handle_proxy_response() {
+
+}
+
+void raft_session::fault(boost::system::error_code ec) {
+  if (host_) {
+    say_error("[%tX] fault network with %s:%d, reason: '%s', code: %d", (ptrdiff_t)this, host_->host.c_str(),
+        host_->port, ec.message().c_str(), ec.value());
+  } else {
+    say_error("[%tX] fault network with unknown, reason: '%s', code: %d", (ptrdiff_t)this, ec.message().c_str(), ec.value());
   }
   if (opened_) {
     if (ec != boost::asio::error::eof) {
@@ -408,12 +418,12 @@ void raft_session::fault(boost::system::error_code ec) {
     }
     socket_.close();
   }
-  if (i_host_ == raft_state.host_map.end()) {
+  if (!host_) {
     delete this;
     return;
   }
-  if (i_host_->second.out_session.get() != this) {
-    i_host_->second.out_session->fault(ec);
+  if (host_->out_session.get() != this) {
+    host_->out_session->fault(ec);
   }
   if (!reconnect_timeout_.is_special()) {
     reconnect_wait_ = true;
@@ -426,17 +436,22 @@ void raft_session::fault(boost::system::error_code ec) {
   }
   if (!opened_) return;
   opened_ = false;
-  if (--i_host_->second.connected == 0) return;
+  if (--host_->connected == 0) return;
   --raft_state.num_connected;
-  if (i_host_->second.id == raft_state.leader_id) {
+  raft_state.host_state.erase(raft_host_state({host_->id, 0}));
+  if (host_->id == raft_state.leader_id) {
+    raft_state.host_state.erase(raft_host_state({(uint32_t)raft_state.local_id, 0}));
+    raft_state.host_state.insert(raft_host_state({(uint32_t)raft_state.local_id, (uint64_t)raft_state.gsn}));
     raft_state.leader_id = -1;
     raft_state.state = raft_state_initial;
-    if (i_host_->second.id == raft_state.max_connected_id) {
-      for (--raft_state.max_connected_id; raft_state.max_connected_id >= 0; --raft_state.max_connected_id) {
-        if (raft_state.host_index[raft_state.max_connected_id]->second.connected == 2) break;
-      }
-    }
+    raft_state.max_connected_id = raft_state.host_state.begin()->server_id;
     send_leader_promise();
+  } else if (raft_state.leader_id == raft_state.local_id) {
+    raft_state.leader_id = -1;
+    if (raft_state.operation_index.empty()) return;
+    uint64_t gsn = raft_state.operation_index.get<raft_local_state::gsn_hash>().begin()->gsn;
+    say_info("[%tX] raft state changed to initial, reject all operations from '%ld'", (ptrdiff_t)this, gsn);
+    raft_rollback_local(gsn);
   }
 }
 
@@ -452,13 +467,12 @@ void raft_session::start_timeout(const boost::posix_time::time_duration& t) {
 
 void raft_session::on_connected() {
   say_debug("[%tX] on_connected, host: %s, status: %d",
-      (ptrdiff_t)this, i_host_->second.full_name.c_str(), (int)(i_host_->second.connected + 1));
-  if (++i_host_->second.connected != 2) return;
+      (ptrdiff_t)this, host_->full_name.c_str(), (int)(host_->connected + 1));
+  if (++host_->connected != 2) return;
   ++raft_state.num_connected;
-  if (i_host_->second.id > raft_state.max_connected_id)
-    raft_state.max_connected_id = i_host_->second.id;
+  raft_state.max_connected_id = raft_state.host_state.begin()->server_id;
   if (raft_state.leader_id == raft_state.local_id) {
-    i_host_->second.out_session->send(raft_mtype_leader_submit);
+    host_->out_session->send(raft_mtype_leader_submit);
   } else {
     send_leader_promise();
   }
@@ -474,11 +488,11 @@ void raft_session::send_leader_promise() {
   {
     raft_state.state = raft_state_leader_accept;
     say_info("raft state changed to leader_accept, possible leader are '%s'",
-        raft_state.host_index[raft_state.max_connected_id]->second.full_name.c_str());
+        raft_state.host_index[raft_state.max_connected_id].full_name.c_str());
     raft_state.num_leader_accept = 1;
     for (auto& host : raft_state.host_index) {
-      if (!host->second.local && host->second.connected == 2)
-        host->second.out_session->send(raft_mtype_leader_promise);
+      if (!host.local && host.connected == 2)
+        host.out_session->send(raft_mtype_leader_promise);
     }
   }
 }

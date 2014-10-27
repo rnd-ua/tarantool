@@ -30,12 +30,22 @@
  */
 
 #include <map>
+#include <set>
 #include <vector>
 #include <string>
 #include <memory>
-
+#include <unordered_map>
 #include <boost/asio.hpp>
+#include <boost/range.hpp>
 #include <boost/date_time/time_duration.hpp>
+#if !defined(NDEBUG)
+#define BOOST_MULTI_INDEX_ENABLE_INVARIANT_CHECKING
+#define BOOST_MULTI_INDEX_ENABLE_SAFE_MODE
+#endif
+#include <boost/multi_index_container.hpp>
+#include <boost/multi_index/member.hpp>
+#include <boost/multi_index/hashed_index.hpp>
+#include <boost/multi_index/ordered_index.hpp>
 
 #include "xrow.h"
 
@@ -46,11 +56,15 @@ extern "C" {
 class raft_session;
 
 struct raft_host_data {
+private:
+  raft_host_data(const raft_host_data& data);
+  raft_host_data& operator=(const raft_host_data& data);
+
+public:
   raft_host_data()
     : leader(false), local(false), connected(0), id(-1), port(0)
     , out_session(nullptr), in_session(nullptr)
   {}
-  raft_host_data(const raft_host_data& data);
   raft_host_data(raft_host_data&& data)
     : leader(data.leader), local(data.local), connected(data.connected)
     , id(data.id), host(std::move(data.host)), port(data.port)
@@ -61,7 +75,6 @@ struct raft_host_data {
     buffer.body[0].iov_base = NULL;
     buffer.body[0].iov_len = 0;
   }
-  raft_host_data& operator=(const raft_host_data& data);
 
   bool leader;
   bool local;
@@ -75,8 +88,7 @@ struct raft_host_data {
   xrow_header buffer;
 };
 
-typedef std::map<std::string, raft_host_data> raft_host_map_t;
-typedef std::vector<raft_host_map_t::iterator> raft_host_index_t;
+typedef std::vector<raft_host_data> raft_host_index_t;
 
 struct raft_header {
   uint8_t type;
@@ -95,9 +107,21 @@ struct raft_msg_info {
 } __attribute__((packed));
 
 struct raft_msg_body {
-  int64_t gsn;
+  uint64_t gsn;
   xrow_header* body;
-} __attribute__((packed));
+};
+
+struct raft_host_state {
+  uint32_t server_id;
+  uint64_t gsn;
+
+  bool operator==(const raft_host_state& s) const {
+    return s.server_id == server_id;
+  }
+};
+inline bool operator==(const raft_host_state& s1, const raft_host_state& s2) {
+  return s1.operator==(s2);
+}
 
 enum raft_message_type {
   raft_mtype_hello = 0,
@@ -108,7 +132,9 @@ enum raft_message_type {
   raft_mtype_body = 5,
   raft_mtype_submit = 6,
   raft_mtype_reject = 7,
-  raft_mtype_count = 8
+  raft_mtype_proxy_request = 8,
+  raft_mtype_proxy_response = 9,
+  raft_mtype_count = 10
 };
 
 enum raft_machine_state {
@@ -117,7 +143,59 @@ enum raft_machine_state {
   raft_state_ready = 2
 };
 
+namespace boost {
+  inline std::size_t hash_value(const boost::iterator_range<const uint8_t*>& v) {
+    return boost::hash_range(v.begin(), v.end());
+  }
+}
+struct wal_write_request;
 struct raft_local_state {
+  struct operation {
+    operation(boost::asio::io_service& io_service) : timeout(new boost::asio::deadline_timer(io_service)) {}
+    operation(operation&& op)
+      : gsn(op.gsn), server_id(op.server_id), lsn(op.lsn), submitted(op.submitted)
+      , rejected(op.rejected), key(op.key), req(op.req), timeout(op.timeout)
+    { op.timeout = NULL; }
+
+    operation(const operation& op)
+      : gsn(op.gsn), server_id(op.server_id), lsn(op.lsn), submitted(op.submitted)
+      , rejected(op.rejected), key(op.key), req(op.req), timeout(op.timeout)
+    { op.timeout = NULL; }
+    ~operation() { delete timeout; }
+
+    uint64_t gsn;
+    uint32_t server_id;
+    uint64_t lsn;
+    mutable uint32_t submitted;
+    mutable uint32_t rejected;
+    boost::iterator_range<const uint8_t*> key;
+    wal_write_request* req;
+    mutable boost::asio::deadline_timer* timeout;
+  private:
+    operation& operator=(const operation& op);
+  };
+  struct gsn_hash{};
+  struct key_hash{};
+
+private:
+  typedef boost::multi_index_container<
+      operation,
+      boost::multi_index::indexed_by<
+        boost::multi_index::ordered_unique<
+          boost::multi_index::tag<gsn_hash>,
+          BOOST_MULTI_INDEX_MEMBER(operation, uint64_t, gsn)>,
+        boost::multi_index::hashed_unique<
+          boost::multi_index::tag<key_hash>,
+          BOOST_MULTI_INDEX_MEMBER(operation, boost::iterator_range<const uint8_t*>, key)>
+      >
+    > global_operation_map;
+  typedef std::unordered_map<uint64_t, wal_write_request*> local_operation_map;
+  struct host_state_compare {
+    bool operator()( const raft_host_state& lhs, const raft_host_state& rhs ) const {
+      return lhs.server_id == rhs.server_id ? false : (lhs.gsn > rhs.gsn ? true : (lhs.gsn < rhs.gsn ? false : lhs.server_id > rhs.server_id));
+    }
+  };
+public:
   raft_local_state()
     : leader_id(-1), num_leader_accept(0), num_connected(1)
     , max_connected_id(-1), local_id(-1), state(raft_state_initial)
@@ -126,8 +204,8 @@ struct raft_local_state {
 
   boost::asio::io_service io_service;
 
-  raft_host_map_t host_map;
   raft_host_index_t host_index;
+  std::set<raft_host_state, host_state_compare> host_state;
   int8_t leader_id;
   uint8_t num_leader_accept;
   uint8_t num_connected;
@@ -138,12 +216,16 @@ struct raft_local_state {
   int64_t lsn;
   int64_t max_gsn;
 
+  global_operation_map operation_index;
+  local_operation_map local_operation_index;
+
   /* settings */
   boost::posix_time::time_duration read_timeout;
   boost::posix_time::time_duration write_timeout;
   boost::posix_time::time_duration connect_timeout;
   boost::posix_time::time_duration resolve_timeout;
   boost::posix_time::time_duration reconnect_timeout;
+  boost::posix_time::time_duration operation_timeout;
 };
 
 extern struct raft_local_state raft_state;
@@ -158,7 +240,9 @@ inline bool is_leader() {
   return raft_state.leader_id == raft_state.local_id;
 }
 
-void raft_write_wal(uint64_t gsn, uint32_t server_id);
+void raft_write_wal_remote(uint64_t gsn, uint32_t server_id);
+void raft_write_wal_local(const raft_local_state::operation& op);
+void raft_rollback_local(uint64_t gsn);
 
 #if defined(__cplusplus)
 } /* extern "C" */
