@@ -34,6 +34,7 @@
 #include <arpa/inet.h>
 
 #include "box/raft_common.h"
+#include "box/raft_zcopy_buff.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -42,12 +43,12 @@ extern "C" {
 using boost::asio::ip::tcp;
 
 class raft_session {
-  typedef std::list<std::pair<int, struct iovec*> > write_queue_t;
   typedef void (raft_session::*handler_t)();
 public:
   raft_session(tcp::socket socket);
-  raft_session(typename raft_host_map_t::iterator i_host);
-  void send(const raft_msg_body& b);
+  raft_session(uint32_t server_id);
+  void send(uint8_t type, const raft_msg_body& b);
+  void send(uint8_t type, uint64_t gsn);
 
 private:
   void init_handlers();
@@ -57,24 +58,18 @@ private:
   void do_connect(tcp::resolver::iterator it);
   void handle_connect();
 
-  void send(uint8_t type, const void* data, std::size_t length);
   void send(uint8_t type);
   void send(uint8_t type, const raft_msg_info& h);
-  void do_send() {
-    if (active_write_ || write_queue_.empty()) return;
-    active_write_ = true;
-    do_send(0);
-  }
-  void do_send(int part);
-  void push_write_queue(uint8_t type, const void* data, std::size_t size);
-  void pop_write_queue();
-  void handle_send(boost::system::error_code ec);
+  void send_hello();
+  void do_send();
 
   uint64_t decode(xrow_header* b);
   void decode(raft_msg_info* info);
+  void decode(raft_host_state* state);
   void decode_header() {
     read_header_.length = ntohl(read_header_.length);
   }
+  uint64_t decode_gsn();
 
   void do_read_header();
   void handle_read(boost::system::error_code ec, std::size_t length);
@@ -86,6 +81,8 @@ private:
   void handle_body();
   void handle_submit();
   void handle_reject();
+  void handle_proxy_request();
+  void handle_proxy_response();
 
   void fault(boost::system::error_code ec);
   void start_timeout(const boost::posix_time::time_duration& t);
@@ -97,13 +94,13 @@ private:
   bool active_write_;
   raft_header read_header_;
   std::vector<char> read_buff_;
-  write_queue_t write_queue_;
-  std::vector<uint8_t> write_buff_;
+  raft_zcopy_buff write_queue_;
+  raft_zcopy_buff write_buff_;
   tcp::socket socket_;
   tcp::resolver resolver_;
   boost::asio::deadline_timer timer_;
   boost::posix_time::time_duration reconnect_timeout_;
-  raft_host_map_t::iterator i_host_;
+  raft_host_data* host_;
   handler_t handlers_[raft_mtype_count];
 };
 

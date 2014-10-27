@@ -58,6 +58,16 @@ local default_cfg = {
     -- snapshot_daemon
     snapshot_period     = 0,        -- 0 = disabled
     snapshot_count      = 6,
+
+    -- raft options
+    enable_raft             = 0,
+    raft_read_timeout       = 3100,
+    raft_write_timeout      = 3100,
+    raft_connect_timeout    = 3100,
+    raft_resolve_timeout    = 3100,
+    raft_reconnect_timeout  = 3100,
+    raft_replica            = "",
+    raft_local              = "",
 }
 
 -- see template_cfg below
@@ -101,6 +111,14 @@ local template_cfg = {
     coredump            = 'boolean',
     snapshot_period     = 'number',
     snapshot_count      = 'number',
+    enable_raft             = 'number',
+    raft_read_timeout       = 'number',
+    raft_write_timeout      = 'number',
+    raft_connect_timeout    = 'number',
+    raft_resolve_timeout    = 'number',
+    raft_reconnect_timeout  = 'number',
+    raft_replica            = 'string',
+    raft_local              = 'string',
 }
 
 local function normalize_uri(port)

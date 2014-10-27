@@ -37,6 +37,8 @@
 #include "recovery.h"
 #include "xrow.h"
 #include "msgpuck/msgpuck.h"
+#include "session.h"
+#include "box/raft.h"
 #include "box/cluster.h"
 #include "iproto_constants.h"
 
@@ -168,6 +170,7 @@ replica_bootstrap(struct recovery_state *r)
 
 	/* Add a surrogate server id for snapshot rows */
 	vclock_add_server(&r->vclock, 0);
+	vclock_add_server(&r->vclock, RAFT_SERVER_ID);
 
 	while (true) {
 		remote_read_row(&coio, iobuf, &row);
