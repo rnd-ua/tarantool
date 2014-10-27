@@ -30,6 +30,10 @@
 #include "raft.h"
 
 #include <list>
+#include <iterator>
+#include <boost/bind.hpp>
+#include <boost/lexical_cast.hpp>
+
 #include "cfg.h"
 #include "fio.h"
 #include "coio.h"
@@ -43,7 +47,6 @@
 
 static struct wal_writer* wal_local_writer = NULL;
 static struct wal_writer proxy_wal_writer;
-static struct wal_fifo raft_input = STAILQ_HEAD_INITIALIZER(raft_input);
 static pthread_once_t raft_writer_once = PTHREAD_ONCE_INIT;
 static ev_async local_write_event;
 
@@ -53,7 +56,7 @@ static fiber* raft_local_f;
 
 /** WAL writer thread routine. */
 static void* raft_writer_thread(void*);
-static void raft_writer_pop();
+static void raft_writer_push(uint64_t gsn, bool result);
 static void raft_read_cfg();
 static void raft_init_state(const struct vclock* vclock);
 static void raft_proceed_queue();
@@ -242,40 +245,34 @@ int raft_write(struct recovery_state *r, struct xrow_header *row) {
   req->row = row;
   row->tm = ev_now(loop());
   row->sync = 0;
+  if (row->server_id == RAFT_SERVER_ID) {
+    req->res = wal_write(wal_local_writer, req);
+    if (req->res < 0) {
+      raft_state.io_service.post(boost::bind(&raft_writer_push, row->lsn, false));
+      return -1;
+    } else {
+      raft_state.io_service.post(boost::bind(&raft_writer_push, row->lsn, true));
+      return 0;
+    }
+  } else {
+    (void) tt_pthread_mutex_lock(&writer->mutex);
+    bool input_was_empty = STAILQ_EMPTY(&writer->input);
+    STAILQ_INSERT_TAIL(&writer->input, req, wal_fifo_entry);
 
-  (void) tt_pthread_mutex_lock(&writer->mutex);
-  bool input_was_empty = STAILQ_EMPTY(&writer->input);
-  STAILQ_INSERT_TAIL(&writer->input, req, wal_fifo_entry);
+    if (input_was_empty) {
+      raft_state.io_service.post(&raft_proceed_queue);
+    }
 
-  if (input_was_empty)
-    raft_writer_pop();
+    (void) tt_pthread_mutex_unlock(&writer->mutex);
 
-  (void) tt_pthread_mutex_unlock(&writer->mutex);
+    fiber_yield(); /* Request was inserted. */
 
-  fiber_yield(); /* Request was inserted. */
+    /* req->res is -1 on error */
+    if (req->res < 0)
+      return -1; /* error */
 
-  /* req->res is -1 on error */
-  if (req->res < 0)
-    return -1; /* error */
-
-  return wal_write(wal_local_writer, req); /* success, send to local wal writer */
-}
-
-#include <iterator>
-#include <boost/lexical_cast.hpp>
-
-struct raft_execute_info {
-  wal_write_request* request;
-  int64_t gsn;
-  uint8_t submit;
-};
-
-static struct raft_execute_info raft_cur_execute;
-
-static void set_cur_execute(wal_write_request* request) {
-  raft_cur_execute.request = request;
-  raft_cur_execute.gsn = -1;
-  raft_cur_execute.submit = 0;
+    return wal_write(wal_local_writer, req); /* success, send to local wal writer */
+  }
 }
 
 static int raft_get_timeout(const char* name, int def) {
@@ -294,6 +291,7 @@ static void raft_read_cfg() {
   raft_state.connect_timeout = boost::posix_time::milliseconds(raft_get_timeout("raft_connect_timeout", 3100));
   raft_state.resolve_timeout = boost::posix_time::milliseconds(raft_get_timeout("raft_resolve_timeout", 3100));
   raft_state.reconnect_timeout = boost::posix_time::milliseconds(raft_get_timeout("raft_reconnect_timeout", 3100));
+  raft_state.operation_timeout = boost::posix_time::milliseconds(raft_get_timeout("raft_operation_timeout", 3500));
   const char* hosts = cfg_gets("raft_replica");
   if (hosts == NULL) {
     tnt_raise(ClientError, ER_CFG, "raft replica: expected host:port[;host_port]*");
@@ -301,6 +299,7 @@ static void raft_read_cfg() {
   std::string hosts_str(hosts);
   auto i_host_begin = hosts_str.begin();
   auto i_host_end = hosts_str.end();
+  std::map<std::string, raft_host_data> local_buff;
   while (i_host_begin != hosts_str.end()) {
     i_host_end = std::find(i_host_begin, hosts_str.end(), ';');
     auto i_url = std::find(i_host_begin, i_host_end, ':');
@@ -312,18 +311,27 @@ static void raft_read_cfg() {
       tnt_raise(ClientError, ER_CFG, "raft replica: invalid port in raft url");
     }
     nhost.full_name.assign(i_host_begin, i_host_end);
-    raft_state.host_map.emplace(nhost.full_name, std::move(nhost));
+    local_buff.emplace(nhost.full_name, std::move(nhost));
     i_host_begin = (i_host_end != hosts_str.end() ? i_host_end + 1 : i_host_end);
   }
   const char* localhost = cfg_gets("raft_local");
   if (localhost == NULL) {
     tnt_raise(ClientError, ER_CFG, "raft replica: raft_local param not found");
   }
-  auto i_local = raft_state.host_map.find(localhost);
-  if (i_local == raft_state.host_map.end()) {
+  auto i_local = local_buff.find(localhost);
+  if (i_local == local_buff.end()) {
     tnt_raise(ClientError, ER_CFG, "raft replica: raft_local param contains unknown host");
   }
   i_local->second.local = true;
+  uint8_t host_id = 0;
+  raft_state.host_index.reserve(local_buff.size());
+  for (auto& i : local_buff) {
+    i.second.id = host_id++;
+    raft_state.host_index.emplace_back(std::move(i.second));
+    if (i.second.local) {
+      raft_state.local_id = i.second.id;
+    }
+  }
 }
 
 class raft_server {
@@ -350,23 +358,18 @@ private:
 };
 
 static void* raft_writer_thread(void*) {
-  uint8_t host_id = 0;
-  raft_state.host_index.reserve(raft_state.host_map.size());
-  for (auto i_host = raft_state.host_map.begin(); i_host != raft_state.host_map.end(); ++i_host) {
-    i_host->second.id = host_id++;
-    raft_state.host_index.push_back(i_host);
-    if (i_host->second.local) {
-      raft_state.local_id = i_host->second.id;
-    } else {
-      i_host->second.out_session.reset(new raft_session(i_host));
+  for (auto& host : raft_state.host_index) {
+    if (!host.local) {
+      host.out_session.reset(new raft_session(host.id));
     }
   }
   raft_state.max_connected_id = raft_state.local_id;
+  raft_state.host_state.insert(raft_host_state({(uint32_t)raft_state.local_id, (uint64_t)raft_state.max_gsn}));
   assert(raft_state.local_id >= 0);
   // start to listen port
   raft_server acceptor(tcp::endpoint(
     boost::asio::ip::tcp::v4(),
-    raft_state.host_index[raft_state.local_id]->second.port
+    raft_state.host_index[raft_state.local_id].port
   ));
   // start to make sessions to other hosts
   while (!proxy_wal_writer.is_shutdown) {
@@ -390,59 +393,120 @@ static void* raft_writer_thread(void*) {
   return NULL;
 }
 
-void raft_write_wal(uint64_t gsn, uint32_t server_id) {
-  if (server_id == raft_state.local_id) {
-    raft_cur_execute.request->row->server_id = RAFT_SERVER_ID;
-    raft_cur_execute.request->row->lsn = gsn;
-    raft_cur_execute.request->res = 1;
-    STAILQ_INSERT_HEAD(&proxy_wal_writer.commit, raft_cur_execute.request, wal_fifo_entry);
-    raft_cur_execute.request = NULL;
-    ev_async_send(proxy_wal_writer.txn_loop, &proxy_wal_writer.write_event);
-    raft_proceed_queue();
-  } else {
-    raft_state.host_index[server_id]->second.buffer.server_id = RAFT_SERVER_ID;
-    raft_state.host_index[server_id]->second.buffer.lsn = gsn;
-    tt_pthread_mutex_lock(&proxy_wal_writer.mutex);
-    raft_local_input.emplace_back(std::move(raft_state.host_index[server_id]->second.buffer));
-    raft_state.host_index[server_id]->second.buffer.body[0].iov_base = NULL;
-    tt_pthread_mutex_unlock(&proxy_wal_writer.mutex);
-    ev_async_send(proxy_wal_writer.txn_loop, &local_write_event);
+void raft_write_wal_remote(uint64_t gsn, uint32_t server_id) {
+  sleep(5);
+  raft_state.host_index[server_id].buffer.server_id = RAFT_SERVER_ID;
+  raft_state.host_index[server_id].buffer.lsn = gsn;
+  tt_pthread_mutex_lock(&proxy_wal_writer.mutex);
+  raft_local_input.emplace_back(std::move(raft_state.host_index[server_id].buffer));
+  raft_state.host_index[server_id].buffer.body[0].iov_base = NULL;
+  tt_pthread_mutex_unlock(&proxy_wal_writer.mutex);
+  ev_async_send(proxy_wal_writer.txn_loop, &local_write_event);
+}
+
+void raft_write_wal_local(const raft_local_state::operation& op) {
+  op.req->res = 0;
+  op.req->row->lsn = op.gsn;
+  op.req->row->server_id = RAFT_SERVER_ID;
+  op.timeout->cancel();
+  tt_pthread_mutex_lock(&proxy_wal_writer.mutex);
+  STAILQ_INSERT_HEAD(&proxy_wal_writer.commit, op.req, wal_fifo_entry);
+  tt_pthread_mutex_unlock(&proxy_wal_writer.mutex);
+  ev_async_send(proxy_wal_writer.txn_loop, &proxy_wal_writer.write_event);
+}
+
+void raft_rollback_local(uint64_t gsn) {
+  struct wal_fifo rollback = STAILQ_HEAD_INITIALIZER(rollback);
+  auto& index = raft_state.operation_index.get<raft_local_state::gsn_hash>();
+  for (auto i_op = index.find(gsn); i_op != index.end(); ) {
+    i_op->req->res = -1;
+    STAILQ_INSERT_HEAD(&rollback, i_op->req, wal_fifo_entry);
+    i_op->timeout->cancel();
+    i_op = index.erase(i_op);
   }
+  tt_pthread_mutex_lock(&proxy_wal_writer.mutex);
+  proxy_wal_writer.is_rollback = true;
+  STAILQ_CONCAT(&proxy_wal_writer.input, &rollback);
+  tt_pthread_mutex_unlock(&proxy_wal_writer.mutex);
+  ev_async_send(proxy_wal_writer.txn_loop, &proxy_wal_writer.write_event);
+}
+
+static void raft_operation_timeout(uint64_t gsn, boost::system::error_code ec) {
+  if (ec == boost::asio::error::operation_aborted) return;
+  auto& index = raft_state.operation_index.get<raft_local_state::gsn_hash>();
+  auto i_op = index.find(gsn);
+  assert(i_op != index.end());
+  for (raft_host_data& host : raft_state.host_index) {
+    if (!host.local) host.out_session->send(raft_mtype_reject, gsn);
+  }
+  raft_rollback_local(gsn);
 }
 
 static void raft_proceed_queue() {
-  if (STAILQ_EMPTY(&raft_input)) {
+  if (raft_state.leader_id != raft_state.local_id) {
     tt_pthread_mutex_lock(&proxy_wal_writer.mutex);
-    STAILQ_CONCAT(&raft_input, &proxy_wal_writer.input);
+    proxy_wal_writer.is_rollback = true;
     tt_pthread_mutex_unlock(&proxy_wal_writer.mutex);
-  }
-  if (STAILQ_EMPTY(&raft_input)) {
+    ev_async_send(proxy_wal_writer.txn_loop, &proxy_wal_writer.write_event);
     return;
   }
-  wal_write_request* wreq = STAILQ_FIRST(&raft_input);
-  if (wreq->row->server_id == RAFT_SERVER_ID) {
-    STAILQ_INSERT_HEAD(&proxy_wal_writer.commit, wreq, wal_fifo_entry);
-    STAILQ_REMOVE_HEAD(&raft_input, wal_fifo_entry);
-    wreq->res = 1;
-    ev_async_send(proxy_wal_writer.txn_loop, &proxy_wal_writer.write_event);
+  static struct wal_fifo input = STAILQ_HEAD_INITIALIZER(input);
+  static struct wal_fifo rollback = STAILQ_HEAD_INITIALIZER(rollback);
+  tt_pthread_mutex_lock(&proxy_wal_writer.mutex);
+  STAILQ_CONCAT(&input, &proxy_wal_writer.input);
+  tt_pthread_mutex_unlock(&proxy_wal_writer.mutex);
+  if (STAILQ_EMPTY(&input)) {
+    return;
+  }
+  wal_write_request* wreq = STAILQ_FIRST(&input);
+  if (raft_state.leader_id == raft_state.local_id) {
+    while (wreq) {
+      auto key = boost::make_iterator_range(
+          (const uint8_t*)wreq->row->body[0].iov_base,
+          (const uint8_t*)wreq->row->body[0].iov_base + wreq->row->body[0].iov_len);
+      auto& key_index = raft_state.operation_index.get<raft_local_state::key_hash>();
+      if (key_index.find(key) != key_index.end()) {
+        break;
+      }
+      raft_local_state::operation op(raft_state.io_service);
+      op.gsn = ++raft_state.gsn;
+      op.key = key;
+      op.lsn = ++raft_state.lsn;
+      op.rejected = 0;
+      op.submitted = 1;
+      op.req = wreq;
+      op.server_id = raft_state.local_id;
+      op.timeout->expires_from_now(raft_state.operation_timeout);
+      op.timeout->async_wait(boost::bind(&raft_operation_timeout, op.gsn, _1));
+      raft_state.operation_index.insert(op);
+      raft_msg_body msg = {op.gsn, op.req->row };
+      for (auto &host : raft_state.host_index) {
+        if (!host.local && host.connected == 2)
+          host.out_session->send(raft_mtype_body, msg);
+      }
+      wreq = STAILQ_NEXT(wreq, wal_fifo_entry);
+    }
+    STAILQ_SPLICE(&input, wreq, wal_fifo_entry, &rollback);
   } else {
-    if (raft_cur_execute.request) return;
-    STAILQ_REMOVE_HEAD(&raft_input, wal_fifo_entry);
-    set_cur_execute(wreq);
-    raft_msg_body msg;
-    raft_cur_execute.gsn = msg.gsn = (raft_state.leader_id == raft_state.local_id ? ++raft_state.gsn : 0);
-    raft_cur_execute.request->row->lsn = ++raft_state.lsn;
-    raft_cur_execute.request->row->server_id = raft_state.local_id + 1;
-    msg.body = raft_cur_execute.request->row;
-    for (auto &host : raft_state.host_index) {
-      if (!host->second.local && host->second.connected == 2)
-        host->second.out_session->send(msg);
+    while (wreq) {
+      raft_state.local_operation_index.emplace(++raft_state.lsn, wreq);
+      raft_state.host_index[raft_state.leader_id].out_session->send(raft_mtype_proxy_request, raft_msg_body({0, wreq->row}));
+      wreq = STAILQ_NEXT(wreq, wal_fifo_entry);
     }
   }
+  STAILQ_SPLICE(&input, wreq, wal_fifo_entry, &rollback);
+  if (STAILQ_EMPTY(&rollback)) {
+    return;
+  }
+  tt_pthread_mutex_lock(&proxy_wal_writer.mutex);
+  proxy_wal_writer.is_rollback = true;
+  STAILQ_CONCAT(&proxy_wal_writer.input, &rollback);
+  tt_pthread_mutex_unlock(&proxy_wal_writer.mutex);
+  ev_async_send(proxy_wal_writer.txn_loop, &proxy_wal_writer.write_event);
 }
 
-static void raft_writer_pop() {
-  raft_state.io_service.post(&raft_proceed_queue);
+static void raft_writer_push(uint64_t gsn, bool result) {
+  raft_state.host_index[raft_state.leader_id].out_session->send((result ? raft_mtype_submit : raft_mtype_reject), gsn);
 }
 
 void raft_writer_stop(struct recovery_state *r) {

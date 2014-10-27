@@ -23,21 +23,29 @@ box.cfg
   slab_alloc_factor: 2
   rows_per_wal: 50
   background: false
+  raft_local: 
+  raft_reconnect_timeout: 3100
   slab_alloc_arena: 0.1
   log_level: 5
   listen: <uri>
-  logger_nonblock: true
-  snap_dir: .
-  coredump: false
-  sophia_dir: ./sophia
-  wal_mode: write
-  panic_on_snap_error: true
-  panic_on_wal_error: false
   pid_file: tarantool.pid
   slab_alloc_minimal: 64
+  logger_nonblock: true
+  raft_read_timeout: 3100
+  snap_dir: .
+  coredump: false
   wal_dir: .
   readahead: 16320
+  sophia_dir: ./sophia
+  raft_replica: 
+  panic_on_wal_error: false
+  panic_on_snap_error: true
+  raft_resolve_timeout: 3100
+  enable_raft: 0
   snapshot_period: 0
+  wal_mode: write
+  raft_write_timeout: 3100
+  raft_connect_timeout: 3100
   wal_dir_rescan_delay: 0.1
 ...
 space:insert{1, 'tuple'}

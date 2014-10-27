@@ -5,22 +5,30 @@ box.cfg
 4	rows_per_wal:50
 5	background:false
 6	logger:tarantool.log
-7	slab_alloc_arena:0.1
-8	log_level:5
-9	listen:3313
-10	logger_nonblock:true
-11	snap_dir:.
-12	coredump:false
-13	sophia_dir:./sophia
-14	wal_mode:write
-15	panic_on_snap_error:true
-16	panic_on_wal_error:false
-17	too_long_threshold:0.01
-18	slab_alloc_minimal:64
-19	wal_dir:.
-20	readahead:16320
-21	snapshot_period:0
-22	wal_dir_rescan_delay:0.1
+7	raft_reconnect_timeout:3100
+8	slab_alloc_arena:0.1
+9	log_level:5
+10	too_long_threshold:0.01
+11	listen:3313
+12	raft_local:
+13	slab_alloc_minimal:64
+14	logger_nonblock:true
+15	wal_dir:.
+16	snap_dir:.
+17	coredump:false
+18	readahead:16320
+19	snapshot_period:0
+20	sophia_dir:./sophia
+21	raft_replica:
+22	panic_on_wal_error:false
+23	panic_on_snap_error:true
+24	raft_resolve_timeout:3100
+25	enable_raft:0
+26	wal_mode:write
+27	raft_read_timeout:3100
+28	raft_write_timeout:3100
+29	raft_connect_timeout:3100
+30	wal_dir_rescan_delay:0.1
 ------------------------------------------------------
 Check that too_long_threshold = 0.01
 0.01
