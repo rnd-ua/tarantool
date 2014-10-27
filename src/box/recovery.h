@@ -37,6 +37,11 @@
 #include "vclock.h"
 #include "tt_uuid.h"
 #include "uri.h"
+#include "replica.h"
+#include "fiber.h"
+#include "tt_pthread.h"
+#include "xrow.h"
+#include "small/region.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -54,7 +59,32 @@ typedef void (snapshot_handler)(struct log_io *);
  * LSN makes it to disk.
  */
 
-struct wal_writer;
+struct wal_write_request {
+  STAILQ_ENTRY(wal_write_request) wal_fifo_entry;
+  /* Auxiliary. */
+  int64_t res;
+  struct fiber *fiber;
+  struct xrow_header *row;
+};
+
+/* Context of the WAL writer thread. */
+STAILQ_HEAD(wal_fifo, wal_write_request);
+
+struct wal_writer
+{
+  struct wal_fifo input;
+  struct wal_fifo commit;
+  struct cord cord;
+  pthread_mutex_t mutex;
+  pthread_cond_t cond;
+  ev_async write_event;
+  struct fio_batch *batch;
+  bool is_shutdown;
+  bool is_rollback;
+  ev_loop *txn_loop;
+  struct vclock vclock;
+};
+
 struct wal_watcher;
 
 enum wal_mode { WAL_NONE = 0, WAL_WRITE, WAL_FSYNC, WAL_MODE_MAX };
@@ -154,7 +184,10 @@ void recovery_follow_local(struct recovery_state *r, ev_tstamp wal_dir_rescan_de
 void recovery_finalize(struct recovery_state *r);
 
 int recover_wal(struct recovery_state *r, struct log_io *l);
-int wal_write(struct recovery_state *r, struct xrow_header *packet);
+void wal_writer_destroy(struct wal_writer *writer);
+int wal_write_lsn(struct recovery_state *r, struct xrow_header *packet);
+int wal_write(struct wal_writer *writer, struct wal_write_request *req);
+void wal_writer_stop(struct recovery_state *r);
 
 void recovery_setup_panic(struct recovery_state *r, bool on_snap_error, bool on_wal_error);
 void recovery_process(struct recovery_state *r, struct xrow_header *packet);

@@ -32,8 +32,6 @@
 #include <fcntl.h>
 
 #include "log_io.h"
-#include "fiber.h"
-#include "tt_pthread.h"
 #include "fio.h"
 #include "sio.h"
 #include "errinj.h"
@@ -42,12 +40,12 @@
 #include "replica.h"
 #include "fiber.h"
 #include "msgpuck/msgpuck.h"
-#include "xrow.h"
 #include "crc32.h"
 #include "scoped_guard.h"
 #include "box/cluster.h"
 #include "vclock.h"
 #include "session.h"
+#include "raft.h"
 
 /*
  * Recovery subsystem
@@ -145,8 +143,6 @@ fill_lsn(struct recovery_state *r, struct xrow_header *row)
 
 static int
 wal_writer_start(struct recovery_state *state);
-void
-wal_writer_stop(struct recovery_state *r);
 static void
 recovery_stop_local(struct recovery_state *r);
 
@@ -208,8 +204,9 @@ recovery_delete(struct recovery_state *r)
 	if (r->watcher)
 		recovery_stop_local(r);
 
-	if (r->writer)
-		wal_writer_stop(r);
+	if (r->writer) {
+    raft_writer_stop(r);
+  }
 
 	log_dir_destroy(&r->snap_dir);
 	log_dir_destroy(&r->wal_dir);
@@ -248,6 +245,7 @@ recovery_bootstrap(struct recovery_state *r)
 {
 	/* Add a surrogate server id for snapshot rows */
 	vclock_add_server(&r->vclock, 0);
+	vclock_add_server(&r->vclock, RAFT_SERVER_ID);
 
 	/* Recover from bootstrap.snap */
 	say_info("initializing an empty data directory");
@@ -294,6 +292,7 @@ recover_snap(struct recovery_state *r)
 
 	/* Add a surrogate server id for snapshot rows */
 	vclock_add_server(&r->vclock, 0);
+	vclock_add_server(&r->vclock, RAFT_SERVER_ID);
 
 	say_info("recovering from `%s'", snap->filename);
 	if (recover_wal(r, snap) != 0)
@@ -517,7 +516,6 @@ recovery_finalize(struct recovery_state *r)
 
 		log_io_close(&r->current_wal);
 	}
-
 	wal_writer_start(r);
 }
 
@@ -650,32 +648,6 @@ recovery_stop_local(struct recovery_state *r)
  * in the data state.
  */
 
-struct wal_write_request {
-	STAILQ_ENTRY(wal_write_request) wal_fifo_entry;
-	/* Auxiliary. */
-	int64_t res;
-	struct fiber *fiber;
-	struct xrow_header *row;
-};
-
-/* Context of the WAL writer thread. */
-STAILQ_HEAD(wal_fifo, wal_write_request);
-
-struct wal_writer
-{
-	struct wal_fifo input;
-	struct wal_fifo commit;
-	struct cord cord;
-	pthread_mutex_t mutex;
-	pthread_cond_t cond;
-	ev_async write_event;
-	struct fio_batch *batch;
-	bool is_shutdown;
-	bool is_rollback;
-	ev_loop *txn_loop;
-	struct vclock vclock;
-};
-
 static struct wal_writer wal_writer;
 
 /**
@@ -795,7 +767,7 @@ wal_writer_init(struct wal_writer *writer, struct vclock *vclock)
 }
 
 /** Destroy a WAL writer structure. */
-static void
+void
 wal_writer_destroy(struct wal_writer *writer)
 {
 	(void) tt_pthread_mutex_destroy(&writer->mutex);
@@ -841,7 +813,8 @@ wal_writer_start(struct recovery_state *r)
 		r->writer = NULL;
 		return -1;
 	}
-	return 0;
+  r->writer = raft_init(r->writer, &r->vclock);
+  return 0;
 }
 
 /** Stop and destroy the writer thread (at shutdown). */
@@ -1051,7 +1024,7 @@ wal_writer_thread(void *worker_args)
  * to be written to disk and wait until this task is completed.
  */
 int
-wal_write(struct recovery_state *r, struct xrow_header *row)
+wal_write_lsn(struct recovery_state *r, struct xrow_header *row)
 {
 	/*
 	 * Bump current LSN even if wal_mode = NONE, so that
@@ -1060,39 +1033,37 @@ wal_write(struct recovery_state *r, struct xrow_header *row)
 	fill_lsn(r, row);
 	if (r->wal_mode == WAL_NONE)
 		return 0;
+  struct wal_write_request *req = (struct wal_write_request *)
+    region_alloc(&fiber()->gc, sizeof(struct wal_write_request));
 
-	ERROR_INJECT_RETURN(ERRINJ_WAL_IO);
-
-	struct wal_writer *writer = r->writer;
-
-	struct wal_write_request *req = (struct wal_write_request *)
-		region_alloc(&fiber()->gc, sizeof(struct wal_write_request));
-
-	req->fiber = fiber();
-	req->res = -1;
-	req->row = row;
-	row->tm = ev_now(loop());
-	row->sync = 0;
-
-	(void) tt_pthread_mutex_lock(&writer->mutex);
-
-	bool input_was_empty = STAILQ_EMPTY(&writer->input);
-	STAILQ_INSERT_TAIL(&writer->input, req, wal_fifo_entry);
-
-	if (input_was_empty)
-		(void) tt_pthread_cond_signal(&writer->cond);
-
-	(void) tt_pthread_mutex_unlock(&writer->mutex);
-
-	fiber_yield(); /* Request was inserted. */
-
-	/* req->res is -1 on error */
-	if (req->res < 0)
-		return -1; /* error */
-
-	return 0; /* success */
+  req->fiber = fiber();
+  req->row = row;
+  row->tm = ev_now(loop());
+  row->sync = 0;
+  return wal_write(r->writer, req);
 }
 
+int wal_write(struct wal_writer *writer, struct wal_write_request *req) {
+  ERROR_INJECT_RETURN(ERRINJ_WAL_IO);
+  req->res = -1;
+  (void) tt_pthread_mutex_lock(&writer->mutex);
+
+  bool input_was_empty = STAILQ_EMPTY(&writer->input);
+  STAILQ_INSERT_TAIL(&writer->input, req, wal_fifo_entry);
+
+  if (input_was_empty)
+    (void) tt_pthread_cond_signal(&writer->cond);
+
+  (void) tt_pthread_mutex_unlock(&writer->mutex);
+
+  fiber_yield(); /* Request was inserted. */
+
+  /* req->res is -1 on error */
+  if (req->res < 0)
+    return -1; /* error */
+
+  return 0; /* success */
+}
 /* }}} */
 
 /* {{{ box.snapshot() */

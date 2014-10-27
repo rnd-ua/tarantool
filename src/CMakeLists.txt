@@ -42,6 +42,12 @@ add_custom_target(ragel
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMAND ragel -G2 src/uri.rl -o src/uri.c)
 
+set(Boost_USE_STATIC_LIBS OFF)
+set(Boost_USE_MULTITHREADED ON)
+add_definitions(-DBOOST_LOG_DYN_LINK)
+find_package(Boost COMPONENTS system date_time thread REQUIRED)
+include_directories(${Boost_INCLUDE_DIRS})
+
 set (common_sources
      memory.cc
      fiber.cc
@@ -95,7 +101,7 @@ endif()
 
 set_source_files_compile_flags(${common_sources})
 add_library(core STATIC ${common_sources})
-target_link_libraries(core pthread)
+target_link_libraries(core pthread ${Boost_LIBRARIES})
 
 set (common_libraries core small salad misc bitset msgpuck)
 

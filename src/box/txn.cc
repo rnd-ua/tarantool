@@ -33,6 +33,7 @@
 #include "space.h"
 #include <tarantool.h>
 #include "cluster.h"
+#include "raft.h"
 #include "recovery.h"
 #include <fiber.h>
 #include "request.h" /* for request_name */
@@ -224,7 +225,7 @@ txn_commit(struct txn *txn)
 		assert(recovery->wal_mode == WAL_NONE ||
 		       stmt->row != NULL);
 		ev_tstamp start = ev_now(loop()), stop;
-		res = wal_write(recovery, stmt->row);
+		res = raft_write(recovery, stmt->row);
 		stop = ev_now(loop());
 
 		if (stop - start > too_long_threshold && stmt->row != NULL) {
