@@ -2,7 +2,7 @@
 --# push filter 'admin: .*' to 'admin: <uri>'
 box.cfg.nosuchoption = 1
 ---
-- error: '[string "-- load_cfg.lua - internal file..."]:213: Attempt to modify a read-only
+- error: '[string "-- load_cfg.lua - internal file..."]:215: Attempt to modify a read-only
     table'
 ...
 t = {} for k,v in pairs(box.cfg) do if type(v) ~= 'table' and type(v) ~= 'function' then table.insert(t, k..': '..tostring(v)) end end
@@ -19,23 +19,24 @@ t
   - 'raft_reconnect_timeout: 3100'
   - 'slab_alloc_arena: 0.1'
   - 'log_level: 5'
-  - 'primary: <uri>
   - 'pid_file: tarantool.pid'
+  - 'primary: <uri>
+  - 'raft_election_timeout: -1'
   - 'slab_alloc_minimal: 64'
   - 'logger_nonblock: true'
-  - 'raft_read_timeout: 3100'
+  - 'wal_dir: .'
   - 'snap_dir: .'
   - 'coredump: false'
-  - 'wal_dir: .'
   - 'readahead: 16320'
+  - 'snapshot_period: 0'
   - 'sophia_dir: ./sophia'
   - 'raft_replica: '
   - 'panic_on_wal_error: false'
   - 'panic_on_snap_error: true'
   - 'raft_resolve_timeout: 3100'
   - 'enable_raft: 0'
-  - 'snapshot_period: 0'
   - 'wal_mode: write'
+  - 'raft_read_timeout: 3100'
   - 'raft_write_timeout: 3100'
   - 'raft_connect_timeout: 3100'
   - 'wal_dir_rescan_delay: 0.1'
@@ -58,23 +59,24 @@ t
   - 'raft_reconnect_timeout: 3100'
   - 'slab_alloc_arena: 0.1'
   - 'log_level: 5'
-  - 'primary: <uri>
   - 'pid_file: tarantool.pid'
+  - 'primary: <uri>
+  - 'raft_election_timeout: -1'
   - 'slab_alloc_minimal: 64'
   - 'logger_nonblock: true'
-  - 'raft_read_timeout: 3100'
+  - 'wal_dir: .'
   - 'snap_dir: .'
   - 'coredump: false'
-  - 'wal_dir: .'
   - 'readahead: 16320'
+  - 'snapshot_period: 0'
   - 'sophia_dir: ./sophia'
   - 'raft_replica: '
   - 'panic_on_wal_error: false'
   - 'panic_on_snap_error: true'
   - 'raft_resolve_timeout: 3100'
   - 'enable_raft: 0'
-  - 'snapshot_period: 0'
   - 'wal_mode: write'
+  - 'raft_read_timeout: 3100'
   - 'raft_write_timeout: 3100'
   - 'raft_connect_timeout: 3100'
   - 'wal_dir_rescan_delay: 0.1'
@@ -82,23 +84,23 @@ t
 -- check that cfg with unexpected parameter fails.
 box.cfg{sherlock = 'holmes'}
 ---
-- error: '[string "-- load_cfg.lua - internal file..."]:139: Error: cfg parameter
+- error: '[string "-- load_cfg.lua - internal file..."]:141: Error: cfg parameter
     ''sherlock'' is unexpected'
 ...
 -- check that cfg with unexpected type of parameter failes
 box.cfg{listen = {}}
 ---
-- error: '[string "-- load_cfg.lua - internal file..."]:154: Error: cfg parameter
+- error: '[string "-- load_cfg.lua - internal file..."]:156: Error: cfg parameter
     ''listen'' should be one of types: string, number'
 ...
 box.cfg{wal_dir = 0}
 ---
-- error: '[string "-- load_cfg.lua - internal file..."]:148: Error: cfg parameter
+- error: '[string "-- load_cfg.lua - internal file..."]:150: Error: cfg parameter
     ''wal_dir'' should be of type string'
 ...
 box.cfg{coredump = 'true'}
 ---
-- error: '[string "-- load_cfg.lua - internal file..."]:148: Error: cfg parameter
+- error: '[string "-- load_cfg.lua - internal file..."]:150: Error: cfg parameter
     ''coredump'' should be of type boolean'
 ...
 --# clear filter
