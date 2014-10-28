@@ -78,6 +78,7 @@ local default_cfg = {
     raft_connect_timeout    = 3100,
     raft_resolve_timeout    = 3100,
     raft_reconnect_timeout  = 3100,
+    raft_election_timeout   = -1,
     raft_replica            = "",
     raft_local              = "",
 }
@@ -141,6 +142,7 @@ local template_cfg = {
     raft_connect_timeout    = 'number',
     raft_resolve_timeout    = 'number',
     raft_reconnect_timeout  = 'number',
+    raft_election_timeout   = 'number',
     raft_replica            = 'string',
     raft_local              = 'string',
 }
