@@ -275,10 +275,14 @@ int raft_write(struct recovery_state *r, struct xrow_header *row) {
   }
 }
 
-static int raft_get_timeout(const char* name, int def) {
+static boost::posix_time::time_duration raft_get_timeout(const char* name, int def) {
   int v = cfg_geti(name);
   if (v < 1) v = def;
-  return def;
+  if (v < 1) {
+    return boost::posix_time::not_a_date_time;
+  } else {
+    return boost::posix_time::milliseconds(def);
+  }
 }
 
 static void raft_init_state(const struct vclock* vclock) {
@@ -286,12 +290,16 @@ static void raft_init_state(const struct vclock* vclock) {
 }
 
 static void raft_read_cfg() {
-  raft_state.read_timeout = boost::posix_time::milliseconds(raft_get_timeout("raft_read_timeout", 3100));
-  raft_state.write_timeout = boost::posix_time::milliseconds(raft_get_timeout("raft_write_timeout", 3100));
-  raft_state.connect_timeout = boost::posix_time::milliseconds(raft_get_timeout("raft_connect_timeout", 3100));
-  raft_state.resolve_timeout = boost::posix_time::milliseconds(raft_get_timeout("raft_resolve_timeout", 3100));
-  raft_state.reconnect_timeout = boost::posix_time::milliseconds(raft_get_timeout("raft_reconnect_timeout", 3100));
-  raft_state.operation_timeout = boost::posix_time::milliseconds(raft_get_timeout("raft_operation_timeout", 3500));
+  raft_state.read_timeout = raft_get_timeout("raft_read_timeout", 3100);
+  raft_state.write_timeout = raft_get_timeout("raft_write_timeout", 3100);
+  raft_state.connect_timeout = raft_get_timeout("raft_connect_timeout", 3100);
+  raft_state.resolve_timeout = raft_get_timeout("raft_resolve_timeout", 3100);
+  raft_state.reconnect_timeout = raft_get_timeout("raft_reconnect_timeout", 3100);
+  raft_state.operation_timeout = raft_get_timeout("raft_operation_timeout", 3500);
+  auto election_timeout = raft_get_timeout("raft_election_timeout", -1);
+  if (!election_timeout.is_special()) {
+    raft_state.start_election_time += election_timeout;
+  }
   const char* hosts = cfg_gets("raft_replica");
   if (hosts == NULL) {
     tnt_raise(ClientError, ER_CFG, "raft replica: expected host:port[;host_port]*");

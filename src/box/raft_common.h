@@ -138,9 +138,10 @@ enum raft_message_type {
 };
 
 enum raft_machine_state {
-  raft_state_initial = 0,
-  raft_state_leader_accept = 1,
-  raft_state_ready = 2
+  raft_state_started = 0,
+  raft_state_initial = 1,
+  raft_state_leader_accept = 2,
+  raft_state_ready = 3
 };
 
 namespace boost {
@@ -198,8 +199,8 @@ private:
 public:
   raft_local_state()
     : leader_id(-1), num_leader_accept(0), num_connected(1)
-    , max_connected_id(-1), local_id(-1), state(raft_state_initial)
-    , gsn(-1), lsn(-1), max_gsn(-1)
+    , max_connected_id(-1), local_id(-1), state(raft_state_started)
+    , gsn(-1), lsn(-1), max_gsn(-1), start_election_time(boost::posix_time::microsec_clock::universal_time())
   {}
 
   boost::asio::io_service io_service;
@@ -226,6 +227,7 @@ public:
   boost::posix_time::time_duration resolve_timeout;
   boost::posix_time::time_duration reconnect_timeout;
   boost::posix_time::time_duration operation_timeout;
+  boost::posix_time::ptime start_election_time;
 };
 
 extern struct raft_local_state raft_state;

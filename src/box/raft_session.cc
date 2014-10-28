@@ -304,7 +304,9 @@ void raft_session::handle_hello() {
 }
 
 void raft_session::handle_leader_promise() {
-  if (host_->id == raft_state.max_connected_id && raft_state.state == raft_state_initial) {
+  if (host_->id == raft_state.max_connected_id &&
+      (raft_state.state == raft_state_initial || raft_state.state == raft_state_started))
+  {
     raft_state.state = raft_state_leader_accept;
     say_info("[%tX] raft state changed to leader_accept, possible leader are '%s'",
         (ptrdiff_t)this, raft_state.host_index[raft_state.max_connected_id].full_name.c_str());
@@ -483,9 +485,13 @@ void raft_session::send_leader_promise() {
       (ptrdiff_t)this, (int)raft_state.num_connected, (int)raft_state.state,
       (int)raft_state.local_id, (int)raft_state.max_connected_id
   );
-  if (has_consensus() && raft_state.state == raft_state_initial &&
-      raft_state.local_id == raft_state.max_connected_id)
+  if (has_consensus() && raft_state.local_id == raft_state.max_connected_id &&
+      (raft_state.state == raft_state_initial || raft_state.state == raft_state_started))
   {
+    if (raft_state.state == raft_state_started && raft_state.num_connected < raft_state.host_index.size() &&
+        (raft_state.start_election_time < boost::posix_time::microsec_clock::universal_time())) {
+      return;
+    }
     raft_state.state = raft_state_leader_accept;
     say_info("raft state changed to leader_accept, possible leader are '%s'",
         raft_state.host_index[raft_state.max_connected_id].full_name.c_str());
