@@ -49,6 +49,9 @@ public:
   raft_session(uint32_t server_id);
   void send(uint8_t type, const raft_msg_body& b);
   void send(uint8_t type, uint64_t gsn);
+  void send(uint8_t type);
+
+  void fault(boost::system::error_code ec);
 
 private:
   void init_handlers();
@@ -58,14 +61,13 @@ private:
   void do_connect(tcp::resolver::iterator it);
   void handle_connect();
 
-  void send(uint8_t type);
   void send(uint8_t type, const raft_msg_info& h);
   void send_hello();
   void do_send();
 
-  uint64_t decode(xrow_header* b);
+  uint64_t decode_body();
   void decode(raft_msg_info* info);
-  void decode(raft_host_state* state);
+  uint32_t decode_state();
   void decode_header() {
     read_header_.length = ntohl(read_header_.length);
   }
@@ -84,10 +86,9 @@ private:
   void handle_proxy_request();
   void handle_proxy_response();
 
-  void fault(boost::system::error_code ec);
   void start_timeout(const boost::posix_time::time_duration& t);
+  void start_recover();
   void on_connected();
-  void send_leader_promise();
 
   bool opened_;
   bool reconnect_wait_;
