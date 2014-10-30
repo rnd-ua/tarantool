@@ -32,3 +32,4 @@
 #include "raft_session.h"
 
 struct raft_local_state raft_state;
+raft_host_index_t raft_host_index;

@@ -2,7 +2,7 @@
 --# push filter 'admin: .*' to 'admin: <uri>'
 box.cfg.nosuchoption = 1
 ---
-- error: '[string "-- load_cfg.lua - internal file..."]:215: Attempt to modify a read-only
+- error: '[string "-- load_cfg.lua - internal file..."]:217: Attempt to modify a read-only
     table'
 ...
 t = {} for k,v in pairs(box.cfg) do if type(v) ~= 'table' and type(v) ~= 'function' then table.insert(t, k..': '..tostring(v)) end end
@@ -17,25 +17,26 @@ t
   - 'background: false'
   - 'raft_local: '
   - 'raft_reconnect_timeout: 3100'
+  - 'pid_file: tarantool.pid'
   - 'slab_alloc_arena: 0.1'
   - 'log_level: 5'
-  - 'pid_file: tarantool.pid'
-  - 'primary: <uri>
   - 'raft_election_timeout: -1'
+  - 'primary: <uri>
   - 'slab_alloc_minimal: 64'
-  - 'logger_nonblock: true'
   - 'wal_dir: .'
+  - 'logger_nonblock: true'
+  - 'readahead: 16320'
   - 'snap_dir: .'
   - 'coredump: false'
-  - 'readahead: 16320'
-  - 'snapshot_period: 0'
-  - 'sophia_dir: ./sophia'
-  - 'raft_replica: '
+  - 'wal_mode: write'
   - 'panic_on_wal_error: false'
+  - 'raft_operation_timeout: 3500'
+  - 'raft_replica: '
+  - 'snapshot_period: 0'
   - 'panic_on_snap_error: true'
   - 'raft_resolve_timeout: 3100'
   - 'enable_raft: 0'
-  - 'wal_mode: write'
+  - 'sophia_dir: ./sophia'
   - 'raft_read_timeout: 3100'
   - 'raft_write_timeout: 3100'
   - 'raft_connect_timeout: 3100'
@@ -57,25 +58,26 @@ t
   - 'background: false'
   - 'raft_local: '
   - 'raft_reconnect_timeout: 3100'
+  - 'pid_file: tarantool.pid'
   - 'slab_alloc_arena: 0.1'
   - 'log_level: 5'
-  - 'pid_file: tarantool.pid'
-  - 'primary: <uri>
   - 'raft_election_timeout: -1'
+  - 'primary: <uri>
   - 'slab_alloc_minimal: 64'
-  - 'logger_nonblock: true'
   - 'wal_dir: .'
+  - 'logger_nonblock: true'
+  - 'readahead: 16320'
   - 'snap_dir: .'
   - 'coredump: false'
-  - 'readahead: 16320'
-  - 'snapshot_period: 0'
-  - 'sophia_dir: ./sophia'
-  - 'raft_replica: '
+  - 'wal_mode: write'
   - 'panic_on_wal_error: false'
+  - 'raft_operation_timeout: 3500'
+  - 'raft_replica: '
+  - 'snapshot_period: 0'
   - 'panic_on_snap_error: true'
   - 'raft_resolve_timeout: 3100'
   - 'enable_raft: 0'
-  - 'wal_mode: write'
+  - 'sophia_dir: ./sophia'
   - 'raft_read_timeout: 3100'
   - 'raft_write_timeout: 3100'
   - 'raft_connect_timeout: 3100'
@@ -84,23 +86,23 @@ t
 -- check that cfg with unexpected parameter fails.
 box.cfg{sherlock = 'holmes'}
 ---
-- error: '[string "-- load_cfg.lua - internal file..."]:141: Error: cfg parameter
+- error: '[string "-- load_cfg.lua - internal file..."]:143: Error: cfg parameter
     ''sherlock'' is unexpected'
 ...
 -- check that cfg with unexpected type of parameter failes
 box.cfg{listen = {}}
 ---
-- error: '[string "-- load_cfg.lua - internal file..."]:156: Error: cfg parameter
+- error: '[string "-- load_cfg.lua - internal file..."]:158: Error: cfg parameter
     ''listen'' should be one of types: string, number'
 ...
 box.cfg{wal_dir = 0}
 ---
-- error: '[string "-- load_cfg.lua - internal file..."]:150: Error: cfg parameter
+- error: '[string "-- load_cfg.lua - internal file..."]:152: Error: cfg parameter
     ''wal_dir'' should be of type string'
 ...
 box.cfg{coredump = 'true'}
 ---
-- error: '[string "-- load_cfg.lua - internal file..."]:150: Error: cfg parameter
+- error: '[string "-- load_cfg.lua - internal file..."]:152: Error: cfg parameter
     ''coredump'' should be of type boolean'
 ...
 --# clear filter
