@@ -31,9 +31,10 @@
 
 #include <map>
 #include <set>
-#include <vector>
-#include <string>
+#include <bitset>
 #include <memory>
+#include <string>
+#include <vector>
 #include <unordered_map>
 #include <boost/asio.hpp>
 #include <boost/range.hpp>
@@ -48,12 +49,15 @@
 #include <boost/multi_index/ordered_index.hpp>
 
 #include "xrow.h"
+#include "vclock.h"
 
 #if defined(__cplusplus)
 extern "C" {
 #endif /* defined(__cplusplus) */
 
 class raft_session;
+
+#define RAFT_LOCAL_DATA (raft_host_index[raft_state.local_id])
 
 struct raft_host_data {
 private:
@@ -62,13 +66,13 @@ private:
 
 public:
   raft_host_data()
-    : leader(false), local(false), connected(0), id(-1), port(0)
-    , out_session(nullptr), in_session(nullptr)
+    : leader(false), local(false), connected(0), id(-1), gsn(0)
+    , last_op_crc(0), port(0), out_session(nullptr), in_session(nullptr)
   {}
   raft_host_data(raft_host_data&& data)
     : leader(data.leader), local(data.local), connected(data.connected)
-    , id(data.id), host(std::move(data.host)), port(data.port)
-    , out_session(data.out_session.release()), in_session(data.in_session.release())
+    , id(data.id), host(std::move(data.host)), gsn(data.gsn), last_op_crc(data.last_op_crc)
+    , port(data.port), out_session(data.out_session.release()), in_session(data.in_session.release())
     , full_name(std::move(data.full_name))
   {
     buffer.bodycnt = 0;
@@ -81,6 +85,8 @@ public:
   uint8_t connected; // 0 - not connected, 1 - partial connected, 2 - full duplex
   uint8_t id;
   std::string host;
+  uint64_t gsn;
+  uint32_t last_op_crc;
   unsigned short port;
   std::unique_ptr<raft_session> out_session;
   std::unique_ptr<raft_session> in_session;
@@ -89,6 +95,7 @@ public:
 };
 
 typedef std::vector<raft_host_data> raft_host_index_t;
+extern raft_host_index_t raft_host_index;
 
 struct raft_header {
   uint8_t type;
@@ -113,12 +120,13 @@ struct raft_msg_body {
 
 struct raft_host_state {
   uint32_t server_id;
-  uint64_t gsn;
 
   bool operator==(const raft_host_state& s) const {
     return s.server_id == server_id;
   }
 };
+struct raft_host_state_compare;
+
 inline bool operator==(const raft_host_state& s1, const raft_host_state& s2) {
   return s1.operator==(s2);
 }
@@ -141,7 +149,9 @@ enum raft_machine_state {
   raft_state_started = 0,
   raft_state_initial = 1,
   raft_state_leader_accept = 2,
-  raft_state_ready = 3
+  raft_state_recovery = 3,
+  raft_state_wait_recovery = 4,
+  raft_state_ready = 5
 };
 
 namespace boost {
@@ -150,9 +160,13 @@ namespace boost {
   }
 }
 struct wal_write_request;
+
 struct raft_local_state {
   struct operation {
-    operation(boost::asio::io_service& io_service) : timeout(new boost::asio::deadline_timer(io_service)) {}
+    operation(boost::asio::io_service& io_service)
+      : gsn(0), server_id(0), lsn(0), submitted(0),rejected(0)
+      , req(NULL), timeout(new boost::asio::deadline_timer(io_service))
+    {}
     operation(operation&& op)
       : gsn(op.gsn), server_id(op.server_id), lsn(op.lsn), submitted(op.submitted)
       , rejected(op.rejected), key(op.key), req(op.req), timeout(op.timeout)
@@ -177,6 +191,13 @@ struct raft_local_state {
   };
   struct gsn_hash{};
   struct key_hash{};
+  struct host_state_compare {
+    bool operator()( const raft_host_state& lhs, const raft_host_state& rhs ) const {
+      const raft_host_data& d1 = raft_host_index[lhs.server_id];
+      const raft_host_data& d2 = raft_host_index[rhs.server_id];
+      return d1.id == d2.id ? false : (d1.gsn > d2.gsn ? true : (d1.gsn < d2.gsn ? false : d1.id > d2.id));
+    }
+  };
 
 private:
   typedef boost::multi_index_container<
@@ -191,21 +212,16 @@ private:
       >
     > global_operation_map;
   typedef std::unordered_map<uint64_t, wal_write_request*> local_operation_map;
-  struct host_state_compare {
-    bool operator()( const raft_host_state& lhs, const raft_host_state& rhs ) const {
-      return lhs.server_id == rhs.server_id ? false : (lhs.gsn > rhs.gsn ? true : (lhs.gsn < rhs.gsn ? false : lhs.server_id > rhs.server_id));
-    }
-  };
 public:
   raft_local_state()
     : leader_id(-1), num_leader_accept(0), num_connected(1)
     , max_connected_id(-1), local_id(-1), state(raft_state_started)
-    , gsn(-1), lsn(-1), max_gsn(-1), start_election_time(boost::posix_time::microsec_clock::universal_time())
+    , lsn(-1), fiber_num(1), start_election_time(boost::posix_time::microsec_clock::universal_time())
   {}
+
 
   boost::asio::io_service io_service;
 
-  raft_host_index_t host_index;
   std::set<raft_host_state, host_state_compare> host_state;
   int8_t leader_id;
   uint8_t num_leader_accept;
@@ -213,12 +229,12 @@ public:
   int8_t max_connected_id;
   int8_t local_id;
   uint8_t state;
-  int64_t gsn;
   int64_t lsn;
-  int64_t max_gsn;
+  uint32_t fiber_num;
 
   global_operation_map operation_index;
   local_operation_map local_operation_index;
+  std::bitset<VCLOCK_MAX> hosts_for_recover;
 
   /* settings */
   boost::posix_time::time_duration read_timeout;
@@ -233,7 +249,7 @@ public:
 extern struct raft_local_state raft_state;
 
 inline bool has_consensus() {
-  return raft_state.num_connected > raft_state.host_index.size() / 2;
+  return raft_state.num_connected > raft_host_index.size() / 2;
 }
 inline bool has_leader() {
   return raft_state.leader_id >= 0;
@@ -243,8 +259,10 @@ inline bool is_leader() {
 }
 
 void raft_write_wal_remote(uint64_t gsn, uint32_t server_id);
-void raft_write_wal_local(const raft_local_state::operation& op);
+void raft_write_wal_local(const typename raft_local_state::operation& op);
 void raft_rollback_local(uint64_t gsn);
+void raft_recover_node(int64_t gsn);
+void raft_leader_promise();
 
 #if defined(__cplusplus)
 } /* extern "C" */
