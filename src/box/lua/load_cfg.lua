@@ -78,6 +78,8 @@ local default_cfg = {
     raft_election_timeout   = -1,
     raft_replica            = "",
     raft_local              = "",
+    raft_fiber_num          = 1,
+    raft_queue_len          = 1,
 }
 
 -- types of available options
@@ -122,6 +124,8 @@ local template = {
     raft_election_timeout   = 'number',
     raft_replica            = 'string',
     raft_local              = 'string',
+    raft_fiber_num          = 'number',
+    raft_queue_len          = 'number',
 }
 
 -- dynamically settable options
