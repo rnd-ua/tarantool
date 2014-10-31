@@ -82,6 +82,8 @@ local default_cfg = {
     raft_election_timeout   = -1,
     raft_replica            = "",
     raft_local              = "",
+    raft_fiber_num          = 1,
+    raft_queue_len          = 1,
 }
 
 -- see template_cfg below
@@ -147,6 +149,8 @@ local template_cfg = {
     raft_election_timeout   = 'number',
     raft_replica            = 'string',
     raft_local              = 'string',
+    raft_fiber_num          = 'number',
+    raft_queue_len          = 'number',
 }
 
 local function normalize_uri(port)
