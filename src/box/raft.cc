@@ -322,6 +322,7 @@ static void raft_read_cfg() {
   raft_state.reconnect_timeout = raft_get_timeout("raft_reconnect_timeout", 3100);
   raft_state.operation_timeout = raft_get_timeout("raft_operation_timeout", 3500);
   raft_state.fiber_num = std::max((int)raft_state.fiber_num, cfg_geti("raft_fiber_num"));
+  raft_state.host_queue_len = std::max((int)raft_state.host_queue_len, cfg_geti("raft_queue_len"));
   auto election_timeout = raft_get_timeout("raft_election_timeout", -1);
   if (!election_timeout.is_special()) {
     raft_state.start_election_time += election_timeout;

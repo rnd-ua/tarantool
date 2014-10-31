@@ -216,7 +216,8 @@ public:
   raft_local_state()
     : leader_id(-1), num_leader_accept(0), num_connected(1)
     , max_connected_id(-1), local_id(-1), state(raft_state_started)
-    , lsn(-1), fiber_num(1), start_election_time(boost::posix_time::microsec_clock::universal_time())
+    , lsn(-1), fiber_num(1), host_queue_len(1)
+    , start_election_time(boost::posix_time::microsec_clock::universal_time())
   {}
 
 
@@ -231,6 +232,7 @@ public:
   uint8_t state;
   int64_t lsn;
   uint32_t fiber_num;
+  uint32_t host_queue_len;
 
   global_operation_map operation_index;
   local_operation_map local_operation_index;
