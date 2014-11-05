@@ -84,7 +84,7 @@ private:
   void handle_submit();
   void handle_reject();
   void handle_proxy_request();
-  void handle_proxy_response();
+  void handle_proxy_submit();
 
   void start_timeout(const boost::posix_time::time_duration& t);
   void start_recover();

@@ -34,6 +34,7 @@
 #include <boost/bind.hpp>
 
 #include "say.h"
+#include "box/recovery.h"
 #include "msgpuck/msgpuck.h"
 
 #define CANCEL_TIMER if (ec != boost::asio::error::operation_aborted) timer_.cancel();
@@ -68,7 +69,7 @@ void raft_session::init_handlers() {
   handlers_[raft_mtype_submit] = &raft_session::handle_submit;
   handlers_[raft_mtype_reject] = &raft_session::handle_reject;
   handlers_[raft_mtype_proxy_request] = &raft_session::handle_proxy_request;
-  handlers_[raft_mtype_proxy_response] = &raft_session::handle_proxy_response;
+  handlers_[raft_mtype_proxy_submit] = &raft_session::handle_proxy_submit;
 }
 
 void raft_session::reconnect() {
@@ -358,7 +359,11 @@ void raft_session::handle_body() {
   uint64_t gsn = decode_body();
   if (host_->id == raft_state.leader_id) {
     RAFT_LOCAL_DATA.gsn = gsn;
-    raft_write_wal_remote(gsn, host_->id);
+    if (host_->buffer.server_id != raft_state.local_id) {
+      raft_write_wal_remote(gsn, host_->id);
+    } else {
+      raft_write_wal_local_slave(host_->buffer.lsn, gsn);
+    }
   } else {
     say_error("[%tX] receive insert operation from slave %s, gsn %td, lsn %td", (ptrdiff_t)this, host_->full_name.c_str(), gsn, host_->buffer.lsn);
   }
@@ -380,11 +385,18 @@ void raft_session::handle_submit() {
     start_recover();
     return;
   }
+  assert(host_->active_ops.front() == gsn); // TODO non-sequential host found, disconnect
+  host_->active_ops.pop_front();
   auto& index = raft_state.operation_index.get<raft_local_state::gsn_hash>();
   auto i_op = index.find(gsn);
   if (i_op != index.end()) {
     if (++i_op->submitted > raft_host_index.size() / 2) {
-      raft_write_wal_local(*i_op.operator->());
+      raft_write_wal_local_leader(*i_op.operator->());
+      auto i_proxy = raft_state.proxy_requests.find(gsn);
+      if (i_proxy != raft_state.proxy_requests.end()) {
+        raft_host_index[i_proxy->second.first].out_session->send(raft_mtype_proxy_submit, i_proxy->second.second);
+        raft_state.proxy_requests.erase(i_proxy);
+      }
       index.erase(i_op);
     } else {
       say_debug("[%tX] leader received submit with gsn %td from %s status is %d", (ptrdiff_t)this, gsn, host_->full_name.c_str(), (int)i_op->submitted);
@@ -399,6 +411,8 @@ void raft_session::handle_reject() {
   if (raft_state.leader_id != raft_state.local_id) {
     // TODO : reject all operations [gsn, ...)
   } else {
+    assert(host_->active_ops.front() == gsn); // TODO non-sequential host found, disconnect
+    host_->active_ops.pop_front();
     auto& index = raft_state.operation_index.get<raft_local_state::gsn_hash>();
     auto i_op = index.find(gsn);
     if (i_op != index.end()) {
@@ -419,12 +433,18 @@ void raft_session::handle_proxy_request() {
   if (raft_state.leader_id != raft_state.local_id) {
     say_warn("[%tX] slave received proxy request with lsn %td from %s", (ptrdiff_t)this, host_->buffer.lsn, host_->full_name.c_str());
   } else {
-    raft_write_wal_remote(++RAFT_LOCAL_DATA.gsn, host_->id);
+    uint64_t gsn = ++RAFT_LOCAL_DATA.gsn;
+    raft_state.proxy_requests.emplace(gsn, std::make_pair(host_->id, host_->buffer.lsn));
+    raft_write_wal_remote(gsn, host_->id);
   }
 }
 
-void raft_session::handle_proxy_response() {
-
+void raft_session::handle_proxy_submit() {
+  uint64_t lsn = decode_gsn();
+  auto i_proxy = raft_state.local_operation_index.find(lsn);
+  i_proxy->second->res = 0;
+  raft_write_wal_local_slave(lsn, i_proxy->second->row->lsn);
+  raft_state.local_operation_index.erase(i_proxy);
 }
 
 void raft_session::fault(boost::system::error_code ec) {
