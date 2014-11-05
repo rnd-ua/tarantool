@@ -401,7 +401,7 @@ void raft_session::handle_submit() {
     } else {
       say_debug("[%tX] leader received submit with gsn %td from %s status is %d", (ptrdiff_t)this, gsn, host_->full_name.c_str(), (int)i_op->submitted);
     }
-  } else if (gsn >= RAFT_LOCAL_DATA.gsn) {
+  } else if (gsn > RAFT_LOCAL_DATA.gsn) {
     say_warn("[%tX] leader received unknown submit with gsn %td from %s", (ptrdiff_t)this, gsn, host_->full_name.c_str());
   }
 }
