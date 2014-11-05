@@ -242,7 +242,7 @@ wal_writer* raft_init(wal_writer* initial, struct vclock *vclock) {
 }
 
 int raft_write(struct recovery_state *r, struct xrow_header *row) {
-  auto i_proxy = raft_state.proxy_requests.find(row->lsn);
+  auto i_proxy = row == NULL ? raft_state.proxy_requests.end() : raft_state.proxy_requests.find(row->lsn);
   if (row && row->server_id == RAFT_SERVER_ID && i_proxy == raft_state.proxy_requests.end())
   {
     if (raft_state.local_id < 0) {
@@ -650,14 +650,8 @@ static void raft_proceed_queue() {
 #include <sstream>
 
 void raft_leader_promise() {
-  std::stringstream status_stream;
-  for (auto& h : raft_state.host_state) {
-    status_stream << h.server_id << ":" << raft_host_index[h.server_id].gsn << ":" << raft_host_index[h.server_id].last_op_crc << " ; ";
-  }
-  std::string status = status_stream.str();
-  say_info("leader status: num_connected=%d, state=%d, local_id=%d, max_id=%d, %s",
-      (int)raft_state.num_connected, (int)raft_state.state,
-      (int)raft_state.local_id, (int)raft_state.max_connected_id, status.c_str()
+  say_info("leader status: num_connected=%d, state=%d, local_id=%d, max_id=%d",
+      (int)raft_state.num_connected, (int)raft_state.state, (int)raft_state.local_id, (int)raft_state.max_connected_id
   );
   if (has_consensus() && raft_state.local_id == raft_state.max_connected_id &&
       (raft_state.state == raft_state_initial || raft_state.state == raft_state_started))
