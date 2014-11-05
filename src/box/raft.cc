@@ -242,8 +242,7 @@ wal_writer* raft_init(wal_writer* initial, struct vclock *vclock) {
 }
 
 int raft_write(struct recovery_state *r, struct xrow_header *row) {
-  auto i_proxy = row == NULL ? raft_state.proxy_requests.end() : raft_state.proxy_requests.find(row->lsn);
-  if (row && row->server_id == RAFT_SERVER_ID && i_proxy == raft_state.proxy_requests.end())
+  if (row && row->server_id == RAFT_SERVER_ID)
   {
     if (raft_state.local_id < 0) {
       initial_op_crc = crc32_calc(initial_op_crc, (const char*)row->body[0].iov_base, row->body[0].iov_len);
@@ -264,7 +263,7 @@ int raft_write(struct recovery_state *r, struct xrow_header *row) {
   req->row = row;
   row->tm = ev_now(loop());
   row->sync = 0;
-  if (row->server_id == RAFT_SERVER_ID && i_proxy == raft_state.proxy_requests.end()) {
+  if (row->server_id == RAFT_SERVER_ID && raft_state.leader_id != raft_state.local_id) {
     req->res = wal_write(wal_local_writer, req);
     if (req->res < 0) {
       raft_state.io_service.post(boost::bind(&raft_writer_push, row->lsn, false));
