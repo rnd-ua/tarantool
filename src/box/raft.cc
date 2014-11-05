@@ -242,7 +242,9 @@ wal_writer* raft_init(wal_writer* initial, struct vclock *vclock) {
 }
 
 int raft_write(struct recovery_state *r, struct xrow_header *row) {
-  if (row && row->server_id == RAFT_SERVER_ID) {
+  auto i_proxy = raft_state.proxy_requests.find(row->lsn);
+  if (row && row->server_id == RAFT_SERVER_ID && i_proxy == raft_state.proxy_requests.end())
+  {
     if (raft_state.local_id < 0) {
       initial_op_crc = crc32_calc(initial_op_crc, (const char*)row->body[0].iov_base, row->body[0].iov_len);
     } else {
@@ -262,7 +264,7 @@ int raft_write(struct recovery_state *r, struct xrow_header *row) {
   req->row = row;
   row->tm = ev_now(loop());
   row->sync = 0;
-  if (row->server_id == RAFT_SERVER_ID) {
+  if (row->server_id == RAFT_SERVER_ID && i_proxy == raft_state.proxy_requests.end()) {
     req->res = wal_write(wal_local_writer, req);
     if (req->res < 0) {
       raft_state.io_service.post(boost::bind(&raft_writer_push, row->lsn, false));
@@ -272,6 +274,7 @@ int raft_write(struct recovery_state *r, struct xrow_header *row) {
       return 0;
     }
   } else {
+    if (row->server_id != RAFT_SERVER_ID) row->server_id = raft_state.local_id;
     (void) tt_pthread_mutex_lock(&writer->mutex);
     bool input_was_empty = STAILQ_EMPTY(&writer->input);
     STAILQ_INSERT_TAIL(&writer->input, req, wal_fifo_entry);
@@ -288,7 +291,18 @@ int raft_write(struct recovery_state *r, struct xrow_header *row) {
     if (req->res < 0)
       return -1; /* error */
 
-    return wal_write(wal_local_writer, req); /* success, send to local wal writer */
+    if (raft_state.leader_id == raft_state.local_id) {
+      return wal_write(wal_local_writer, req); /* success, send to local wal writer */
+    } else {
+      if (wal_write(wal_local_writer, req) < 0) {
+        raft_state.io_service.post(boost::bind(&raft_writer_push, row->lsn, false));
+        return -1;
+      } else {
+        raft_state.io_service.post(boost::bind(&raft_writer_push, row->lsn, true));
+      }
+      fiber_yield(); /* Request was inserted. */
+      return req->res;
+    }
   }
 }
 
@@ -443,13 +457,25 @@ void raft_write_wal_remote(uint64_t gsn, uint32_t server_id) {
   tt_pthread_mutex_unlock(&proxy_wal_writer.mutex);
 }
 
-void raft_write_wal_local(const raft_local_state::operation& op) {
+void raft_write_wal_local_leader(const raft_local_state::operation& op) {
   op.req->res = 0;
   op.req->row->lsn = op.gsn;
   op.req->row->server_id = RAFT_SERVER_ID;
   op.timeout->cancel();
   tt_pthread_mutex_lock(&proxy_wal_writer.mutex);
   STAILQ_INSERT_TAIL(&proxy_wal_writer.commit, op.req, wal_fifo_entry);
+  ev_async_send(proxy_wal_writer.txn_loop, &proxy_wal_writer.write_event);
+  tt_pthread_mutex_unlock(&proxy_wal_writer.mutex);
+}
+
+void raft_write_wal_local_slave(uint64_t lsn, uint64_t gsn) {
+  auto i_req = raft_state.local_operation_index.find(lsn);
+  assert(i_req != raft_state.local_operation_index.end());
+  i_req->second->res = 0;
+  i_req->second->row->lsn = gsn;
+  i_req->second->row->server_id = RAFT_SERVER_ID;
+  tt_pthread_mutex_lock(&proxy_wal_writer.mutex);
+  STAILQ_INSERT_TAIL(&proxy_wal_writer.commit, i_req->second, wal_fifo_entry);
   ev_async_send(proxy_wal_writer.txn_loop, &proxy_wal_writer.write_event);
   tt_pthread_mutex_unlock(&proxy_wal_writer.mutex);
 }
@@ -547,13 +573,13 @@ void raft_recover_node(int64_t gsn) {
 
 static void raft_proceed_queue() {
   if (raft_state.state == raft_state_started) return;
-  if (raft_state.leader_id != raft_state.local_id) {
+/*  if (raft_state.leader_id != raft_state.local_id) {
     tt_pthread_mutex_lock(&proxy_wal_writer.mutex);
     proxy_wal_writer.is_rollback = true;
     ev_async_send(proxy_wal_writer.txn_loop, &proxy_wal_writer.write_event);
     tt_pthread_mutex_unlock(&proxy_wal_writer.mutex);
     return;
-  }
+  }*/
   struct wal_fifo input = STAILQ_HEAD_INITIALIZER(input);
   struct wal_fifo rollback = STAILQ_HEAD_INITIALIZER(rollback);
   tt_pthread_mutex_lock(&proxy_wal_writer.mutex);
@@ -574,21 +600,33 @@ static void raft_proceed_queue() {
         break;
       }
       raft_local_state::operation op(raft_state.io_service);
-      op.gsn = ++RAFT_LOCAL_DATA.gsn;
+      if (wreq->row->server_id == RAFT_SERVER_ID) {
+        auto i_proxy = raft_state.proxy_requests.find(wreq->row->lsn);
+        op.gsn = i_proxy->first;
+        wreq->row->server_id = op.server_id = i_proxy->second.first;
+        wreq->row->lsn = op.lsn = i_proxy->second.second;
+      } else {
+        op.gsn = ++RAFT_LOCAL_DATA.gsn;
+        op.server_id = raft_state.local_id;
+        op.lsn = ++raft_state.lsn;
+      }
       op.key = key;
-      op.lsn = ++raft_state.lsn;
-      op.rejected = 0;
       op.submitted = 1;
+      op.rejected = 0;
       op.req = wreq;
-      op.server_id = raft_state.local_id;
       op.timeout->expires_from_now(raft_state.operation_timeout);
       op.timeout->async_wait(boost::bind(&raft_operation_timeout, op.gsn, _1));
       raft_state.operation_index.insert(op);
       raft_msg_body msg = {op.gsn, op.req->row };
       wreq = STAILQ_NEXT(wreq, wal_fifo_entry);
       for (auto &host : raft_host_index) {
-        if (!host.local && host.connected == 2)
+        if (!host.local && host.connected == 2) {
+          if (host.active_ops.size() == raft_state.host_queue_len) {
+            // slow host found, disconnect
+          }
+          host.active_ops.push_back(op.gsn);
           host.out_session->send(raft_mtype_body, msg);
+        }
       }
     }
     STAILQ_SPLICE(&input, wreq, wal_fifo_entry, &rollback);

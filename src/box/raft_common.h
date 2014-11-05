@@ -92,6 +92,7 @@ public:
   std::unique_ptr<raft_session> in_session;
   std::string full_name;
   xrow_header buffer;
+  std::list<uint64_t> active_ops;
 };
 
 typedef std::vector<raft_host_data> raft_host_index_t;
@@ -141,7 +142,7 @@ enum raft_message_type {
   raft_mtype_submit = 6,
   raft_mtype_reject = 7,
   raft_mtype_proxy_request = 8,
-  raft_mtype_proxy_response = 9,
+  raft_mtype_proxy_submit = 9,
   raft_mtype_count = 10
 };
 
@@ -237,6 +238,7 @@ public:
   global_operation_map operation_index;
   local_operation_map local_operation_index;
   std::bitset<VCLOCK_MAX> hosts_for_recover;
+  std::unordered_map<uint64_t, std::pair<uint32_t, uint64_t> > proxy_requests;
 
   /* settings */
   boost::posix_time::time_duration read_timeout;
@@ -261,7 +263,8 @@ inline bool is_leader() {
 }
 
 void raft_write_wal_remote(uint64_t gsn, uint32_t server_id);
-void raft_write_wal_local(const typename raft_local_state::operation& op);
+void raft_write_wal_local_leader(const typename raft_local_state::operation& op);
+void raft_write_wal_local_slave(uint64_t lsn, uint64_t gsn);
 void raft_rollback_local(uint64_t gsn);
 void raft_recover_node(int64_t gsn);
 void raft_leader_promise();
