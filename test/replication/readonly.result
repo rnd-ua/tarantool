@@ -3,7 +3,7 @@ box.schema.user.grant('guest', 'replication')
 ...
 box.info.server.id
 ---
-- 2
+- 12
 ...
 box.info.server.ro
 ---
@@ -35,7 +35,7 @@ space = box.schema.create_space("ro")
 ---
 - error: Can't modify data because this server in read-only mode.
 ...
-box.info.vclock[2]
+box.info.vclock[12]
 ---
 - null
 ...
