@@ -64,6 +64,11 @@ static void raft_init_state(const struct vclock* vclock);
 static void raft_proceed_queue();
 static uint32_t initial_op_crc;
 
+/** REWRITED based on C-style tarantool internal modules sync master-master */
+static void* bsync_thread(void*);
+static struct cord bsync_cord;
+static struct coio_service bsync_coio;
+
 /**
 * A pthread_atfork() callback for a child process. Today we only
 * fork the master process to save a snapshot, and in the child
@@ -238,6 +243,9 @@ wal_writer* raft_init(wal_writer* initial, struct vclock *vclock) {
     wal_writer_destroy(&proxy_wal_writer);
     return 0;
   }
+  if (cord_start(&bsync_cord, "bsync", bsync_thread, NULL)) {
+    say_error("cant start bsync thread");
+  }
   return &proxy_wal_writer;
 }
 
@@ -411,6 +419,7 @@ private:
 };
 
 static void* raft_writer_thread(void*) {
+  return NULL;
   for (auto& host : raft_host_index) {
     if (!host.local) {
       host.out_session.reset(new raft_session(host.id));
@@ -693,4 +702,48 @@ void raft_writer_stop(struct recovery_state *r) {
     wal_local_writer = NULL;
   }
   wal_writer_stop(r);
+}
+
+/* ******************************************************************************** */
+
+static void bsync_handler(va_list /* args */) {
+  say_info("receive incoming connection");
+}
+
+static void bsync_out_fiber(va_list ap) {
+  const char* uri = va_arg(ap, const char*);
+  say_info("send outgoing connection to %s", uri);
+  struct remote remote;
+  /* First, stop the reader, then set the source */
+  snprintf(remote.source, sizeof(remote.source), "%s", uri);
+  int rc = uri_parse(&remote.uri, remote.source);
+  /* URI checked by box_check_replication_source() */
+  assert(rc == 0 && remote.uri.service != NULL);
+  (void) rc;
+  remote.addr_len = sizeof(remote.addrstorage);
+  char host[URI_MAXHOST] = { '\0' };
+  if (remote.uri.host) {
+    snprintf(host, sizeof(host), "%.*s", (int) remote.uri.host_len, remote.uri.host);
+  }
+  char service[URI_MAXSERVICE];
+  snprintf(service, sizeof(service), "%.*s", (int) remote.uri.service_len, remote.uri.service);
+  while (true) {
+    int r = coio_connect_timeout(&bsync_coio.evio_service.ev, host, service, &remote.addr, &remote.addr_len, 300.0);
+    say_info("result is %d, try to reconnect", r);
+  }
+}
+
+static void* bsync_thread(void*) {
+  cord() = &bsync_cord;
+  coio_service_init(&bsync_coio, "bsync", raft_host_index[raft_state.local_id].full_name.c_str(), bsync_handler, NULL);
+  evio_service_start(&bsync_coio.evio_service);
+  for (auto& host : raft_host_index) {
+    if (!host.local) {
+      fiber_call(fiber_new(host.full_name.c_str(), bsync_out_fiber), host.full_name.c_str());
+      break;
+    }
+  }
+  ev_run(loop(), 0);
+  say_info("bsync stopped");
+  return NULL;
 }
