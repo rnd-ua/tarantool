@@ -48,8 +48,7 @@
 #include "box/cluster.h"
 #include "vclock.h"
 #include "session.h"
-#include "coio.h"
-#include "raft.h"
+#include "bsync.h"
 
 /*
  * Recovery subsystem
@@ -147,15 +146,9 @@ fill_lsn(struct recovery_state *r, struct xrow_header *row)
 /* {{{ Initial recovery */
 
 static int
-<<<<<<< HEAD
-wal_writer_start(struct recovery_state *state, int rows_per_wal);
-void
-wal_writer_stop(struct recovery_state *r);
-=======
 wal_writer_start(struct recovery_state *state);
 static void
 recovery_stop_local(struct recovery_state *r);
->>>>>>> first simple RAFT implementation
 
 /**
  * Throws an exception in  case of error.
@@ -245,8 +238,8 @@ recovery_delete(struct recovery_state *r)
 	recovery_stop_local(r);
 
 	if (r->writer) {
-    raft_writer_stop(r);
-  }
+		bsync_writer_stop(r);
+	}
 
 	xdir_destroy(&r->snap_dir);
 	xdir_destroy(&r->wal_dir);
@@ -322,7 +315,7 @@ recovery_bootstrap(struct recovery_state *r)
 {
 	/* Add a surrogate server id for snapshot rows */
 	vclock_add_server(&r->vclock, 0);
-	vclock_add_server(&r->vclock, RAFT_SERVER_ID);
+	vclock_add_server(&r->vclock, BSYNC_SERVER_ID);
 
 	/* Recover from bootstrap.snap */
 	say_info("initializing an empty data directory");
@@ -374,7 +367,7 @@ recover_snap(struct recovery_state *r)
 
 	/* Add a surrogate server id for snapshot rows */
 	vclock_add_server(&r->vclock, 0);
-	vclock_add_server(&r->vclock, RAFT_SERVER_ID);
+	vclock_add_server(&r->vclock, BSYNC_SERVER_ID);
 
 	say_info("recovering from `%s'", snap->filename);
 	recover_xlog(r, snap);
@@ -560,12 +553,7 @@ recovery_finalize(struct recovery_state *r, int rows_per_wal)
 
 		recovery_close_log(r);
 	}
-<<<<<<< HEAD
-
-	wal_writer_start(r, rows_per_wal);
-=======
 	wal_writer_start(r);
->>>>>>> first simple RAFT implementation
 }
 
 
@@ -656,9 +644,7 @@ struct wal_writer
 	struct vclock vclock;
 	bool is_started;
 };
-=======
 static pthread_once_t wal_writer_once = PTHREAD_ONCE_INIT;
->>>>>>> first simple RAFT implementation
 
 static struct wal_writer wal_writer;
 
@@ -829,13 +815,10 @@ wal_writer_start(struct recovery_state *r, int rows_per_wal)
 		r->writer = NULL;
 		return -1;
 	}
-<<<<<<< HEAD
 	wal_writer.is_started = true;
+	r->writer = raft_init(r->writer, &r->vclock);
+	r->writer = bsync_init(r->writer, &r->vclock);
 	return 0;
-=======
-  r->writer = raft_init(r->writer, &r->vclock);
-  return 0;
->>>>>>> first simple RAFT implementation
 }
 
 /** Stop and destroy the writer thread (at shutdown). */
