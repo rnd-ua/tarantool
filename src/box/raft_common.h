@@ -50,6 +50,7 @@
 
 #include "xrow.h"
 #include "vclock.h"
+#include "iobuf.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -143,7 +144,8 @@ enum raft_message_type {
   raft_mtype_reject = 7,
   raft_mtype_proxy_request = 8,
   raft_mtype_proxy_submit = 9,
-  raft_mtype_count = 10
+  raft_mtype_ping = 10,
+  raft_mtype_count = 11
 };
 
 enum raft_machine_state {

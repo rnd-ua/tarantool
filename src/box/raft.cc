@@ -34,6 +34,10 @@
 #include <boost/bind.hpp>
 #include <boost/lexical_cast.hpp>
 
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
+
 #include "crc32.h"
 #include "cfg.h"
 #include "fio.h"
@@ -46,6 +50,7 @@
 #include "raft_common.h"
 #include "raft_session.h"
 #include "box/log_io.h"
+#include "coio_buf.h"
 
 /** REWRITED based on C-style tarantool internal modules sync master-master */
 static void* bsync_thread(void*);
@@ -246,6 +251,9 @@ wal_writer* raft_init(wal_writer* initial, struct vclock *vclock) {
       wal_writer_destroy(&proxy_wal_writer);
       return 0;
     }
+  } else {
+		wal_local_writer = NULL;
+		return initial;
   }
   return &proxy_wal_writer;
 }
@@ -656,8 +664,6 @@ static void raft_proceed_queue() {
   tt_pthread_mutex_unlock(&proxy_wal_writer.mutex);
 }
 
-#include <sstream>
-
 void raft_leader_promise() {
   say_info("leader status: num_connected=%d, state=%d, local_id=%d, max_id=%d",
       (int)raft_state.num_connected, (int)raft_state.state, (int)raft_state.local_id, (int)raft_state.max_connected_id
@@ -707,16 +713,317 @@ void raft_writer_stop(struct recovery_state *r) {
 
 /* ******************************************************************************** */
 
+#define BSYNC_SYSBUFFER_SIZE 64
+#define BSYNC_MAX_HOSTS 16
+
+struct bsync_host_data {
+	uint8_t connected;
+	uint64_t gsn;
+	struct fiber* fiber_out;
+	struct fiber* fiber_in;
+	struct io_buf* buffer;
+	const void* buffer_out;
+	ssize_t buffer_out_size;
+};
+static struct bsync_host_data bsync_index[BSYNC_MAX_HOSTS];
+
+static struct bsync_state_ {
+	uint8_t local_id;
+	uint8_t leader_id;
+	uint64_t lsn;
+	uint8_t num_hosts;
+	uint8_t num_connected;
+	uint8_t state;
+	uint8_t num_accepted;
+
+	ev_tstamp connect_timeout;
+	ev_tstamp read_timeout;
+	ev_tstamp write_timeout;
+	ev_tstamp reconnect_timeout;
+} bsync_state;
+
+#define BSYNC_TRACE say_debug("%s:%d current state: nconnected=%d, state=%d, naccepted=%d\n", \
+	__PRETTY_FUNCTION__, __LINE__, bsync_state.num_connected, bsync_state.state, bsync_state.num_accepted);
+
+#define BSYNC_LOCAL bsync_index[bsync_state.local_id]
+
+static char bsync_system_out[BSYNC_SYSBUFFER_SIZE];
+static char bsync_system_in[BSYNC_SYSBUFFER_SIZE];
+
+static const char* bsync_mtype_name[] = {
+	"bsync_hello",
+	"bsync_promise",
+	"bsync_leader_accept",
+	"bsync_leader_submit",
+	"bsync_leader_reject",
+	"bsync_body",
+	"bsync_submit",
+	"bsync_reject",
+	"bsync_proxy_request",
+	"bsync_proxy_submit",
+	"bsync_ping"
+};
+
+static uint64_t
+bsync_max_host()
+{BSYNC_TRACE
+	uint8_t max_host_id = 0;
+	for (uint8_t i = 1; i < bsync_state.num_hosts; ++i) {
+		if (bsync_index[i].gsn >= bsync_index[max_host_id].gsn &&
+			bsync_index[i].connected == 2)
+		{
+			max_host_id = i;
+		}
+	}
+	return max_host_id;
+}
+
 static void
-bsync_handler(va_list /* args */)
-{
-	say_info("receive incoming connection");
+bsync_connected(uint8_t host_id)
+{BSYNC_TRACE
+	if (bsync_state.leader_id == bsync_state.local_id) {
+		char* pos = bsync_system_out;
+		pos = mp_encode_uint(pos, mp_sizeof_uint(raft_mtype_leader_submit));
+		pos = mp_encode_uint(pos, raft_mtype_leader_submit);
+		bsync_index[host_id].buffer_out = bsync_system_out;
+		bsync_index[host_id].buffer_out_size = pos - bsync_system_out;
+		if (bsync_index[host_id].fiber_out != fiber()) {
+			fiber_call(bsync_index[host_id].fiber_out);
+		}
+		return;
+	}
+	if (2 * bsync_state.num_connected <= bsync_state.num_hosts ||
+		bsync_state.state > raft_state_initial)
+	{
+		return;
+	}
+	if (bsync_state.state > raft_state_initial) return;
+	uint8_t max_host_id = bsync_max_host();
+	if (max_host_id != bsync_state.local_id) return;
+	bsync_state.num_accepted = 1;
+	bsync_state.state = raft_state_leader_accept;
+	ssize_t msize = mp_sizeof_uint(BSYNC_LOCAL.gsn) +
+		mp_sizeof_uint(raft_mtype_leader_promise);
+	char* pos = bsync_system_out;
+	pos = mp_encode_uint(pos, msize);
+	pos = mp_encode_uint(pos, raft_mtype_leader_promise);
+	pos = mp_encode_uint(pos, BSYNC_LOCAL.gsn);
+	for (uint8_t i = 0; i < bsync_state.num_hosts; ++i) {
+		if (i == max_host_id) continue;
+		bsync_index[i].buffer_out = bsync_system_out;
+		bsync_index[i].buffer_out_size = pos - bsync_system_out;
+		if (bsync_index[i].fiber_out != fiber()) {
+			fiber_call(bsync_index[i].fiber_out);
+		}
+	}
+}
+
+static void
+bsync_disconnected(uint8_t host_id) {
+	--bsync_state.num_connected;
+	if (2 * bsync_state.num_connected <= bsync_state.num_hosts ||
+		host_id == bsync_state.leader_id)
+	{
+		bsync_state.leader_id = -1;
+		bsync_state.state = raft_state_initial;
+		bsync_connected(host_id);
+	}
+}
+
+static void
+bsync_leader_promise(uint8_t host_id, const char** ipos)
+{BSYNC_TRACE
+	(void)host_id; (void)ipos;
+	bsync_index[host_id].gsn = mp_decode_uint(ipos);
+	char* pos = bsync_system_out;
+	uint8_t max_host_id = bsync_max_host();
+	if (host_id != max_host_id || bsync_state.state > raft_state_initial) {
+		ssize_t msize = mp_sizeof_uint(raft_mtype_leader_reject) +
+			mp_sizeof_uint(max_host_id) +
+			mp_sizeof_uint(bsync_index[max_host_id].gsn);
+		pos = mp_encode_uint(pos, msize);
+		pos = mp_encode_uint(pos, raft_mtype_leader_reject);
+		pos = mp_encode_uint(pos, max_host_id);
+		pos = mp_encode_uint(pos, bsync_index[max_host_id].gsn);
+	} else {
+		ssize_t msize = mp_sizeof_uint(raft_mtype_leader_accept);
+		pos = mp_encode_uint(pos, msize);
+		pos = mp_encode_uint(pos, raft_mtype_leader_accept);
+		bsync_state.state = raft_state_leader_accept;
+	}
+	bsync_index[host_id].buffer_out = bsync_system_out;
+	bsync_index[host_id].buffer_out_size = pos - bsync_system_out;
+	fiber_call(bsync_index[host_id].fiber_out);
+}
+
+static void
+bsync_leader_accept(uint8_t host_id, const char** ipos)
+{BSYNC_TRACE
+	(void)host_id; (void)ipos;
+	if (bsync_state.state != raft_state_leader_accept) return;
+	if (2 * ++bsync_state.num_accepted <= bsync_state.num_hosts) return;
+	say_info("new leader are %s", raft_host_index[bsync_state.local_id].full_name.c_str());
+	bsync_state.state = raft_state_ready;
+	bsync_state.leader_id = bsync_state.local_id;
+	char* pos = bsync_system_out;
+	pos = mp_encode_uint(pos, mp_sizeof_uint(raft_mtype_leader_submit));
+	pos = mp_encode_uint(pos, raft_mtype_leader_submit);
+	for (uint8_t i = 0; i < bsync_state.num_hosts; ++i) {
+		if (i == bsync_state.local_id) continue;
+		bsync_index[i].buffer_out = bsync_system_out;
+		bsync_index[i].buffer_out_size = pos - bsync_system_out;
+		fiber_call(bsync_index[i].fiber_out);
+	}
+}
+
+static void
+bsync_leader_submit(uint8_t host_id, const char** ipos)
+{BSYNC_TRACE
+	(void)host_id; (void)ipos;
+	bsync_state.leader_id = host_id;
+	bsync_state.state = raft_state_ready;
+	say_info("new leader are %s", raft_host_index[host_id].full_name.c_str());
+}
+
+static void
+bsync_leader_reject(uint8_t host_id, const char** ipos)
+{BSYNC_TRACE
+	(void)host_id; (void)ipos;
+	uint8_t max_id = mp_decode_uint(ipos);
+	bsync_index[max_id].gsn = mp_decode_uint(ipos);
+	bsync_connected(host_id);
+}
+
+static void
+bsync_body(uint8_t host_id, const char** ipos)
+{BSYNC_TRACE
+	(void)host_id; (void)ipos;
+}
+
+static void
+bsync_submit(uint8_t host_id, const char** ipos)
+{BSYNC_TRACE
+	(void)host_id; (void)ipos;
+}
+
+static void
+bsync_reject(uint8_t host_id, const char** ipos)
+{BSYNC_TRACE
+	(void)host_id; (void)ipos;
+}
+
+static void
+bsync_proxy_request(uint8_t host_id, const char** ipos)
+{BSYNC_TRACE
+	(void)host_id; (void)ipos;
+}
+
+static void
+bsync_proxy_submit(uint8_t host_id, const char** ipos)
+{BSYNC_TRACE
+	(void)host_id; (void)ipos;
+}
+
+static void
+bsync_ping(uint8_t host_id, const char** ipos)
+{BSYNC_TRACE
+	(void)host_id; (void)ipos;
+}
+
+typedef void (*bsync_handler_t)(uint8_t host_id, const char** ipos);
+static bsync_handler_t bsync_handlers[] = {
+	0,
+	bsync_leader_promise,
+	bsync_leader_accept,
+	bsync_leader_submit,
+	bsync_leader_reject,
+	bsync_body,
+	bsync_submit,
+	bsync_reject,
+	bsync_proxy_request,
+	bsync_proxy_submit,
+	bsync_ping
+};
+
+static void
+bsync_incoming(struct ev_io* coio, struct iobuf* iobuf, uint8_t host_id) {
+	auto coio_guard = make_scoped_guard([&]() {
+		iobuf_delete(iobuf);
+	});
+	struct ibuf *in = &iobuf->in;
+	while (true) {
+		/* Read fixed header */
+		if (ibuf_size(in) < 1)
+			coio_breadn(coio, in, 1);
+		/* Read length */
+		if (mp_typeof(*in->pos) != MP_UINT) {
+			tnt_raise(ClientError, ER_INVALID_MSGPACK,
+				  "packet length");
+		}
+		ssize_t to_read = mp_check_uint(in->pos, in->end);
+		if (to_read > 0)
+			coio_breadn(coio, in, to_read);
+		uint32_t len = mp_decode_uint((const char **) &in->pos);
+		/* Read header and body */
+		to_read = len - ibuf_size(in);
+		if (to_read > 0)
+			coio_breadn(coio, in, to_read);
+		/* proceed message */
+		const char **ipos = (const char **)&in->pos;
+		uint32_t type = mp_decode_uint(ipos);
+		say_debug("receive message from %s, type %s, length %d",
+			raft_host_index[host_id].full_name.c_str(),
+			bsync_mtype_name[type], len);
+		assert(type < sizeof(bsync_handlers));
+		(*bsync_handlers[type])(host_id, ipos);
+		/* cleanup buffer */
+		iobuf_reset(iobuf);
+		fiber_gc();
+	}
+}
+
+static void
+bsync_handler(va_list ap)
+{BSYNC_TRACE
+	struct ev_io coio = va_arg(ap, struct ev_io);
+	struct sockaddr *addr = va_arg(ap, struct sockaddr *);
+	socklen_t addrlen = va_arg(ap, socklen_t);
+	struct iobuf *iobuf = va_arg(ap, struct iobuf *);
+	(void)addr; (void)addrlen;
+	coio_read_timeout(&coio, bsync_system_in, BSYNC_SYSBUFFER_SIZE,
+			  bsync_state.read_timeout);
+	const char* pos = bsync_system_in;
+	uint64_t host_id = mp_decode_uint(&pos);
+	assert(host_id < raft_host_index.size());
+	bsync_index[host_id].gsn = mp_decode_uint(&pos);
+	bsync_index[host_id].fiber_in = fiber();
+	say_info("receive incoming connection from %s, gsn=%ld",
+		 raft_host_index[host_id].full_name.c_str(),
+		 bsync_index[host_id].gsn);
+	if (++bsync_index[host_id].connected == 1) {
+		fiber_call(bsync_index[host_id].fiber_out);
+	}
+	if (bsync_index[host_id].connected == 2) {
+		++bsync_state.num_connected;
+		bsync_connected(host_id);
+	}
+	try {
+		bsync_incoming(&coio, iobuf, host_id);
+	} catch(...) {
+		if (--bsync_index[host_id].connected == 1) {BSYNC_TRACE
+			bsync_disconnected(host_id);
+			fiber_call(bsync_index[host_id].fiber_out);
+		}
+		throw;
+	}
 }
 
 static void
 bsync_out_fiber(va_list ap)
-{
-	const char* uri = va_arg(ap, const char*);
+{BSYNC_TRACE
+	uint8_t host_id = *va_arg(ap, uint8_t*);
+	const char* uri = raft_host_index[host_id].full_name.c_str();
+	bsync_index[host_id].fiber_out = fiber();
 	say_info("send outgoing connection to %s", uri);
 	struct remote remote;
 	/* First, stop the reader, then set the source */
@@ -734,31 +1041,88 @@ bsync_out_fiber(va_list ap)
 	char service[URI_MAXSERVICE];
 	snprintf(service, sizeof(service), "%.*s",
 		(int) remote.uri.service_len, remote.uri.service);
-	struct ev_io coio;
-	coio_init(&coio);
-	auto coio_guard = make_scoped_guard([&] {
-		evio_close(loop(), &coio);
-	});
-	while (true) {
+	bool connected = false;
+	while (true) try {BSYNC_TRACE
+		connected = false;
+		struct ev_io coio;
+		coio_init(&coio);
+		struct iobuf *iobuf = iobuf_new(service);
+		auto coio_guard = make_scoped_guard([&] {
+			evio_close(loop(), &coio);
+			iobuf_delete(iobuf);
+		});
 		int r = coio_connect_timeout(&coio, host, service, &remote.addr,
-				&remote.addr_len, 300.0);
-		say_info("result is %d, try to reconnect", r);
+				&remote.addr_len, bsync_state.connect_timeout,
+				remote.uri.host_hint);
+		if (r == -1) {
+			say_warn("connection timeout to %s", uri);
+			continue;
+		}
+		char* pos = bsync_system_out;
+		pos = mp_encode_uint(pos, bsync_state.local_id);
+		pos = mp_encode_uint(pos, BSYNC_LOCAL.gsn);
+		coio_write_timeout(&coio, bsync_system_out, BSYNC_SYSBUFFER_SIZE,
+				   bsync_state.write_timeout);
+		connected = true;
+		if (++bsync_index[host_id].connected == 2) {
+			++bsync_state.num_connected;
+			bsync_connected(host_id);
+		}
+		while(true) {BSYNC_TRACE
+			if (bsync_index[host_id].buffer_out == NULL) {
+				char* pos = bsync_system_out;
+				pos = mp_encode_uint(pos, mp_sizeof_uint(raft_mtype_ping));
+				pos = mp_encode_uint(pos, raft_mtype_ping);
+				bsync_index[host_id].buffer_out = bsync_system_out;
+				bsync_index[host_id].buffer_out_size = pos - bsync_system_out;
+			}
+			const void* buffer_out = bsync_index[host_id].buffer_out;
+			ssize_t send_size = bsync_index[host_id].buffer_out_size;
+			bsync_index[host_id].buffer_out = NULL;
+			ssize_t ssize = coio_write_timeout(&coio, buffer_out,
+				send_size, bsync_state.write_timeout);
+			if (ssize < send_size) {BSYNC_TRACE
+				tnt_raise(SocketError, coio.fd, "timeout");
+			}
+			BSYNC_TRACE
+			fiber_yield_timeout(1); /* wait data for sending */
+		}
+	} catch (...) {BSYNC_TRACE
+		if (connected && --bsync_index[host_id].connected == 1) {
+			bsync_disconnected(host_id);
+		}
+		BSYNC_TRACE
+		fiber_yield_timeout(bsync_state.reconnect_timeout);
+		BSYNC_TRACE
 	}
 }
 
 static void*
 bsync_thread(void*)
 {
+	/* initialization */
+	bsync_state.local_id = raft_state.local_id;
+	bsync_state.leader_id = -1;
+	bsync_state.connect_timeout = raft_state.connect_timeout.total_seconds();
+	bsync_state.read_timeout = raft_state.read_timeout.total_seconds();
+	bsync_state.write_timeout = raft_state.write_timeout.total_seconds();
+	bsync_state.num_hosts = raft_host_index.size();
+	bsync_state.num_connected = 1;
+	bsync_state.state = raft_state_started;
+	bsync_state.reconnect_timeout = raft_state.reconnect_timeout.total_seconds();
+	BSYNC_LOCAL.gsn = raft_host_index[raft_state.local_id].gsn;
+	BSYNC_LOCAL.connected = 2;
+
 	coio_service_init(&bsync_coio, "bsync",
 		raft_host_index[raft_state.local_id].full_name.c_str(),
 		bsync_handler, NULL);
 	evio_service_start(&bsync_coio.evio_service);
 	for (auto& host : raft_host_index) {
 		if (host.local) continue;
+		bsync_index[host.id].connected = 0;
 		fiber_call(
 			fiber_new(host.full_name.c_str(), bsync_out_fiber),
-			host.full_name.c_str());
-		break;
+			&host.id);
 	}
 	ev_run(loop(), 0);
 	say_info("bsync stopped");
