@@ -49,7 +49,6 @@
 #include "vclock.h"
 #include "session.h"
 #include "bsync.h"
-#include "raft.h"
 
 /*
  * Recovery subsystem
@@ -239,8 +238,8 @@ recovery_delete(struct recovery_state *r)
 	recovery_stop_local(r);
 
 	if (r->writer) {
-    raft_writer_stop(r);
-  }
+		bsync_writer_stop(r);
+	}
 
 	xdir_destroy(&r->snap_dir);
 	xdir_destroy(&r->wal_dir);
@@ -316,7 +315,7 @@ recovery_bootstrap(struct recovery_state *r)
 {
 	/* Add a surrogate server id for snapshot rows */
 	vclock_add_server(&r->vclock, 0);
-	vclock_add_server(&r->vclock, RAFT_SERVER_ID);
+	vclock_add_server(&r->vclock, BSYNC_SERVER_ID);
 
 	/* Recover from bootstrap.snap */
 	say_info("initializing an empty data directory");
@@ -368,7 +367,7 @@ recover_snap(struct recovery_state *r)
 
 	/* Add a surrogate server id for snapshot rows */
 	vclock_add_server(&r->vclock, 0);
-	vclock_add_server(&r->vclock, RAFT_SERVER_ID);
+	vclock_add_server(&r->vclock, BSYNC_SERVER_ID);
 
 	say_info("recovering from `%s'", snap->filename);
 	recover_xlog(r, snap);
@@ -815,8 +814,9 @@ wal_writer_start(struct recovery_state *r, int rows_per_wal)
 		r->writer = NULL;
 		return -1;
 	}
-  r->writer = raft_init(r->writer, &r->vclock);
-  return 0;
+	r->writer = raft_init(r->writer, &r->vclock);
+	r->writer = bsync_init(r->writer, &r->vclock);
+	return 0;
 }
 
 /** Stop and destroy the writer thread (at shutdown). */
