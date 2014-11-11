@@ -80,6 +80,16 @@ local default_cfg = {
     raft_local              = "",
     raft_fiber_num          = 1,
     raft_queue_len          = 1,
+
+    -- bsync options
+	bsync_enable········	= 1,
+····bsync_read_timeout··	= 3.5,
+····bsync_write_timeout·	= 3.5,
+····bsync_connect_timeout···= 300,
+····bsync_reconnect_timeout·= 300,
+····bsync_election_timeout··= 15,
+····bsync_replica·······	= "",
+····bsync_local				= "",
 }
 
 -- types of available options
@@ -126,6 +136,14 @@ local template = {
     raft_local              = 'string',
     raft_fiber_num          = 'number',
     raft_queue_len          = 'number',
+    bsync_enable            = 'number',
+    bsync_read_timeout      = 'number',
+    bsync_write_timeout     = 'number',
+    bsync_connect_timeout   = 'number',
+    bsync_reconnect_timeout = 'number',
+    bsync_election_timeout  = 'number',
+    bsync_replica           = 'string',
+    bsync_local             = 'string',
 }
 
 -- dynamically settable options
