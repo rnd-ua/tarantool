@@ -37,6 +37,18 @@
 #include "iproto_constants.h"
 
 void
+xrow_copy(const struct xrow_header *src, struct xrow_header *dst)
+{
+	memcpy(dst, src, sizeof(xrow_header));
+	for (int i = 0; i < src->bodycnt; ++i) {
+		dst->body[i].iov_base =
+			region_alloc(&fiber()->gc, dst->body[i].iov_len);
+		memcpy(dst->body[i].iov_base, src->body[i].iov_base,
+			dst->body[i].iov_len);
+	}
+}
+
+void
 xrow_header_decode(struct xrow_header *header, const char **pos,
 		   const char *end)
 {

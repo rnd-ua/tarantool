@@ -54,6 +54,9 @@ struct xrow_header {
 };
 
 void
+xrow_copy(const struct xrow_header *src, struct xrow_header *dst);
+
+void
 xrow_header_decode(struct xrow_header *header,
 		   const char **pos, const char *end);
 struct tt_uuid;
