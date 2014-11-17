@@ -94,6 +94,10 @@ local default_cfg = {
 ····bsync_election_timeout··= 15,
 ····bsync_replica·······	= "",
 ····bsync_local				= "",
+	bsync_ping_timeout		= 1,
+	bsync_election_timeout	= 0,
+	bsync_slow_host_timeout	= 30,
+	bsync_operation_timeout	= 10,
 }
 
 -- see template_cfg below
@@ -169,6 +173,10 @@ local template_cfg = {
     bsync_election_timeout  = 'number',
     bsync_replica           = 'string',
     bsync_local             = 'string',
+    bsync_ping_timeout      = 'number',
+    bsync_election_timeout  = 'number',
+    bsync_slow_host_timeout = 'number',
+    bsync_operation_timeout = 'number',
 }
 
 local function normalize_uri(port)
