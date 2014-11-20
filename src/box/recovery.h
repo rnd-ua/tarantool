@@ -165,7 +165,11 @@ void recovery_stop_local(struct recovery_state *r);
 
 void recovery_finalize(struct recovery_state *r, int rows_per_wal);
 
-int64_t wal_write(struct recovery_state *r, struct xrow_header *packet);
+int recover_wal(struct recovery_state *r, struct log_io *l);
+void wal_writer_destroy(struct wal_writer *writer);
+int wal_write_lsn(struct recovery_state *r, struct xrow_header *packet);
+int wal_write(struct wal_writer *writer, struct xrow_header *req);
+void wal_writer_stop(struct recovery_state *r);
 
 void recovery_setup_panic(struct recovery_state *r, bool on_snap_error, bool on_wal_error);
 void recovery_apply_row(struct recovery_state *r, struct xrow_header *packet);
