@@ -270,7 +270,7 @@ int raft_write(struct recovery_state *r, struct xrow_header *row) {
   row->tm = ev_now(loop());
   row->sync = 0;
   if (row->server_id == RAFT_SERVER_ID && raft_state.leader_id != raft_state.local_id) {
-    req->res = wal_write(wal_local_writer, req);
+    req->res = wal_write(wal_local_writer, req->row);
     if (req->res < 0) {
       raft_state.io_service.post(boost::bind(&raft_writer_push, row->lsn, false));
       return -1;
@@ -297,9 +297,9 @@ int raft_write(struct recovery_state *r, struct xrow_header *row) {
       return -1; /* error */
 
     if (raft_state.leader_id == raft_state.local_id) {
-      return wal_write(wal_local_writer, req); /* success, send to local wal writer */
+      return wal_write(wal_local_writer, req->row); /* success, send to local wal writer */
     } else {
-      if (wal_write(wal_local_writer, req) < 0) {
+      if (wal_write(wal_local_writer, req->row) < 0) {
         raft_state.io_service.post(boost::bind(&raft_writer_push, row->lsn, false));
         return -1;
       } else {
