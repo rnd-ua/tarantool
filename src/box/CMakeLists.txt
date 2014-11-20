@@ -53,9 +53,6 @@ add_library(box
     recovery.cc
     replica.cc
     replication.cc
-    raft_common.cc
-    raft_session.cc
-    raft.cc
     bsync.cc
     ${lua_sources}
     lua/call.cc
