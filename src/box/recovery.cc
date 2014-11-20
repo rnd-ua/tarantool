@@ -824,17 +824,15 @@ wal_writer_start(struct recovery_state *r)
 	wal_writer_init(&wal_writer, &r->vclock);
 	r->writer = &wal_writer;
 
+	bsync_init(r->writer, &r->vclock);
 	ev_async_start(wal_writer.txn_loop, &wal_writer.write_event);
 
 	/* II. Start the thread. */
-
 	if (cord_start(&wal_writer.cord, "wal", wal_writer_thread, r)) {
 		wal_writer_destroy(&wal_writer);
 		r->writer = NULL;
 		return -1;
 	}
-	r->writer = raft_init(r->writer, &r->vclock);
-	r->writer = bsync_init(r->writer, &r->vclock);
 	return 0;
 }
 
@@ -1054,36 +1052,35 @@ wal_write_lsn(struct recovery_state *r, struct xrow_header *row)
 	fill_lsn(r, row);
 	if (r->wal_mode == WAL_NONE)
 		return 0;
-  struct wal_write_request *req = (struct wal_write_request *)
-    region_alloc(&fiber()->gc, sizeof(struct wal_write_request));
-
-  req->fiber = fiber();
-  req->row = row;
-  row->tm = ev_now(loop());
-  row->sync = 0;
-  return wal_write(r->writer, req);
+	return wal_write(r->writer, row);
 }
 
-int wal_write(struct wal_writer *writer, struct wal_write_request *req) {
-  ERROR_INJECT_RETURN(ERRINJ_WAL_IO);
-  req->res = -1;
-  (void) tt_pthread_mutex_lock(&writer->mutex);
+int wal_write(struct wal_writer *writer, struct xrow_header *row) {
+	struct wal_write_request *req = (struct wal_write_request *)
+		region_alloc(&fiber()->gc, sizeof(struct wal_write_request));
+	req->fiber = fiber();
+	req->row = row;
+	row->tm = ev_now(loop());
+	row->sync = 0;
+	ERROR_INJECT_RETURN(ERRINJ_WAL_IO);
+	req->res = -1;
+	(void) tt_pthread_mutex_lock(&writer->mutex);
 
-  bool input_was_empty = STAILQ_EMPTY(&writer->input);
-  STAILQ_INSERT_TAIL(&writer->input, req, wal_fifo_entry);
+	bool input_was_empty = STAILQ_EMPTY(&writer->input);
+	STAILQ_INSERT_TAIL(&writer->input, req, wal_fifo_entry);
 
-  if (input_was_empty)
-    (void) tt_pthread_cond_signal(&writer->cond);
+	if (input_was_empty)
+		(void) tt_pthread_cond_signal(&writer->cond);
 
-  (void) tt_pthread_mutex_unlock(&writer->mutex);
+	(void) tt_pthread_mutex_unlock(&writer->mutex);
 
-  fiber_yield(); /* Request was inserted. */
+	fiber_yield(); /* Request was inserted. */
 
-  /* req->res is -1 on error */
-  if (req->res < 0)
-    return -1; /* error */
+	/* req->res is -1 on error */
+	if (req->res < 0)
+		return -1; /* error */
 
-  return 0; /* success */
+	return 0; /* success */
 }
 /* }}} */
 
