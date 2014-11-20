@@ -34,7 +34,6 @@
 #include "fiber.h"
 #include "vclock.h"
 #include "recovery.h"
-#include "box/raft.h"
 
 #if defined(__cplusplus)
 extern "C" {
@@ -42,7 +41,7 @@ extern "C" {
 
 #define BSYNC_SERVER_ID 0xF
 
-wal_writer* bsync_init(wal_writer* initial, struct vclock *vclock);
+void bsync_init(wal_writer* initial, struct vclock *vclock);
 int bsync_write(struct recovery_state *r, struct xrow_header *packet);
 void bsync_writer_stop(struct recovery_state *r);
 
