@@ -44,6 +44,8 @@
 #include "box/request.h"
 #include "msgpuck/msgpuck.h"
 
+#include "box/bsync_hash.h"
+
 #define BSYNC_SYSBUFFER_SIZE 64
 #define BSYNC_MAX_HOSTS 14
 #define BSYNC_TRACE \
@@ -112,6 +114,8 @@ struct bsync_host_data {
 	struct io_buf* buffer;
 	const void* buffer_out;
 	ssize_t buffer_out_size;
+
+	struct mh_strptr_t *active_ops;
 
 	struct rlist send_queue;
 	struct rlist op_queue;
@@ -241,7 +245,7 @@ bsync_write(struct recovery_state *r, struct xrow_header *row)
 		oper->row = row;
 		oper->result = -1;
 		oper->status = bsync_op_status_init;
-		oper->server_id = bsync_state.local_id + 1;
+		oper->server_id = 0;
 		oper->bsync_owner = NULL;
 	} else { /* proxy request */
 		oper = rlist_shift_entry(&bsync_state.txn_queue,
@@ -425,6 +429,18 @@ bsync_submit(uint8_t host_id, const char** ipos, const char* iend)
 	bsync_op_status* op_status = rlist_shift_entry(&BSYNC_REMOTE.op_queue,
 						struct bsync_op_status, list);
 	++op_status->op->accepted;
+	if (op_status->op->server_id > 0) {
+		tt_pthread_mutex_lock(&proxy_wal_writer.mutex);
+		struct bsync_key node_key = { op_status->op->row->body[0].iov_base,
+					      op_status->op->row->body[0].iov_len};
+		mh_int_t k = mh_strptr_find(BSYNC_REMOTE.active_ops, node_key, NULL);
+		assert(k != mh_end(BSYNC_REMOTE.active_ops));
+		struct mh_strptr_node_t *node = mh_strptr_node(BSYNC_REMOTE.active_ops, k);
+		char ** val = (char **)&node->val;
+		--*val;
+		if (val == NULL) mh_strptr_del(BSYNC_REMOTE.active_ops, k, NULL);
+		tt_pthread_mutex_unlock(&proxy_wal_writer.mutex);
+	}
 	if (op_status->op->status == bsync_op_status_yield)
 		fiber_call(op_status->op->bsync_owner);
 }
@@ -507,6 +523,31 @@ bsync_ping(uint8_t host_id, const char** ipos, const char* iend)
  * Fibers block
  */
 
+static bool
+bsync_is_conflict(struct bsync_operation *oper)
+{
+	if (oper->server_id == 0) return false;
+	struct bsync_key node_key = { oper->row->body[0].iov_base,
+					oper->row->body[0].iov_len};
+	tt_pthread_mutex_lock(&proxy_wal_writer.mutex);
+	auto guard = make_scoped_guard([&](){
+		tt_pthread_mutex_unlock(&proxy_wal_writer.mutex);
+	});
+	for (int host_id = 0; host_id < bsync_state.num_hosts; ++host_id) {
+		mh_int_t k = mh_strptr_find(BSYNC_REMOTE.active_ops, node_key, NULL);
+		if (k != mh_end(BSYNC_REMOTE.active_ops)) {
+			return true;
+		}
+	}
+	for (int host_id = 0; host_id < bsync_state.num_hosts; ++host_id) {
+		struct mh_strptr_node_t node;
+		node.key = node_key;
+		node.val = (void *)1;
+		mh_strptr_put(BSYNC_REMOTE.active_ops, &node, NULL, NULL);
+	}
+	return false;
+}
+
 static void
 bsync_txn_process_fiber(va_list /* ap */)
 {
@@ -514,17 +555,19 @@ restart:BSYNC_TRACE
 	struct bsync_operation *oper =
 		STAILQ_FIRST(&bsync_state.txn_proxy_input);
 	STAILQ_REMOVE_HEAD(&bsync_state.txn_proxy_input, fifo);
+	if (bsync_is_conflict(oper)) {
+		oper->result = -1;
+	} else {
+		struct request *req = (struct request *)
+			region_alloc(&fiber()->gc, sizeof(struct request));
+		request_create(req, oper->row->type);
+		request_decode(req, (const char*)oper->row->body[0].iov_base,
+				oper->row->body[0].iov_len);
+		req->header = oper->row;
 
-	struct request *req = (struct request *)
-		region_alloc(&fiber()->gc, sizeof(struct request));
-	request_create(req, oper->row->type);
-	request_decode(req, (const char*)oper->row->body[0].iov_base,
-			oper->row->body[0].iov_len);
-	req->header = oper->row;
-
-	rlist_add_tail_entry(&bsync_state.txn_queue, oper, list);
-	box_process(&null_port, req);
-
+		rlist_add_tail_entry(&bsync_state.txn_queue, oper, list);
+		box_process(&null_port, req);
+	}
 	fiber_gc();
 	rlist_add_tail_entry(&bsync_state.txn_fiber_cache, fiber(), state);
 	fiber_yield();BSYNC_TRACE
@@ -808,6 +851,7 @@ bsync_incoming(struct ev_io* coio, struct iobuf* iobuf, uint8_t host_id)
 		const char* iend = (const char *)in->pos + len;
 		const char **ipos = (const char **)&in->pos;
 		uint32_t type = mp_decode_uint(ipos);
+		assert(type < bsync_mtype_count);
 		say_debug("receive message from %s, type %s, length %d",
 			BSYNC_REMOTE.source, bsync_mtype_name[type], len);
 		assert(type < sizeof(bsync_handlers));
@@ -1001,6 +1045,9 @@ bsync_cfg_push_host(uint8_t host_id, const char *ibegin,
 	}
 	rlist_create(&BSYNC_REMOTE.op_queue);
 	rlist_create(&BSYNC_REMOTE.send_queue);
+	BSYNC_REMOTE.active_ops = mh_strptr_new();
+	if (BSYNC_REMOTE.active_ops == NULL)
+		panic("out of memory");
 }
 
 static void
@@ -1173,6 +1220,8 @@ bsync_writer_stop(struct recovery_state *r)
 	for (uint8_t host_id = 0; host_id < bsync_state.num_hosts; ++host_id) {
 		rlist_del(&BSYNC_REMOTE.send_queue);
 		rlist_del(&BSYNC_REMOTE.op_queue);
+		if (BSYNC_REMOTE.active_ops)
+			mh_strptr_delete(BSYNC_REMOTE.active_ops);
 	}
 	wal_writer_stop(r);
 }
