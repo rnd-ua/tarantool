@@ -68,18 +68,18 @@ local default_cfg = {
     snapshot_count      = 6,
 
     -- bsync options
-    bsync_enable········	= 1,
-    bsync_read_timeout··	= 3.5,
-    bsync_write_timeout·	= 3.5,
-····bsync_connect_timeout···= 300,
-····bsync_reconnect_timeout·= 300,
-····bsync_election_timeout··= 15,
-····bsync_replica·······	= "",
-····bsync_local				= "",
-	bsync_ping_timeout		= 1,
-	bsync_election_timeout	= 0,
-	bsync_slow_host_timeout	= 30,
-	bsync_operation_timeout	= 10,
+    bsync_enable            = 0,
+    bsync_read_timeout      = 3.5,
+    bsync_write_timeout     = 3.5,
+    bsync_connect_timeout   = 300.0,
+    bsync_reconnect_timeout = 300.0,
+    bsync_election_timeout  = 15.0,
+    bsync_replica           = "",
+    bsync_local             = "",
+    bsync_ping_timeout      = 1.0,
+    bsync_election_timeout  = 5.0,
+    bsync_slow_host_timeout = 30.0,
+    bsync_operation_timeout = 10.0,
 }
 
 -- types of available options
