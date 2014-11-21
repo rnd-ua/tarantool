@@ -237,7 +237,7 @@ static const char* bsync_mtype_name[] = {
 	tt_pthread_mutex_unlock(&proxy_wal_writer.mutex); }
 
 int
-bsync_write(struct recovery_state *r, struct xrow_header *row)
+bsync_write(struct recovery_state *r, struct xrow_header *row) try
 {BSYNC_TRACE
 	if (wal_local_writer == NULL) {
 		return wal_write_lsn(r, row);
@@ -252,6 +252,7 @@ bsync_write(struct recovery_state *r, struct xrow_header *row)
 			region_alloc(&fiber()->gc, sizeof(struct bsync_operation));
 		status = (struct bsync_op_status *)
 			region_alloc(&fiber()->gc, sizeof(struct bsync_op_status));
+		status->op = oper;
 		oper->row = row;
 		oper->result = -1;
 		oper->status = bsync_op_status_init;
@@ -283,13 +284,16 @@ bsync_write(struct recovery_state *r, struct xrow_header *row)
 		rlist_create(&bsync_state.execute_queue);
 	}
 	return oper->result;
+} catch (...) {
+	say_crit("bsync_write found unhandled exception");
+	throw;
 }
 
 static void
 bsync_send_data(struct bsync_host_data *host, struct bsync_send_elem *elem) {
 	rlist_add_tail_entry(&host->send_queue, elem, state);
 	if ((host->flags & bsync_host_active_write) == 0) {
-		fiber_call(BSYNC_LEADER.fiber_out);
+		fiber_call(host->fiber_out);
 	}
 }
 
@@ -1042,7 +1046,9 @@ bsync_out_fiber(va_list ap)
 				bsync_state.connect_timeout,
 				BSYNC_REMOTE.uri.host_hint);
 		if (r == -1) {
-			say_warn("connection timeout to %s", BSYNC_REMOTE.source);
+			say_warn("connection timeout to %s, wait %f",
+				 BSYNC_REMOTE.source, bsync_state.reconnect_timeout);
+			fiber_yield_timeout(bsync_state.reconnect_timeout);BSYNC_TRACE
 			continue;
 		}
 		char* pos = bsync_system_out;
@@ -1261,7 +1267,12 @@ bsync_thread(void*)
 	ev_async_start(bsync_loop, &bsync_process_event);
 	tt_pthread_cond_signal(&proxy_wal_writer.cond);
 	tt_pthread_mutex_unlock(&proxy_wal_writer.mutex);
-	ev_run(loop(), 0);
+	try {
+		ev_run(loop(), 0);
+	} catch (...) {
+		say_crit("bsync_thread found unhandled exception");
+		throw;
+	}
 	say_info("bsync stopped");
 	return NULL;
 }
