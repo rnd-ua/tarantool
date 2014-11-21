@@ -22,34 +22,34 @@ box.cfg
   pid_file: tarantool.pid
   rows_per_wal: 50
   slab_alloc_arena: 0.1
-  log_level: 5
+  wal_dir: .
+  bsync_read_timeout··: 3.5
+  bsync_slow_host_timeout: 30
+  bsync_operation_timeout: 10
   logger_nonblock: true
   snap_dir: .
   coredump: false
-  raft_queue_len: 1
+  bsync_write_timeout·: 3.5
   panic_on_snap_error: true
-  raft_write_timeout: 3100
+  bsync_ping_timeout: 1
   too_long_threshold: 0.5
   slab_alloc_factor: 2
-  raft_fiber_num: 1
-  raft_local: 
-  raft_reconnect_timeout: 3100
+  background: false
+  ····bsync_election_timeout··: 15
+  ····bsync_reconnect_timeout·: 300
   snapshot_period: 0
   listen: <uri>
-  background: false
-  raft_election_timeout: -1
-  wal_dir: .
-  slab_alloc_minimal: 64
+  bsync_enable········: 1
   sophia_dir: ./sophia
   wal_mode: write
-  raft_replica: 
-  raft_resolve_timeout: 3100
+  log_level: 5
+  bsync_election_timeout: 0
   panic_on_wal_error: false
-  enable_raft: 0
-  raft_operation_timeout: 3500
-  raft_read_timeout: 3100
   readahead: 16320
-  raft_connect_timeout: 3100
+  ····bsync_connect_timeout···: 300
+  slab_alloc_minimal: 64
+  ····bsync_local: 
+  ····bsync_replica·······: 
   wal_dir_rescan_delay: 0.1
 ...
 space:insert{1, 'tuple'}
