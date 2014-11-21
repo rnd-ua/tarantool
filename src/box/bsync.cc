@@ -104,14 +104,19 @@ struct bsync_send_elem {
 	struct rlist state;
 };
 
+enum bsync_host_flags {
+	bsync_host_active_read = 0x01,
+	bsync_host_active_write = 0x02
+};
+
 struct bsync_host_data {
 	uint8_t connected;
+	uint8_t flags;
 	uint64_t gsn;
 	char source[REMOTE_SOURCE_MAXLEN];
 	struct uri uri;
 	struct fiber* fiber_out;
 	struct fiber* fiber_in;
-	struct io_buf* buffer;
 	const void* buffer_out;
 	ssize_t buffer_out_size;
 
@@ -147,6 +152,7 @@ static struct bsync_state_ {
 	struct rlist accept_queue;
 	struct rlist submit_queue;
 	struct rlist txn_queue;
+	struct rlist execute_queue;
 
 	struct rlist txn_fiber_cache;
 	struct rlist bsync_fiber_cache;
@@ -239,14 +245,19 @@ bsync_write(struct recovery_state *r, struct xrow_header *row)
 	row->tm = ev_now(loop());
 	row->sync = 0;
 	struct bsync_operation *oper = NULL;
-	if (row->server_id == 0) { /* local request */
+	struct bsync_op_status *status = NULL;
+	bool local_request = (row->server_id == 0);
+	if (local_request) { /* local request */
 		oper = (struct bsync_operation *)
 			region_alloc(&fiber()->gc, sizeof(struct bsync_operation));
+		status = (struct bsync_op_status *)
+			region_alloc(&fiber()->gc, sizeof(struct bsync_op_status));
 		oper->row = row;
 		oper->result = -1;
 		oper->status = bsync_op_status_init;
 		oper->server_id = 0;
 		oper->bsync_owner = NULL;
+		rlist_add_tail_entry(&bsync_state.execute_queue, status, list);
 	} else { /* proxy request */
 		oper = rlist_shift_entry(&bsync_state.txn_queue,
 					 struct bsync_operation, list);
@@ -254,7 +265,32 @@ bsync_write(struct recovery_state *r, struct xrow_header *row)
 	oper->txn_owner = fiber();
 	SWITCH_TO_BSYNC
 	fiber_yield();BSYNC_TRACE
+	if (status) {
+		struct bsync_op_status *s =
+			rlist_first_entry(&bsync_state.execute_queue,
+					  struct bsync_op_status, list);
+		assert(s == status);
+		if (s->op->result >= 0) {
+			rlist_shift_entry(&bsync_state.execute_queue,
+					  struct bsync_op_status, list);
+			return oper->result;
+		}
+		/* rollback in reverse order local operations */
+		rlist_foreach_entry_reverse(s, &bsync_state.execute_queue, list) {
+			s->op->result = -1;
+			fiber_call(s->op->txn_owner);
+		}
+		rlist_create(&bsync_state.execute_queue);
+	}
 	return oper->result;
+}
+
+static void
+bsync_send_data(struct bsync_host_data *host, struct bsync_send_elem *elem) {
+	rlist_add_tail_entry(&host->send_queue, elem, state);
+	if ((host->flags & bsync_host_active_write) == 0) {
+		fiber_call(BSYNC_LEADER.fiber_out);
+	}
 }
 
 static void
@@ -269,8 +305,7 @@ bsync_queue_slave(struct bsync_operation *oper)
 	elem->oper = oper;
 	oper->result = 0;
 	rlist_add_tail_entry(&bsync_state.accept_queue, oper, list);
-	rlist_add_tail_entry(&BSYNC_LEADER.send_queue, elem, state);
-	fiber_call(BSYNC_LEADER.fiber_out);
+	bsync_send_data(&BSYNC_LEADER, elem);
 	/* wait accept or reject */
 	fiber_yield();BSYNC_TRACE
 	if (oper->result < 0) {
@@ -284,8 +319,7 @@ bsync_queue_slave(struct bsync_operation *oper)
 	int wal_result = wal_write(wal_local_writer, oper->row);
 	elem->code = wal_result < 0 ? bsync_mtype_reject
 				    : bsync_mtype_submit;
-	rlist_add_tail_entry(&BSYNC_LEADER.send_queue, elem, state);
-	fiber_call(BSYNC_LEADER.fiber_out);
+	bsync_send_data(&BSYNC_LEADER, elem);
 	if (oper->status == bsync_op_status_accept) {
 		oper->status = bsync_op_status_wal;
 		oper->result = wal_result;
@@ -335,9 +369,8 @@ bsync_queue_leader(struct bsync_operation *oper, bool proxy)
 			oper->row->lsn = oper->gsn;
 			oper->row->server_id = BSYNC_SERVER_ID;
 		}
-		rlist_add_tail_entry(&BSYNC_REMOTE.send_queue, elem, state);
 		rlist_add_tail_entry(&BSYNC_REMOTE.op_queue, op_status, list);
-		fiber_call(BSYNC_REMOTE.fiber_out);
+		bsync_send_data(&BSYNC_REMOTE, elem);
 	}
 	oper->row->server_id = BSYNC_SERVER_ID;
 	oper->row->lsn = oper->gsn;
@@ -392,15 +425,13 @@ bsync_proxy_processor()
 		oper->result = wal_write(wal_local_writer, oper->row);
 		send->code = (oper->result < 0 ? bsync_mtype_reject :
 						 bsync_mtype_submit);
-		rlist_add_tail_entry(&BSYNC_LEADER.send_queue, send, state);
-		fiber_call(BSYNC_LEADER.fiber_out);
+		bsync_send_data(&BSYNC_LEADER, send);
 	} else {
 		bsync_queue_leader(oper, true);
 		uint8_t host_id = oper->server_id - 1;
 		send->code = (oper->result < 0 ? bsync_mtype_proxy_reject :
 						 bsync_mtype_proxy_submit);
-		rlist_add_tail_entry(&BSYNC_REMOTE.send_queue, send, state);
-		fiber_call(BSYNC_REMOTE.fiber_out);
+		bsync_send_data(&BSYNC_REMOTE, send);
 		bsync_wait_slow(oper);
 	}
 }
@@ -426,6 +457,7 @@ static void
 bsync_submit(uint8_t host_id, const char** ipos, const char* iend)
 {BSYNC_TRACE
 	*ipos = iend;
+	assert(!rlist_empty(&BSYNC_REMOTE.op_queue));
 	bsync_op_status* op_status = rlist_shift_entry(&BSYNC_REMOTE.op_queue,
 						struct bsync_op_status, list);
 	++op_status->op->accepted;
@@ -720,6 +752,26 @@ static void
 bsync_disconnected(uint8_t host_id)
 {BSYNC_TRACE
 	--bsync_state.num_connected;
+	mh_strptr_clear(BSYNC_REMOTE.active_ops);
+	rlist_create(&BSYNC_REMOTE.send_queue);
+	rlist_create(&BSYNC_REMOTE.op_queue);
+	if (host_id == bsync_state.leader_id) {
+		struct bsync_operation *oper;
+		rlist_foreach_entry(oper, &bsync_state.submit_queue, list) {
+			oper->result = 0;
+			if (oper->status == bsync_op_status_wal) {
+				fiber_call(oper->txn_owner);
+			} else {
+				oper->status = bsync_op_status_submit;
+			}
+		}
+		rlist_foreach_entry_reverse(oper, &bsync_state.accept_queue, list) {
+			oper->result = -1;
+			fiber_call(oper->txn_owner);
+		}
+		rlist_create(&bsync_state.accept_queue);
+		rlist_create(&bsync_state.submit_queue);
+	}
 	if (2 * bsync_state.num_connected <= bsync_state.num_hosts ||
 		host_id == bsync_state.leader_id)
 	{
@@ -824,6 +876,13 @@ static bsync_handler_t bsync_handlers[] = {
 };
 
 static void
+bsync_breadn(struct ev_io *coio, uint8_t host_id, struct ibuf *buf, size_t sz) {
+	BSYNC_REMOTE.flags |= bsync_host_active_read;
+	coio_breadn(coio, buf, sz);
+	BSYNC_REMOTE.flags &= !bsync_host_active_read;
+}
+
+static void
 bsync_incoming(struct ev_io* coio, struct iobuf* iobuf, uint8_t host_id)
 {BSYNC_TRACE
 	auto coio_guard = make_scoped_guard([&]() {
@@ -832,8 +891,9 @@ bsync_incoming(struct ev_io* coio, struct iobuf* iobuf, uint8_t host_id)
 	struct ibuf *in = &iobuf->in;
 	while (true) {
 		/* Read fixed header */
-		if (ibuf_size(in) < 1)
-			coio_breadn(coio, in, 1);
+		if (ibuf_size(in) < 1) {
+			bsync_breadn(coio, host_id, in, 1);
+		}
 		/* Read length */
 		if (mp_typeof(*in->pos) != MP_UINT) {
 			tnt_raise(ClientError, ER_INVALID_MSGPACK,
@@ -841,12 +901,12 @@ bsync_incoming(struct ev_io* coio, struct iobuf* iobuf, uint8_t host_id)
 		}
 		ssize_t to_read = mp_check_uint(in->pos, in->end);
 		if (to_read > 0)
-			coio_breadn(coio, in, to_read);
+			bsync_breadn(coio, host_id, in, to_read);
 		uint32_t len = mp_decode_uint((const char **) &in->pos);
 		/* Read header and body */
 		to_read = len - ibuf_size(in);
 		if (to_read > 0)
-			coio_breadn(coio, in, to_read);
+			bsync_breadn(coio, host_id, in, to_read);
 		/* proceed message */
 		const char* iend = (const char *)in->pos + len;
 		const char **ipos = (const char **)&in->pos;
@@ -923,7 +983,8 @@ encode_request(struct bsync_send_elem* elem, struct iovec* iov) {
 static void
 bsync_send(struct ev_io* coio, uint8_t host_id)
 {
-	if (bsync_state.state == bsync_state_ready) {
+	if (bsync_state.state == bsync_state_ready &&
+		!rlist_empty(&BSYNC_REMOTE.send_queue)) {
 		while(!rlist_empty(&BSYNC_REMOTE.send_queue)) {
 			struct bsync_send_elem* elem =
 				rlist_shift_entry(&BSYNC_REMOTE.send_queue,
@@ -932,7 +993,9 @@ bsync_send(struct ev_io* coio, uint8_t host_id)
 				BSYNC_REMOTE.source, bsync_mtype_name[elem->code]);
 			struct iovec iov[XROW_IOVMAX];
 			int iovcnt = encode_request(elem, iov);
+			BSYNC_REMOTE.flags |= bsync_host_active_write;
 			coio_writev(coio, iov, iovcnt, -1);
+			BSYNC_REMOTE.flags &= !bsync_host_active_write;
 		}
 	} else {
 		if (BSYNC_REMOTE.buffer_out == NULL) {
@@ -948,8 +1011,10 @@ bsync_send(struct ev_io* coio, uint8_t host_id)
 		const void* buffer_out = BSYNC_REMOTE.buffer_out;
 		ssize_t send_size = bsync_index[host_id].buffer_out_size;
 		bsync_index[host_id].buffer_out = NULL;
+		BSYNC_REMOTE.flags |= bsync_host_active_write;
 		ssize_t ssize = coio_write_timeout(coio, buffer_out,
 			send_size, bsync_state.write_timeout);
+		BSYNC_REMOTE.flags &= !bsync_host_active_write;
 		if (ssize < send_size) {
 			tnt_raise(SocketError, coio->fd, "timeout");
 		}
@@ -983,8 +1048,10 @@ bsync_out_fiber(va_list ap)
 		char* pos = bsync_system_out;
 		pos = mp_encode_uint(pos, bsync_state.local_id);
 		pos = mp_encode_uint(pos, BSYNC_LOCAL.gsn);
+		BSYNC_REMOTE.flags |= bsync_host_active_write;
 		coio_write_timeout(&coio, bsync_system_out, BSYNC_SYSBUFFER_SIZE,
 				   bsync_state.write_timeout);
+		BSYNC_REMOTE.flags &= !bsync_host_active_write;
 		connected = true;
 		if (++BSYNC_REMOTE.connected == 2) {
 			++bsync_state.num_connected;
@@ -996,6 +1063,7 @@ bsync_out_fiber(va_list ap)
 			fiber_yield_timeout(bsync_state.ping_timeout);
 		}
 	} catch (...) {
+		BSYNC_TRACE
 		if (connected && --bsync_index[host_id].connected == 1) {
 			bsync_disconnected(host_id);
 		}
@@ -1043,6 +1111,7 @@ bsync_cfg_push_host(uint8_t host_id, const char *ibegin,
 	if (strcmp(BSYNC_REMOTE.source, localhost) == 0) {
 		bsync_state.local_id = host_id;
 	}
+	BSYNC_REMOTE.flags = 0;
 	rlist_create(&BSYNC_REMOTE.op_queue);
 	rlist_create(&BSYNC_REMOTE.send_queue);
 	BSYNC_REMOTE.active_ops = mh_strptr_new();
@@ -1139,6 +1208,7 @@ bsync_init(wal_writer* initial, struct vclock *vclock)
 	rlist_create(&bsync_state.accept_queue);
 	rlist_create(&bsync_state.submit_queue);
 	rlist_create(&bsync_state.txn_queue);
+	rlist_create(&bsync_state.execute_queue);
 
 	ev_async_init(&txn_process_event, bsync_txn_process);
 	ev_async_init(&bsync_process_event, bsync_process);
@@ -1217,6 +1287,7 @@ bsync_writer_stop(struct recovery_state *r)
 	rlist_del(&bsync_state.accept_queue);
 	rlist_del(&bsync_state.submit_queue);
 	rlist_del(&bsync_state.txn_queue);
+	rlist_del(&bsync_state.execute_queue);
 	for (uint8_t host_id = 0; host_id < bsync_state.num_hosts; ++host_id) {
 		rlist_del(&BSYNC_REMOTE.send_queue);
 		rlist_del(&BSYNC_REMOTE.op_queue);
