@@ -41,18 +41,8 @@ add_custom_target(ragel
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     COMMAND ragel -G2 src/uri.rl -o src/uri.c)
 
-<<<<<<< HEAD
 set (core_sources
      say.cc
-=======
-set(Boost_USE_STATIC_LIBS OFF)
-set(Boost_USE_MULTITHREADED ON)
-add_definitions(-DBOOST_LOG_DYN_LINK)
-find_package(Boost COMPONENTS system date_time thread REQUIRED)
-include_directories(${Boost_INCLUDE_DIRS})
-
-set (common_sources
->>>>>>> first simple RAFT implementation
      memory.cc
      fiber.cc
      exception.cc
