@@ -39,8 +39,12 @@
 #include "coio_buf.h"
 #include "scoped_guard.h"
 #include "box/box.h"
+#include "box/txn.h"
 #include "box/port.h"
 #include "box/log_io.h"
+#include "box/schema.h"
+#include "box/space.h"
+#include "box/tuple.h"
 #include "box/request.h"
 #include "msgpuck/msgpuck.h"
 
@@ -69,16 +73,6 @@ static struct ev_loop* bsync_loop;
 static struct ev_async txn_process_event;
 static struct ev_async bsync_process_event;
 
-/* TODO: change structure of operation structures:
- * 1. create txn structure (and move to it all info about TXN)
- * 2. remove bsync_op_status structure and use instead of it bsync_send_elem
- * 3. rename bsync_send_elem to bsync_host
- * After finish check, that tarantool have 3 structures about operation:
- * 1. bsync_txn_info - leave time is equal to TXN fiber
- * 2. bsync_host_info - leave time is equal to host part
- * 3. bsync_operation - leave time is equal to BSYNC fiber
- */
-
 struct bsync_host_info {/* for save in host queue */
 	uint8_t code;
 	struct bsync_operation *op;
@@ -90,6 +84,7 @@ struct bsync_txn_info { /* txn information about operation */
 	struct xrow_header *row;
 	struct fiber *owner;
 	struct bsync_operation *op;
+	struct bsync_key dup_key;
 	int result;
 
 	struct rlist list;
@@ -323,6 +318,10 @@ bsync_end_active_op(uint8_t host_id, struct bsync_operation *oper)
 	tt_pthread_mutex_lock(&proxy_wal_writer.mutex);
 	mh_int_t k = mh_strptr_find(BSYNC_REMOTE.active_ops,
 				    oper->dup_key, NULL);
+	if (k == mh_end(BSYNC_REMOTE.active_ops)) {
+		k = mh_strptr_find(BSYNC_REMOTE.active_ops,
+				   oper->dup_key, NULL);
+	}
 	assert(k != mh_end(BSYNC_REMOTE.active_ops));
 	struct mh_strptr_node_t *node = mh_strptr_node(BSYNC_REMOTE.active_ops, k);
 	if (oper->server_id != 0) {
@@ -335,22 +334,84 @@ bsync_end_active_op(uint8_t host_id, struct bsync_operation *oper)
 	tt_pthread_mutex_unlock(&proxy_wal_writer.mutex);
 }
 
+static void
+bsync_space_cb(void *d, uint8_t key, uint32_t v)
+{
+	if (key == IPROTO_SPACE_ID) ((struct bsync_key *)d)->space_id = v;
+}
+
+static void
+bsync_tuple_cb(void *d, uint8_t key, const char *v, const char *vend)
+{
+	if (key == IPROTO_TUPLE) {
+		((struct bsync_key *)d)->data = (char *)v;
+		((struct bsync_key *)d)->size = vend - v;
+	}
+}
+
+#define BSYNC_MAX_KEY_PART_LEN 256
+static void
+bsync_parse_dup_key(struct bsync_key *dup_key, struct key_def *key, struct tuple *tuple)
+{
+	dup_key->size = 0;
+	dup_key->data = (char *)region_alloc(&fiber()->gc,
+		BSYNC_MAX_KEY_PART_LEN * key->part_count);
+	for (uint32_t p = 0; p < key->part_count; ++p) {
+		if (key->parts[p].type == NUM) {
+			uint32_t v = tuple_field_u32(tuple, key->parts[p].fieldno);
+			memcpy(dup_key->data, &v, sizeof(uint32_t));
+			dup_key->size += sizeof(uint32_t);
+			continue;
+		}
+		const char *key_part =
+			tuple_field_cstr(tuple, key->parts[p].fieldno);
+		dup_key->size +=
+			strcpy((char *)dup_key->data, key_part) - (char *)dup_key->data;
+	}
+}
+
+static void
+bsync_parse_dup_key(struct bsync_key *dup_key, struct txn_stmt *stmt)
+{
+	bsync_parse_dup_key(dup_key, stmt->space->index[0]->key_def, stmt->new_tuple);
+}
+
+static void
+bsync_parse_dup_key(struct bsync_key *dup_key, struct xrow_header *xrow)
+{
+	/*
+	 * TODO : special analiz for operations with spaces (remove/create)
+	 */
+	dup_key->data = NULL;
+	dup_key->size = 0;
+	request_header_decode(xrow, bsync_space_cb, bsync_tuple_cb, dup_key);
+	struct space *space = space_cache_find(dup_key->space_id);
+	assert(space->index[0]->key_def->iid == 0);
+	struct tuple *new_tuple =
+		tuple_new(space->format, (const char *)dup_key->data,
+			  (const char *)dup_key->data + dup_key->size);
+	TupleGuard guard(new_tuple);
+	space_validate_tuple(space, new_tuple);
+	bsync_parse_dup_key(dup_key, space->index[0]->key_def, new_tuple);
+}
+
 int
-bsync_write(struct recovery_state *r, struct xrow_header *row) try
+bsync_write(struct recovery_state *r, struct txn_stmt *stmt) try
 {BSYNC_TRACE
 	if (wal_local_writer == NULL) {
-		return wal_write_lsn(r, row);
+		return wal_write_lsn(r, stmt->row);
 	}
-	row->tm = ev_now(loop());
-	row->sync = 0;
+	stmt->row->tm = ev_now(loop());
+	stmt->row->sync = 0;
 	struct bsync_txn_info *info = NULL;
-	bool local_request = (row->server_id == 0);
+	bool local_request = (stmt->row->server_id == 0);
 	if (local_request) { /* local request */
 		info = (struct bsync_txn_info *)
 			region_alloc(&fiber()->gc, sizeof(struct bsync_txn_info));
-		info->row = row;
+		info->row = stmt->row;
 		info->op = NULL;
 		info->result = -1;
+		bsync_parse_dup_key(&info->dup_key, stmt);
 		rlist_add_tail_entry(&bsync_state.execute_queue, info, list);
 	} else { /* proxy request */
 		info = rlist_shift_entry(&bsync_state.txn_queue,
@@ -445,12 +506,6 @@ bsync_wait_slow(struct bsync_operation *oper)
 }
 
 static void
-bsync_space_cb(void *d, uint8_t key, uint32_t v)
-{
-	if (key == IPROTO_SPACE_ID) ((struct bsync_key *)d)->space_id = v;
-}
-
-static void
 bsync_queue_leader(struct bsync_operation *oper, bool proxy)
 {BSYNC_TRACE
 	oper->status = bsync_op_status_init;
@@ -459,10 +514,12 @@ bsync_queue_leader(struct bsync_operation *oper, bool proxy)
 	oper->server_id = oper->txn_data->row->server_id;
 	if (oper->server_id == 0) {BSYNC_TRACE
 		/* local operation */
-		oper->dup_key.data = NULL;
-		oper->dup_key.size = 0;
-		request_header_decode(oper->txn_data->row,
-				      bsync_space_cb, &oper->dup_key);
+		oper->dup_key.space_id = oper->txn_data->dup_key.space_id;
+		oper->dup_key.size = oper->txn_data->dup_key.size;
+		oper->dup_key.data = (char *)
+			region_alloc(&fiber()->gc, oper->dup_key.size);
+		memcpy(oper->dup_key.data, oper->txn_data->dup_key.data,
+			oper->dup_key.size);
 		bsync_begin_active_op(oper);
 	}
 	if (oper->txn_data->result < 0) {
@@ -707,9 +764,7 @@ restart:BSYNC_TRACE
 	request_decode(req, (const char*)info->row->body[0].iov_base,
 			info->row->body[0].iov_len);
 	req->header = info->row;
-	info->op->dup_key.space_id = req->space_id;
-	info->op->dup_key.data = NULL;
-	info->op->dup_key.size = 0;
+	bsync_parse_dup_key(&info->op->dup_key, info->row);
 	if (bsync_begin_active_op(info->op)) {
 		rlist_add_tail_entry(&bsync_state.txn_queue, info, list);
 		box_process(&null_port, req);
