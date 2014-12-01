@@ -76,8 +76,7 @@ void
 request_decode(struct request *request, const char *data, uint32_t len);
 
 void
-request_header_decode(struct xrow_header* xrow, request_uint_f space_f,
-		      request_char_f char_f, void *data_f);
+request_header_decode(struct xrow_header* xrow, request_uint_f space_f, void *data_f);
 
 int
 request_encode(struct request *request, struct iovec *iov);

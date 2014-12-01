@@ -241,7 +241,7 @@ request_decode_cb(const char *data, uint32_t len, uint32_t type,
 	const char *end = data + len;
 	uint64_t key_map = iproto_body_key_map[type];
 	if (mp_typeof(*data) != MP_MAP || mp_check_map(data, end) > 0) {
-error:
+//error:
 		tnt_raise(ClientError, ER_INVALID_MSGPACK, "packet body");
 	}
 	uint32_t size = mp_decode_map(&data);
@@ -255,9 +255,9 @@ error:
 		key_map &= ~iproto_key_bit(key);
 		const char *value = data;
 		if (mp_check(&data, end))
-			goto error;
+			tnt_raise(ClientError, ER_INVALID_MSGPACK, "packet body"); /*goto error;*/
 		if (iproto_key_type[key] != mp_typeof(*value))
-			goto error;
+			tnt_raise(ClientError, ER_INVALID_MSGPACK, "packet body"); /*goto error;*/
 		switch (key) {
 		case IPROTO_SPACE_ID:
 		case IPROTO_INDEX_ID:
@@ -294,14 +294,17 @@ request_decode(struct request *request, const char *data, uint32_t len)
 		request_set_char, request);
 }
 
+static void
+request_null_char(void *, uint8_t, const char *, const char *)
+{}
+
 void
-request_header_decode(struct xrow_header* xrow, request_uint_f uint_f,
-		      request_char_f char_f, void *data)
+request_header_decode(struct xrow_header* xrow, request_uint_f uint_f, void *data)
 {
 	try {
 		request_decode_cb(
 			(const char *)xrow->body[0].iov_base, xrow->body[0].iov_len,
-			xrow->type, uint_f, char_f, data);
+			xrow->type, uint_f, request_null_char, data);
 	} catch (...) {
 
 	}
