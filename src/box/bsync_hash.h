@@ -39,13 +39,37 @@ extern "C" {
 #endif
 
 struct bsync_key {
+	uint32_t space_id;
 	const void *data;
 	size_t size;
 };
+
+struct bsync_val {
+	uint32_t leader_ops;
+	uint32_t slave_ops;
+	uint32_t slave_id;
+};
+
 #if MH_SOURCE
 static uint32_t bsync_hash_key(const struct bsync_key *key) {
-	return crc32_calc(0, (const char *)key->data, key->size);
+	uint32_t v = crc32_calc(0, (const char *)&key->space_id, sizeof(uint32_t));
+	if (key->data) {
+		v = crc32_calc(v, (const char *)key->data, key->size);
+	}
+	return v;
 }
+
+static int
+bsync_hash_cmp(const struct bsync_key *k1, const struct bsync_key *k2)
+{
+	if (k1->space_id != k2->space_id) return 0;
+	if (k1->size != k2->size) return 0;
+	if (k1->data && k2->data) {
+		return !memcmp(k1->data, k2->data, k1->size);
+	}
+	return k1->data || k2->data ? 0 : 1;
+}
+
 #endif
 
 /*
@@ -55,17 +79,16 @@ static uint32_t bsync_hash_key(const struct bsync_key *key) {
 #define mh_key_t struct bsync_key
 struct mh_strptr_node_t {
 	mh_key_t key;
-	void *val;
+	bsync_val val;
 };
 
 #define mh_node_t struct mh_strptr_node_t
 #define mh_arg_t void *
 #define mh_hash(a, arg) (bsync_hash_key(&(a)->key))
 #define mh_hash_key(a, arg) (bsync_hash_key(&(a)))
-#define mh_eq(a, b, arg) ((a)->key.size != (b)->key.size ? 0 \
-			  : !memcmp((a)->key.data, (b)->key.data, (a)->key.size))
-#define mh_eq_key(a, b, arg) ((a).size != (b)->key.size ? 0 \
-			  : !memcmp((a).data, (b)->key.data, (a).size))
+#define mh_eq(a, b, arg) (bsync_hash_cmp(&(a)->key, &(b)->key))
+#define mh_eq_key(a, b, arg) (bsync_hash_cmp(&(a), &(b)->key))
+
 #include "salad/mhash.h"
 
 #if defined(__cplusplus)
