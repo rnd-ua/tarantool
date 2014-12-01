@@ -225,7 +225,7 @@ txn_commit(struct txn *txn)
 		assert(recovery->wal_mode == WAL_NONE ||
 		       stmt->row != NULL);
 		ev_tstamp start = ev_now(loop()), stop;
-		res = bsync_write(recovery, stmt->row);
+		res = bsync_write(recovery, stmt);
 		stop = ev_now(loop());
 
 		if (stop - start > too_long_threshold && stmt->row != NULL) {
