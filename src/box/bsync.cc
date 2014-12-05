@@ -1375,9 +1375,16 @@ bsync_out_fiber(va_list ap)
 	auto coio_guard = make_scoped_guard([&] {
 		evio_close(loop(), &coio);
 	});
+	char host[URI_MAXHOST] = { '\0' };
+	if (BSYNC_REMOTE.uri.host) {
+		snprintf(host, sizeof(host), "%.*s",
+			(int) BSYNC_REMOTE.uri.host_len, BSYNC_REMOTE.uri.host);
+	}
+	char service[URI_MAXSERVICE];
+	snprintf(service, sizeof(service), "%.*s",
+		(int) BSYNC_REMOTE.uri.service_len, BSYNC_REMOTE.uri.service);
 	while (!proxy_wal_writer.is_shutdown) try {BSYNC_TRACE
-		int r = coio_connect_timeout(&coio, BSYNC_REMOTE.uri.host,
-				BSYNC_REMOTE.uri.service, 0, 0,
+		int r = coio_connect_timeout(&coio, host, service, 0, 0,
 				bsync_state.connect_timeout,
 				BSYNC_REMOTE.uri.host_hint);
 		if (r == -1) {
