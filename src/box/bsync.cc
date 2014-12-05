@@ -896,10 +896,6 @@ restart:BSYNC_TRACE
 static void
 bsync_shutdown_fiber(va_list /* ap */) {
 	wal_writer_stop(recovery_state);
-	for (uint8_t host_id = 0; host_id < bsync_state.num_hosts; ++host_id) {
-		if (BSYNC_REMOTE.fiber_in) fiber_cancel(BSYNC_REMOTE.fiber_in);
-		if (BSYNC_REMOTE.fiber_out) fiber_cancel(BSYNC_REMOTE.fiber_out);
-	}
 	/* TODO : cancel all active bsync process fibers */
 	evio_service_stop(&bsync_coio.evio_service);
 	ev_break(bsync_loop, 1);
@@ -1413,8 +1409,6 @@ bsync_out_fiber(va_list ap)
 	if (--BSYNC_REMOTE.connected == 1) {
 		bsync_disconnected(host_id);
 	}
-	if (BSYNC_REMOTE.fiber_in)
-		fiber_cancel(BSYNC_REMOTE.fiber_in);
 }
 
 /*
