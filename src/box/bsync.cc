@@ -1268,6 +1268,17 @@ encode_request(uint8_t host_id, struct bsync_host_info *elem, struct iovec *iov)
 }
 
 static void
+bsync_writev(struct ev_io *coio, struct iovec *iov, int iovcnt, uint8_t host_id)
+{
+	BSYNC_REMOTE.flags |= bsync_host_active_write;
+	coio_writev_timeout(coio, iov, iovcnt, -1, bsync_state.write_timeout);
+	BSYNC_REMOTE.flags &= !bsync_host_active_write;
+	if (errno == ETIMEDOUT) {
+		tnt_raise(SocketError, coio->fd, "timeout");
+	}
+}
+
+static void
 bsync_send(struct ev_io *coio, uint8_t host_id)
 {
 	if (rlist_empty(&BSYNC_REMOTE.send_queue)) {
@@ -1310,9 +1321,7 @@ bsync_send(struct ev_io *coio, uint8_t host_id)
 		say_debug("send to %s message with type %s",
 			BSYNC_REMOTE.source, bsync_mtype_name[BSYNC_REMOTE.election_code]);
 		BSYNC_REMOTE.election_code = bsync_mtype_none;
-		BSYNC_REMOTE.flags |= bsync_host_active_write;
-		coio_writev(coio, iov, 1, -1);
-		BSYNC_REMOTE.flags &= !bsync_host_active_write;
+		bsync_writev(coio, iov, 1, host_id);
 	} else {
 		assert(bsync_state.state == bsync_state_ready);
 		while(!rlist_empty(&BSYNC_REMOTE.send_queue)) {
@@ -1331,9 +1340,7 @@ bsync_send(struct ev_io *coio, uint8_t host_id)
 				BSYNC_REMOTE.source, bsync_mtype_name[elem->code]);
 			struct iovec iov[XROW_IOVMAX];
 			int iovcnt = encode_request(host_id, elem, iov);
-			BSYNC_REMOTE.flags |= bsync_host_active_write;
-			coio_writev(coio, iov, iovcnt, -1);
-			BSYNC_REMOTE.flags &= !bsync_host_active_write;
+			bsync_writev(coio, iov, iovcnt, host_id);
 		}
 	}
 }
@@ -1392,13 +1399,15 @@ bsync_out_fiber(va_list ap)
 		bsync_outgoing(&coio, host_id);
 	} catch (...) {
 	}
+	BSYNC_TRACE
 	if (BSYNC_REMOTE.fiber_out != fiber()) return;
 	BSYNC_REMOTE.fiber_out = NULL;
 	BSYNC_REMOTE.flags &= !bsync_host_active_write;
 	if (--BSYNC_REMOTE.connected == 1) {
 		bsync_disconnected(host_id);
 	}
-	if (BSYNC_REMOTE.fiber_in) fiber_cancel(BSYNC_REMOTE.fiber_in);
+	if (BSYNC_REMOTE.fiber_in)
+		fiber_cancel(BSYNC_REMOTE.fiber_in);
 }
 
 /*
