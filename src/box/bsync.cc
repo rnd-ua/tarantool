@@ -54,13 +54,14 @@
 #define BSYNC_MAX_HOSTS 14
 #define BSYNC_TRACE \
 	say_debug("%s:%d current state: nconnected=%d, state=%d,"\
-		"naccepted=%d, leader=%d", \
+		" naccepted=%d, leader=%d", \
 	__PRETTY_FUNCTION__, __LINE__, bsync_state.num_connected, \
 	bsync_state.state, bsync_state.num_accepted, (int)bsync_state.leader_id);
 
 static void* bsync_thread(void*);
 static void bsync_process_fiber(va_list ap);
 static void bsync_connected(uint8_t host_id);
+static void bsync_out_fiber(va_list ap);
 
 static struct coio_service bsync_coio;
 static struct wal_writer* wal_local_writer = NULL;
@@ -118,7 +119,9 @@ struct bsync_operation {
 enum bsync_host_flags {
 	bsync_host_active_read = 0x01,
 	bsync_host_active_write = 0x02,
-	bsync_host_rollback = 0x04
+	bsync_host_rollback = 0x04,
+	bsync_host_disconnected = 0x08,
+	bsync_host_reconnect_sleep = 0x10
 };
 
 struct bsync_host_data {
@@ -200,6 +203,7 @@ bsync_max_host()
 			max_host_id = i;
 		}
 	}
+	say_debug("max_host_id is %d", (int)max_host_id);
 	return max_host_id;
 }
 
@@ -952,7 +956,6 @@ bsync_connected(uint8_t host_id)
 	}
 	bsync_state.state = bsync_state_initial;
 	uint8_t max_host_id = bsync_max_host();
-	say_debug("max_host_id is %d", (int)max_host_id);
 	if (max_host_id != bsync_state.local_id) return;
 	bsync_state.num_accepted = 1;
 	bsync_state.state = bsync_state_leader_accept;
@@ -981,7 +984,7 @@ bsync_election(va_list /* ap */)
 static void
 bsync_disconnected(uint8_t host_id)
 {BSYNC_TRACE
-	BSYNC_REMOTE.flags = 0;
+	BSYNC_REMOTE.flags = bsync_host_disconnected;
 	--bsync_state.num_connected;
 	mh_strptr_clear(BSYNC_REMOTE.active_ops);
 	rlist_create(&BSYNC_REMOTE.send_queue);
@@ -1096,19 +1099,22 @@ static bsync_handler_t bsync_handlers[] = {
 
 static void
 bsync_encode_extended_header(uint8_t host_id, const char **pos)
-{BSYNC_TRACE
+{
 	uint32_t len = mp_decode_uint(pos);
+	const char *end = *pos + len;
 	if (!len) return;
 	uint32_t flags = mp_decode_uint(pos);
 	assert(flags);
 	if (flags & bsync_iproto_commit_gsn) {
 		BSYNC_REMOTE.commit_gsn = mp_decode_uint(pos);
 	}
+	/* ignore all unknown data from extended header */
+	*pos = end;
 }
 
 static uint32_t
 bsync_read_package(struct ev_io *coio, struct ibuf *in, uint8_t host_id)
-{BSYNC_TRACE
+{
 	if (host_id < BSYNC_MAX_HOSTS)
 		BSYNC_REMOTE.flags |= bsync_host_active_read;
 	/* Read fixed header */
@@ -1179,10 +1185,16 @@ bsync_accept_handler(va_list ap)
 	assert(host_id < bsync_state.num_hosts);
 	BSYNC_REMOTE.gsn = mp_decode_uint(ipos);
 	BSYNC_REMOTE.fiber_in = fiber();
-	say_info("receive incoming connection from %s, gsn=%ld",
-		 BSYNC_REMOTE.source, BSYNC_REMOTE.gsn);
-	if (++BSYNC_REMOTE.connected == 1 && BSYNC_REMOTE.fiber_out) {BSYNC_TRACE
-		fiber_call(BSYNC_REMOTE.fiber_out);
+	say_info("receive incoming connection from %s, gsn=%ld, status=%d",
+		 BSYNC_REMOTE.source, BSYNC_REMOTE.gsn, (int)BSYNC_REMOTE.connected);
+	if (++BSYNC_REMOTE.connected == 1) {BSYNC_TRACE
+		if (BSYNC_REMOTE.flags & bsync_host_reconnect_sleep) {
+			fiber_call(BSYNC_REMOTE.fiber_out);
+		} else if (BSYNC_REMOTE.flags & bsync_host_disconnected) {
+			fiber_call(
+				fiber_new(BSYNC_REMOTE.source, bsync_out_fiber),
+				&host_id);
+		}
 	}
 	if (BSYNC_REMOTE.connected == 2) {
 		++bsync_state.num_connected;
@@ -1193,9 +1205,8 @@ bsync_accept_handler(va_list ap)
 	} catch(...) {
 		if (--BSYNC_REMOTE.connected == 1) {BSYNC_TRACE
 			bsync_disconnected(host_id);
-			if (BSYNC_REMOTE.fiber_out) {BSYNC_TRACE
-				fiber_call(BSYNC_REMOTE.fiber_out);
-			}
+			BSYNC_REMOTE.connected = 0;
+			BSYNC_REMOTE.fiber_out = NULL;
 		}
 		throw;
 	}
@@ -1328,21 +1339,36 @@ bsync_send(struct ev_io *coio, uint8_t host_id)
 }
 
 static void
+bsync_outgoing(struct ev_io *coio, uint8_t host_id)
+{BSYNC_TRACE
+	if (BSYNC_REMOTE.fiber_out == fiber()) {BSYNC_TRACE
+		BSYNC_REMOTE.election_code = bsync_mtype_hello;
+		BSYNC_REMOTE.election_host = bsync_state.local_id;
+		bsync_send(coio, host_id);
+		if (++BSYNC_REMOTE.connected == 2) {
+			++bsync_state.num_connected;
+			bsync_connected(host_id);
+		}
+	}
+	while(!proxy_wal_writer.is_shutdown && BSYNC_REMOTE.fiber_out == fiber()) {
+		bsync_send(coio, host_id);
+		fiber_gc();
+		fiber_yield_timeout(bsync_state.ping_timeout);
+	}
+}
+
+static void
 bsync_out_fiber(va_list ap)
 {BSYNC_TRACE
 	uint8_t host_id = *va_arg(ap, uint8_t*);
 	say_info("send outgoing connection to %s", BSYNC_REMOTE.source);
-	bool connected = false;
 	BSYNC_REMOTE.fiber_out = fiber();
+	struct ev_io coio;
+	coio_init(&coio);
+	auto coio_guard = make_scoped_guard([&] {
+		evio_close(loop(), &coio);
+	});
 	while (!proxy_wal_writer.is_shutdown) try {BSYNC_TRACE
-		connected = false;
-		struct ev_io coio;
-		coio_init(&coio);
-		struct iobuf *iobuf = iobuf_new(BSYNC_REMOTE.source);
-		auto coio_guard = make_scoped_guard([&] {
-			evio_close(loop(), &coio);
-			iobuf_delete(iobuf);
-		});
 		int r = coio_connect_timeout(&coio, BSYNC_REMOTE.uri.host,
 				BSYNC_REMOTE.uri.service, 0, 0,
 				bsync_state.connect_timeout,
@@ -1350,33 +1376,29 @@ bsync_out_fiber(va_list ap)
 		if (r == -1) {
 			say_warn("connection timeout to %s, wait %f",
 				 BSYNC_REMOTE.source, bsync_state.reconnect_timeout);
-			fiber_yield_timeout(bsync_state.reconnect_timeout);BSYNC_TRACE
+			BSYNC_REMOTE.flags |= bsync_host_reconnect_sleep;
+			fiber_yield_timeout(bsync_state.reconnect_timeout);
+			BSYNC_REMOTE.flags &= !bsync_host_reconnect_sleep;
 			continue;
 		}
-		BSYNC_TRACE
-		BSYNC_REMOTE.election_code = bsync_mtype_hello;
-		BSYNC_REMOTE.election_host = bsync_state.local_id;
-		bsync_send(&coio, host_id);
-		connected = true;
-		if (++BSYNC_REMOTE.connected == 2) {
-			++bsync_state.num_connected;
-			bsync_connected(host_id);
-		}
-		while(!proxy_wal_writer.is_shutdown) {
-			bsync_send(&coio, host_id);
-			fiber_gc();
-			fiber_yield_timeout(bsync_state.ping_timeout);
-		}
-		BSYNC_REMOTE.fiber_out = NULL;
-	} catch (...) {
-		BSYNC_TRACE
-		BSYNC_REMOTE.flags &= !bsync_host_active_write;
-		if (connected && --bsync_index[host_id].connected == 1) {
-			bsync_disconnected(host_id);
-		}
-		if (BSYNC_REMOTE.fiber_in) fiber_cancel(BSYNC_REMOTE.fiber_in);
-		fiber_yield_timeout(bsync_state.reconnect_timeout);BSYNC_TRACE
+		break;
+	} catch (...) {BSYNC_TRACE
+		BSYNC_REMOTE.flags |= bsync_host_reconnect_sleep;
+		fiber_yield_timeout(bsync_state.reconnect_timeout);
+		BSYNC_REMOTE.flags &= !bsync_host_reconnect_sleep;
 	}
+	BSYNC_TRACE
+	try {
+		bsync_outgoing(&coio, host_id);
+	} catch (...) {
+	}
+	if (BSYNC_REMOTE.fiber_out != fiber()) return;
+	BSYNC_REMOTE.fiber_out = NULL;
+	BSYNC_REMOTE.flags &= !bsync_host_active_write;
+	if (--BSYNC_REMOTE.connected == 1) {
+		bsync_disconnected(host_id);
+	}
+	if (BSYNC_REMOTE.fiber_in) fiber_cancel(BSYNC_REMOTE.fiber_in);
 }
 
 /*
@@ -1561,7 +1583,7 @@ bsync_thread(void*)
 	evio_service_start(&bsync_coio.evio_service);
 	for (uint8_t host_id = 0; host_id < bsync_state.num_hosts; ++host_id) {
 		if (host_id == bsync_state.local_id) continue;
-		bsync_index[host_id].connected = 0;
+		BSYNC_REMOTE.connected = 0;
 		fiber_call(
 			fiber_new(BSYNC_REMOTE.source, bsync_out_fiber),
 			&host_id);
