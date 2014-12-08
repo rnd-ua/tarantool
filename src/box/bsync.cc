@@ -329,10 +329,6 @@ bsync_end_active_op(uint8_t host_id, struct bsync_operation *oper)
 	tt_pthread_mutex_lock(&proxy_wal_writer.mutex);
 	mh_int_t k = mh_strptr_find(BSYNC_REMOTE.active_ops,
 				    oper->dup_key, NULL);
-	if (k == mh_end(BSYNC_REMOTE.active_ops)) {
-		k = mh_strptr_find(BSYNC_REMOTE.active_ops,
-				   oper->dup_key, NULL);
-	}
 	assert(k != mh_end(BSYNC_REMOTE.active_ops));
 	struct mh_strptr_node_t *node = mh_strptr_node(BSYNC_REMOTE.active_ops, k);
 	if (oper->server_id != 0) {
