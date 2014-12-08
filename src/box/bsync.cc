@@ -558,6 +558,7 @@ bsync_proxy_processor()
 		send->code = (oper->txn_data->result < 0 ? bsync_mtype_reject :
 							   bsync_mtype_submit);
 		bsync_send_data(&BSYNC_LEADER, send);
+		SWITCH_TO_TXN
 	} else if (oper->txn_data->result < 0) {
 		uint8_t host_id = oper->server_id - 1;
 		if (BSYNC_REMOTE.flags & bsync_host_rollback) {
