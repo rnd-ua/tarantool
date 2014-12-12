@@ -451,9 +451,9 @@ bsync_parse_dup_key(struct bsync_common *data, struct key_def *key,
 		}
 		const char *key_part =
 			tuple_field_cstr(tuple, key->parts[p].fieldno);
-		data->dup_key->size +=
-			strcpy((char *)data->dup_key->data, key_part) -
-				(char *)data->dup_key->data;
+		ssize_t key_len = strlen(key_part);
+		data->dup_key->size += key_len;
+		memcpy(data->dup_key->data, key_part, key_len);
 	}
 	data->dup_key->space_id = key->space_id;
 	assert(data->dup_key->size > 0);
