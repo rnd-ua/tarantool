@@ -456,7 +456,6 @@ bsync_parse_dup_key(struct bsync_common *data, struct key_def *key,
 		memcpy(data->dup_key->data, key_part, key_len);
 	}
 	data->dup_key->space_id = key->space_id;
-	assert(data->dup_key->size > 0);
 }
 
 static void
