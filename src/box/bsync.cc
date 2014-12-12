@@ -656,6 +656,15 @@ bsync_proxy_processor()
 	oper->txn_data->owner = NULL;
 	xrow_header_decode(oper->txn_data->row, bsync_state.iproxy_pos,
 			   bsync_state.iproxy_end);
+	struct iovec xrow_body[XROW_BODY_IOVMAX];
+	memcpy(xrow_body, oper->txn_data->row->body,
+		sizeof(oper->txn_data->row->body));
+	for (int i = 0; i < oper->txn_data->row->bodycnt; ++i) {
+		oper->txn_data->row->body[i].iov_base =
+			region_alloc(&fiber()->gc, xrow_body[i].iov_len);
+		memcpy(oper->txn_data->row->body[i].iov_base,
+			xrow_body[i].iov_base, xrow_body[i].iov_len);
+	}
 	bsync_state.iproxy_pos = NULL;
 	bsync_state.iproxy_end = NULL;
 
