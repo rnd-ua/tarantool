@@ -667,12 +667,12 @@ bsync_proxy_processor()
 	}
 	bsync_state.iproxy_pos = NULL;
 	bsync_state.iproxy_end = NULL;
-
 	oper->server_id = oper->txn_data->row->server_id;
 	oper->lsn = oper->txn_data->row->lsn;
 	oper->owner = fiber();
 	bool slave_proxy = (bsync_state.leader_id != bsync_state.local_id);
 	if (slave_proxy) {
+		assert(BSYNC_LOCAL.gsn < oper->txn_data->row->lsn);
 		BSYNC_LOCAL.gsn = oper->gsn = oper->txn_data->row->lsn;
 	}
 	SWITCH_TO_TXN
