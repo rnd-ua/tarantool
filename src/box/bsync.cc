@@ -661,6 +661,8 @@ bsync_proxy_processor()
 	bool slave_proxy = (bsync_state.leader_id != bsync_state.local_id);
 	if (slave_proxy) {
 		assert(BSYNC_LOCAL.gsn < oper->txn_data->row->lsn);
+		assert(wal_local_writer->vclock.lsn[BSYNC_SERVER_ID] <=
+			BSYNC_LOCAL.gsn);
 		BSYNC_LOCAL.gsn = oper->gsn = oper->txn_data->row->lsn;
 	}
 	SWITCH_TO_TXN
