@@ -1123,14 +1123,16 @@ bsync_leader_promise(uint8_t host_id, const char** ipos, const char* iend)
 static void
 bsync_election_ops()
 {BSYNC_TRACE
-	struct bsync_operation *oper;
-	struct rlist election_ops;
-	rlist_create(&election_ops);
-	rlist_swap(&election_ops, &bsync_state.election_ops);
-	rlist_foreach_entry(oper, &election_ops, list) {
+	if (rlist_empty(&bsync_state.election_ops))
+		return;
+	while (!rlist_empty(&bsync_state.election_ops) &&
+		bsync_state.state == bsync_state_ready)
+	{
+		struct bsync_operation *oper =
+			rlist_shift_entry(&bsync_state.election_ops,
+					  struct bsync_operation, list);
 		fiber_call(oper->owner);
 	}
-	rlist_del(&election_ops);
 }
 
 static void
