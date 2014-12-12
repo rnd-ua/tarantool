@@ -452,24 +452,6 @@ bsync_parse_dup_key(struct bsync_common *data, struct key_def *key,
 	data->dup_key->space_id = key->space_id;
 }
 
-static void
-bsync_parse_dup_key(struct bsync_common *data, struct xrow_header *xrow)
-{
-	data->dup_key = (struct bsync_key *)
-		region_alloc(&fiber()->gc, sizeof(struct bsync_key));
-	data->dup_key->data = NULL;
-	data->dup_key->size = 0;
-	request_header_decode(xrow, bsync_space_cb, bsync_tuple_cb, data->dup_key);
-	struct space *space = space_cache_find(data->dup_key->space_id);
-	assert(space->index[0]->key_def->iid == 0);
-	struct tuple *new_tuple =
-		tuple_new(space->format, (const char *)data->dup_key->data,
-			  (const char *)data->dup_key->data + data->dup_key->size);
-	TupleGuard guard(new_tuple);
-	space_validate_tuple(space, new_tuple);
-	bsync_parse_dup_key(data, space->index[0]->key_def, new_tuple);
-}
-
 int
 bsync_write(struct recovery_state *r, struct txn_stmt *stmt) try
 {BSYNC_TRACE
@@ -882,7 +864,19 @@ bsync_txn_proceed_request(struct bsync_txn_info *info)
 			info->row->body[0].iov_len);
 	req->header = info->row;
 	info->op->common->region = bsync_new_region();
-	bsync_parse_dup_key(info->op->common, info->row);
+
+	struct bsync_key local_data;
+	request_header_decode(info->row, bsync_space_cb,
+				bsync_tuple_cb, &local_data);
+	const char *tuple = local_data.data;
+	struct space *space = space_cache_find(local_data.space_id);
+	assert(space->index[0]->key_def->iid == 0);
+	struct tuple *new_tuple =
+		tuple_new(space->format, tuple, tuple + local_data.size);
+	TupleGuard guard(new_tuple);
+	space_validate_tuple(space, new_tuple);
+	bsync_parse_dup_key(info->common, space->index[0]->key_def, new_tuple);
+
 	if (info->op->server_id == BSYNC_SERVER_ID ||
 		bsync_begin_active_op(info->op))
 	{
