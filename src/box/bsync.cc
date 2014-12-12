@@ -522,6 +522,15 @@ bsync_send_data(struct bsync_host_data *host, struct bsync_host_info *elem) {
 	}
 }
 
+static uint64_t
+bsync_update_gsn(uint64_t gsn)
+{
+	assert(BSYNC_LOCAL.gsn <= gsn);
+	assert(wal_local_writer->vclock.lsn[BSYNC_SERVER_ID] <= BSYNC_LOCAL.gsn);
+	BSYNC_LOCAL.gsn = gsn;
+	return gsn;
+}
+
 static void
 bsync_queue_slave(struct bsync_operation *oper)
 {BSYNC_TRACE
@@ -547,7 +556,7 @@ bsync_queue_slave(struct bsync_operation *oper)
 	}
 	oper->status = bsync_op_status_accept;
 	oper->txn_data->row->server_id = BSYNC_SERVER_ID;
-	oper->txn_data->row->lsn = oper->gsn;
+	oper->txn_data->row->lsn = bsync_update_gsn(oper->gsn);
 	rlist_add_tail_entry(&bsync_state.submit_queue, oper, list);
 	int wal_result = wal_write(wal_local_writer, oper->txn_data->row);
 	elem->code = wal_result < 0 ? bsync_mtype_reject
@@ -616,7 +625,7 @@ bsync_queue_leader(struct bsync_operation *oper, bool proxy)
 		say_debug("********** send accept/body from fiber %ld", (ptrdiff_t)elem->op->owner);
 		bsync_send_data(&BSYNC_REMOTE, elem);
 	}
-	oper->txn_data->row->lsn = oper->gsn;
+	oper->txn_data->row->lsn = bsync_update_gsn(oper->gsn);
 	oper->txn_data->row->server_id = BSYNC_SERVER_ID;
 	oper->status = bsync_op_status_wal;
 	oper->txn_data->result = wal_write(wal_local_writer, oper->txn_data->row);
@@ -672,10 +681,7 @@ bsync_proxy_processor()
 	oper->owner = fiber();
 	bool slave_proxy = (bsync_state.leader_id != bsync_state.local_id);
 	if (slave_proxy) {
-		assert(BSYNC_LOCAL.gsn < oper->txn_data->row->lsn);
-		assert(wal_local_writer->vclock.lsn[BSYNC_SERVER_ID] <=
-			BSYNC_LOCAL.gsn);
-		BSYNC_LOCAL.gsn = oper->gsn = oper->txn_data->row->lsn;
+		oper->gsn = bsync_update_gsn(oper->txn_data->row->lsn);
 	}
 	SWITCH_TO_TXN
 	fiber_yield();BSYNC_TRACE
