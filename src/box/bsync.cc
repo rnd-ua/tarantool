@@ -1133,6 +1133,19 @@ bsync_leader_promise(uint8_t host_id, const char** ipos, const char* iend)
 }
 
 static void
+bsync_election_ops()
+{BSYNC_TRACE
+	struct bsync_operation *oper;
+	struct rlist election_ops;
+	rlist_create(&election_ops);
+	rlist_swap(&election_ops, &bsync_state.election_ops);
+	rlist_foreach_entry(oper, &election_ops, list) {
+		fiber_call(oper->owner);
+	}
+	rlist_del(&election_ops);
+}
+
+static void
 bsync_leader_accept(uint8_t host_id, const char** ipos, const char* iend)
 {BSYNC_TRACE
 	(void)host_id; (void)ipos; (void)iend;
@@ -1155,11 +1168,7 @@ bsync_leader_accept(uint8_t host_id, const char** ipos, const char* iend)
 		bsync_state.state = bsync_state_recovery;
 	} else {
 		bsync_state.state = bsync_state_ready;
-		struct bsync_operation *oper;
-		rlist_foreach_entry(oper, &bsync_state.election_ops, list) {
-			fiber_call(oper->owner);
-		}
-		rlist_create(&bsync_state.election_ops);
+		bsync_election_ops();
 	}
 }
 
@@ -1170,11 +1179,7 @@ bsync_leader_submit(uint8_t host_id, const char** ipos, const char* iend)
 	bsync_state.leader_id = host_id;
 	bsync_state.state = bsync_state_ready;
 	say_info("new leader are %s", BSYNC_REMOTE.source);
-	struct bsync_operation *oper;
-	rlist_foreach_entry(oper, &bsync_state.election_ops, list) {
-		fiber_call(oper->owner);
-	}
-	rlist_create(&bsync_state.election_ops);
+	bsync_election_ops();
 }
 
 static void
