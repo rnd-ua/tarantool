@@ -155,6 +155,18 @@ xrow_header_encode(const struct xrow_header *header, struct iovec *out)
 		map_size++;
 	}
 
+	if (header->commit_sn) {
+		d = mp_encode_uint(d, IPROTO_BSYNC_COMMIT);
+		d = mp_encode_uint(d, header->commit_sn);
+		map_size++;
+	}
+
+	if (header->rollback_sn) {
+		d = mp_encode_uint(d, IPROTO_BSYNC_ROLLBACK);
+		d = mp_encode_uint(d, header->rollback_sn);
+		map_size++;
+	}
+
 	assert(d <= data + HEADER_LEN_MAX);
 	mp_encode_map(data, map_size);
 	out->iov_base = data;

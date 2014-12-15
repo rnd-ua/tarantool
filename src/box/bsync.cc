@@ -170,7 +170,8 @@ static struct bsync_state_ {
 	uint8_t state;
 	uint8_t num_accepted;
 	bool rollback;
-	uint64_t submit_gsn;
+	uint64_t wal_commit_gsn;
+	uint64_t wal_rollback_gsn;
 
 	uint64_t recovery_hosts;
 	ev_tstamp connect_timeout;
@@ -531,6 +532,24 @@ bsync_update_gsn(uint64_t gsn)
 	return gsn;
 }
 
+static int
+bsync_wal_write(struct xrow_header *row)
+{
+	if (bsync_state.wal_commit_gsn) {
+		row->commit_sn = bsync_state.wal_commit_gsn;
+		bsync_state.wal_commit_gsn = 0;
+	} else {
+		assert(row->commit_sn == 0);
+	}
+	if (bsync_state.wal_rollback_gsn) {
+		row->rollback_sn = bsync_state.wal_rollback_gsn;
+		bsync_state.wal_rollback_gsn = 0;
+	} else {
+		assert(row->rollback_sn == 0);
+	}
+	return wal_write(wal_local_writer, row);
+}
+
 static void
 bsync_queue_slave(struct bsync_operation *oper)
 {BSYNC_TRACE
@@ -558,7 +577,7 @@ bsync_queue_slave(struct bsync_operation *oper)
 	oper->txn_data->row->server_id = BSYNC_SERVER_ID;
 	oper->txn_data->row->lsn = bsync_update_gsn(oper->gsn);
 	rlist_add_tail_entry(&bsync_state.submit_queue, oper, list);
-	int wal_result = wal_write(wal_local_writer, oper->txn_data->row);
+	int wal_result = bsync_wal_write(oper->txn_data->row);
 	elem->code = wal_result < 0 ? bsync_mtype_reject
 				    : bsync_mtype_submit;
 	bsync_send_data(&BSYNC_LEADER, elem);
@@ -582,8 +601,9 @@ bsync_wait_slow(struct bsync_operation *oper)
 		if (ev_now(loop()) - start <= bsync_state.slow_host_timeout)
 			continue;
 	}
-	if (2 * oper->accepted > bsync_state.num_hosts)
-		bsync_state.submit_gsn = oper->gsn;
+	if (2 * oper->accepted > bsync_state.num_hosts) {
+		bsync_state.wal_commit_gsn = oper->gsn;
+	}
 	BSYNC_TRACE
 }
 
@@ -628,7 +648,7 @@ bsync_queue_leader(struct bsync_operation *oper, bool proxy)
 	oper->txn_data->row->lsn = bsync_update_gsn(oper->gsn);
 	oper->txn_data->row->server_id = BSYNC_SERVER_ID;
 	oper->status = bsync_op_status_wal;
-	oper->txn_data->result = wal_write(wal_local_writer, oper->txn_data->row);
+	oper->txn_data->result = bsync_wal_write(oper->txn_data->row);
 	if (oper->txn_data->result < 0) ++oper->rejected;
 	else ++oper->accepted;
 	ev_tstamp start = ev_now(loop());
@@ -689,7 +709,7 @@ bsync_proxy_processor()
 			region_alloc(&fiber()->gc, sizeof(bsync_host_info));
 	send->op = oper;
 	if (slave_proxy) {
-		oper->txn_data->result = wal_write(wal_local_writer, oper->txn_data->row);
+		oper->txn_data->result = bsync_wal_write(oper->txn_data->row);
 		send->code = (oper->txn_data->result < 0 ? bsync_mtype_reject :
 							   bsync_mtype_submit);
 		bsync_send_data(&BSYNC_LEADER, send);
@@ -1163,7 +1183,7 @@ bsync_leader_accept(uint8_t host_id, const char** ipos, const char* iend)
 	if (2 * ++bsync_state.num_accepted <= bsync_state.num_hosts) return;
 	say_info("new leader are %s", BSYNC_LOCAL.source);
 	bsync_state.leader_id = bsync_state.local_id;
-	bsync_state.submit_gsn = BSYNC_LOCAL.gsn;
+	bsync_state.wal_commit_gsn = BSYNC_LOCAL.gsn;
 	bsync_state.recovery_hosts = 0;
 	for (uint8_t i = 0; i < bsync_state.num_hosts; ++i) {
 		if (i == bsync_state.local_id || bsync_index[i].connected < 2)
@@ -1342,9 +1362,9 @@ bsync_accept_handler(va_list ap)
 static int
 bsync_extended_header_size(uint8_t host_id)
 {
-	if (bsync_state.submit_gsn > BSYNC_REMOTE.commit_gsn) {
+	if (bsync_state.wal_commit_gsn > BSYNC_REMOTE.commit_gsn) {
 		return mp_sizeof_uint(bsync_iproto_commit_gsn) +
-			mp_sizeof_uint(bsync_state.submit_gsn);
+			mp_sizeof_uint(bsync_state.wal_commit_gsn);
 	} else {
 		return 0;
 	}
@@ -1354,10 +1374,10 @@ static char *
 bsync_extended_header_encode(uint8_t host_id, char *pos)
 {
 	pos = mp_encode_uint(pos, bsync_extended_header_size(host_id));
-	if (bsync_state.submit_gsn > BSYNC_REMOTE.commit_gsn) {
+	if (bsync_state.wal_commit_gsn > BSYNC_REMOTE.commit_gsn) {
 		pos = mp_encode_uint(pos, bsync_iproto_commit_gsn);
-		pos = mp_encode_uint(pos, bsync_state.submit_gsn);
-		BSYNC_REMOTE.commit_gsn = bsync_state.submit_gsn;
+		pos = mp_encode_uint(pos, bsync_state.wal_commit_gsn);
+		BSYNC_REMOTE.commit_gsn = bsync_state.wal_commit_gsn;
 	}
 	return pos;
 }
@@ -1655,7 +1675,8 @@ bsync_init(wal_writer* initial, struct vclock *vclock)
 	bsync_state.iproxy_end = NULL;
 	bsync_state.iproxy_pos = NULL;
 	bsync_state.rollback = false;
-	bsync_state.submit_gsn = 0;
+	bsync_state.wal_commit_gsn = 0;
+	bsync_state.wal_rollback_gsn = 0;
 
 	assert(! bsync_wal_writer.is_shutdown);
 	assert(STAILQ_EMPTY(&bsync_wal_writer.input));

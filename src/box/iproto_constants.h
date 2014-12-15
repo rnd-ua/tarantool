@@ -68,6 +68,8 @@ enum iproto_key {
 	IPROTO_CLUSTER_UUID = 0x25,
 	IPROTO_VCLOCK = 0x26,
 	IPROTO_EXPR = 0x27, /* EVAL */
+	IPROTO_BSYNC_COMMIT = 0x28,
+	IPROTO_BSYNC_ROLLBACK = 0x29,
 	/* Leave a gap between request keys and response keys */
 	IPROTO_DATA = 0x30,
 	IPROTO_ERROR = 0x31,
