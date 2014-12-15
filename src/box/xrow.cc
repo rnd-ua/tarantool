@@ -85,6 +85,12 @@ error:
 		case IPROTO_TIMESTAMP:
 			header->tm = mp_decode_double(pos);
 			break;
+		case IPROTO_BSYNC_COMMIT:
+			header->commit_sn = mp_decode_uint(pos);
+			break;
+		case IPROTO_BSYNC_ROLLBACK:
+			header->rollback_sn = mp_decode_uint(pos);
+			break;
 		default:
 			/* unknown header */
 			mp_next(pos);
