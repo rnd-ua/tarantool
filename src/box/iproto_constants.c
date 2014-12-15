@@ -83,6 +83,8 @@ const unsigned char iproto_key_type[IPROTO_KEY_MAX] =
 	/* 0x25 */	MP_STR, /* IPROTO_CLUSTER_UUID */
 	/* 0x26 */	MP_MAP, /* IPROTO_VCLOCK */
 	/* 0x27 */	MP_STR, /* IPROTO_EXPR */
+	/* 0x28 */	MP_UINT, /* IPROTO_BSYNC_COMMIT */
+	/* 0x29 */	MP_UINT, /* IPROTO_BSYNC_ROLLBACK */
 	/* }}} */
 };
 
