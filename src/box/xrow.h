@@ -48,6 +48,8 @@ struct xrow_header {
 	uint64_t sync;
 	uint64_t lsn;
 	double tm;
+	uint64_t commit_sn;
+	uint64_t rollback_sn;
 
 	int bodycnt;
 	struct iovec body[XROW_BODY_IOVMAX];
