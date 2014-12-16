@@ -556,17 +556,20 @@ bsync_queue_slave(struct bsync_operation *oper)
 	elem->code = bsync_mtype_proxy_request;
 	elem->op = oper;
 	oper->txn_data->result = 0;
+	say_debug("start to proceed request %ld", oper->lsn);
 	rlist_add_tail_entry(&bsync_state.accept_queue, oper, list);
 	bsync_send_data(&BSYNC_LEADER, elem);
 	/* wait accept or reject */
 	fiber_yield();BSYNC_TRACE
 	if (oper->txn_data->result < 0) {
 		SWITCH_TO_TXN
+		say_debug("request %ld rejected", oper->lsn);
 		fiber_yield();BSYNC_TRACE
 		elem->code = bsync_mtype_proxy_join;
 		bsync_send_data(&BSYNC_LEADER, elem);
 		return;
 	}
+	say_debug("request %ld accepted to gsn %ld", oper->lsn, oper->gsn);
 	oper->status = bsync_op_status_accept;
 	oper->txn_data->row->server_id = BSYNC_SERVER_ID;
 	oper->txn_data->row->lsn = bsync_update_gsn(oper->gsn);
@@ -606,6 +609,7 @@ bsync_queue_leader(struct bsync_operation *oper, bool proxy)
 {BSYNC_TRACE
 	oper->status = bsync_op_status_init;
 	oper->gsn = ++BSYNC_LOCAL.gsn;
+	say_debug("start to proceed request %ld", oper->gsn);
 	oper->server_id = oper->txn_data->row->server_id;
 	oper->rejected = 0;
 	oper->accepted = 0;
@@ -691,12 +695,14 @@ bsync_proxy_processor()
 	if (slave_proxy) {
 		oper->gsn = bsync_update_gsn(oper->txn_data->row->lsn);
 	}
+	say_debug("start to apply request %ld", oper->gsn);
 	SWITCH_TO_TXN
 	fiber_yield();BSYNC_TRACE
 	struct bsync_host_info *send = (struct bsync_host_info *)
 			region_alloc(&fiber()->gc, sizeof(bsync_host_info));
 	send->op = oper;
 	if (slave_proxy) {
+		say_debug("submit request %ld", oper->gsn);
 		oper->txn_data->result = bsync_wal_write(oper->txn_data->row);
 		send->code = (oper->txn_data->result < 0 ? bsync_mtype_reject :
 							   bsync_mtype_submit);
@@ -997,7 +1003,6 @@ restart:BSYNC_TRACE
 					goto exit;
 				}
 			}
-			say_debug("start to proceed request %ld", oper->lsn);
 			if (bsync_state.leader_id == bsync_state.local_id) {
 				oper->server_id = 0;
 				bsync_queue_leader(oper, false);
@@ -1233,7 +1238,7 @@ static bsync_handler_t bsync_handlers[] = {
 };
 
 static void
-bsync_encode_extended_header(uint8_t host_id, const char **pos)
+bsync_decode_extended_header(uint8_t host_id, const char **pos)
 {
 	uint32_t len = mp_decode_uint(pos);
 	const char *end = *pos + len;
@@ -1272,7 +1277,7 @@ bsync_read_package(struct ev_io *coio, struct ibuf *in, uint8_t host_id)
 	if (host_id < BSYNC_MAX_HOSTS)
 		BSYNC_REMOTE.flags &= !bsync_host_active_read;
 	const char *pos = (const char *)in->pos;
-	bsync_encode_extended_header(host_id, (const char **) &in->pos);
+	bsync_decode_extended_header(host_id, (const char **) &in->pos);
 	return len - (in->pos - pos);
 }
 
