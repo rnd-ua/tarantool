@@ -485,6 +485,7 @@ bsync_write(struct recovery_state *r, struct xrow_header *row) try
 	} else { /* proxy request */
 		info = rlist_shift_entry(&bsync_state.txn_queue,
 					 struct bsync_txn_info, list);
+		say_debug("send request %ld to bsync", info->op->gsn);
 	}
 	info->owner = fiber();
 	SWITCH_TO_BSYNC
@@ -935,6 +936,7 @@ bsync_txn_proceed_request(struct bsync_txn_info *info)
 	if (info->op->server_id == BSYNC_SERVER_ID ||
 		bsync_begin_active_op(info->op))
 	{
+		say_debug("send request %ld to txn", info->op->gsn);
 		rlist_add_tail_entry(&bsync_state.txn_queue, info, list);
 		box_process(&null_port, req);
 	} else {BSYNC_TRACE
