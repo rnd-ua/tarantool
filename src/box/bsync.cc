@@ -963,6 +963,7 @@ bsync_txn_process(ev_loop *loop, ev_async *watcher, int event)
 			STAILQ_FIRST(&bsync_state.txn_proxy_input);
 		if (info->owner) {
 			STAILQ_REMOVE_HEAD(&bsync_state.txn_proxy_input, fifo);
+			say_debug("send request %ld to txn", info->op->gsn);
 			fiber_call(info->owner);
 		} else {
 			fiber_call(bsync_fiber(&bsync_state.txn_fiber_cache,
@@ -1483,8 +1484,9 @@ bsync_send(struct ev_io *coio, uint8_t host_id)
 				bsync_print_op_queue(host_id);
 			}
 			assert(elem->code <= bsync_mtype_hello);
-			say_debug("send to %s message with type %s",
-				BSYNC_REMOTE.source, bsync_mtype_name[elem->code]);
+			say_debug("send to %s message with type %s, gsn %ld",
+				BSYNC_REMOTE.source, bsync_mtype_name[elem->code],
+				elem->op->gsn);
 			struct iovec iov[XROW_IOVMAX];
 			int iovcnt = encode_request(host_id, elem, iov);
 			bsync_writev(coio, iov, iovcnt, host_id);
