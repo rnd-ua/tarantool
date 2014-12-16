@@ -614,6 +614,7 @@ bsync_queue_leader(struct bsync_operation *oper, bool proxy)
 	oper->server_id = oper->txn_data->row->server_id;
 	oper->rejected = 0;
 	oper->accepted = 0;
+	oper->txn_data->op = oper;
 	if (oper->server_id == 0) {BSYNC_TRACE
 		/* local operation */
 		oper->common->dup_key = oper->txn_data->common->dup_key;
@@ -695,16 +696,19 @@ bsync_proxy_processor()
 	bool slave_proxy = (bsync_state.leader_id != bsync_state.local_id);
 	if (slave_proxy) {
 		oper->gsn = bsync_update_gsn(oper->txn_data->row->lsn);
+		say_debug("start to apply request %ld to WAL", oper->gsn);
+		oper->txn_data->result = bsync_wal_write(oper->txn_data->row);
 	}
-	say_debug("start to apply request %ld", oper->gsn);
-	SWITCH_TO_TXN
-	fiber_yield();BSYNC_TRACE
+	if (oper->txn_data->result >= 0) {
+		say_debug("start to apply request %ld to TXN", oper->gsn);
+		SWITCH_TO_TXN
+		fiber_yield();BSYNC_TRACE
+	}
 	struct bsync_host_info *send = (struct bsync_host_info *)
 			region_alloc(&fiber()->gc, sizeof(bsync_host_info));
 	send->op = oper;
 	if (slave_proxy) {
 		say_debug("submit request %ld", oper->gsn);
-		oper->txn_data->result = bsync_wal_write(oper->txn_data->row);
 		send->code = (oper->txn_data->result < 0 ? bsync_mtype_reject :
 							   bsync_mtype_submit);
 		bsync_send_data(&BSYNC_LEADER, send);
