@@ -772,13 +772,14 @@ bsync_proceed_rollback(struct bsync_txn_info *info)
 #include <sstream>
 static void
 bsync_print_op_queue(uint8_t host_id)
-{BSYNC_TRACE
+{
 	struct bsync_host_info *info = NULL;
 	std::stringstream stream;
 	rlist_foreach_entry(info, &BSYNC_REMOTE.op_queue, list) {
 		stream << info->op->owner << ":" << info->op->gsn << "; ";
 	}
-	say_debug("op_queue contains %s", stream.str().c_str());
+	say_debug("op_queue %s contains %s", BSYNC_REMOTE.source,
+		  stream.str().c_str());
 }
 
 static void
