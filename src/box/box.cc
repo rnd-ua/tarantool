@@ -86,6 +86,8 @@ recover_row(struct recovery_state *r, void *param, struct xrow_header *row)
 	(void) param;
 	(void) r;
 	assert(r == recovery);
+	if (row->bodycnt == 0 && (row->commit_sn || row->rollback_sn))
+		return;
 	assert(row->bodycnt == 1); /* always 1 for read */
 	struct request request;
 	request_create(&request, row->type);
