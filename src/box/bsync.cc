@@ -510,10 +510,7 @@ bsync_write(struct recovery_state *r, struct xrow_header *row) try
 	SWITCH_TO_BSYNC
 	fiber_yield();BSYNC_TRACE
 	if (!bsync_state.rollback) {
-		struct bsync_txn_info *s =
-			rlist_shift_entry(&bsync_state.execute_queue,
-					  struct bsync_txn_info, list);
-		assert(s == info);
+		rlist_del_entry(info, list);
 		if (info->result >= 0) {
 			info->repeat = false;
 			return info->result;
@@ -521,6 +518,7 @@ bsync_write(struct recovery_state *r, struct xrow_header *row) try
 		tt_pthread_mutex_lock(&bsync_state.mutex);
 		bsync_state.rollback = true;
 		/* rollback in reverse order local operations */
+		struct bsync_txn_info *s;
 		rlist_foreach_entry_reverse(s, &bsync_state.execute_queue, list) {
 			s->result = -1;
 			fiber_call(s->owner);
@@ -724,6 +722,9 @@ bsync_proxy_processor()
 {BSYNC_TRACE
 	struct bsync_operation *oper = (struct bsync_operation *)
 		region_alloc(&fiber()->gc, sizeof(struct bsync_operation));
+	struct bsync_host_info *send = (struct bsync_host_info *)
+		region_alloc(&fiber()->gc, sizeof(bsync_host_info));
+	send->op = oper;
 	oper->txn_data = (struct bsync_txn_info *)
 		region_alloc(&fiber()->gc, sizeof(struct bsync_txn_info));
 	oper->txn_data->common = oper->common = (struct bsync_common *)
@@ -754,9 +755,14 @@ bsync_proxy_processor()
 	oper->owner = fiber();
 	bool slave_proxy = (bsync_state.leader_id != bsync_state.local_id);
 	if (slave_proxy) {
+		oper->status = bsync_op_status_wal;
 		oper->gsn = bsync_update_gsn(oper->txn_data->stmt->row->lsn);
 		say_debug("start to apply request %ld to WAL", oper->gsn);
 		oper->txn_data->result = bsync_wal_write(oper->txn_data->stmt->row);
+		say_debug("submit request %ld", oper->gsn);
+		send->code = (oper->txn_data->result < 0 ? bsync_mtype_reject :
+							   bsync_mtype_submit);
+		bsync_send_data(&BSYNC_LEADER, send);
 	}
 	if (oper->txn_data->result >= 0) {
 		rlist_add_tail_entry(&bsync_state.commit_queue, oper, list);
@@ -764,17 +770,11 @@ bsync_proxy_processor()
 		SWITCH_TO_TXN
 		fiber_yield();BSYNC_TRACE
 	}
-	struct bsync_host_info *send = (struct bsync_host_info *)
-			region_alloc(&fiber()->gc, sizeof(bsync_host_info));
-	send->op = oper;
 	if (slave_proxy) {
-		say_debug("submit request %ld", oper->gsn);
-		send->code = (oper->txn_data->result < 0 ? bsync_mtype_reject :
-							   bsync_mtype_submit);
-		bsync_send_data(&BSYNC_LEADER, send);
-		oper->txn_data->result = 0;
-		oper->status = bsync_op_status_yield;
-		fiber_yield();
+		if (oper->status != bsync_op_status_submit) {
+			oper->status = bsync_op_status_yield;
+			fiber_yield();
+		}
 		SWITCH_TO_TXN
 	} else if (oper->txn_data->result < 0) {
 		uint8_t host_id = oper->server_id - 1;
