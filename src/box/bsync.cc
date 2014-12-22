@@ -511,12 +511,10 @@ bsync_write(struct recovery_state *r, struct xrow_header *row) try
 	fiber_yield();BSYNC_TRACE
 	if (!bsync_state.rollback) {
 		struct bsync_txn_info *s =
-			rlist_first_entry(&bsync_state.execute_queue,
+			rlist_shift_entry(&bsync_state.execute_queue,
 					  struct bsync_txn_info, list);
 		assert(s == info);
 		if (info->result >= 0) {
-			rlist_shift_entry(&bsync_state.execute_queue,
-					  struct bsync_txn_info, list);
 			info->repeat = false;
 			return info->result;
 		}
@@ -531,8 +529,10 @@ bsync_write(struct recovery_state *r, struct xrow_header *row) try
 		STAILQ_INIT(&bsync_state.bsync_proxy_input);
 		STAILQ_INIT(&bsync_state.bsync_proxy_queue);
 		bsync_state.rollback = false;
+		rlist_foreach_entry(s, &bsync_state.commit_queue, list) {
+			fiber_call(s->owner);
+		}
 		tt_pthread_cond_signal(&bsync_state.cond);
-		tt_pthread_cond_wait(&bsync_state.cond,&bsync_state.mutex);
 		tt_pthread_mutex_unlock(&bsync_state.mutex);
 	}
 	return info->result;
@@ -579,21 +579,14 @@ bsync_wal_write(struct xrow_header *row)
 static void
 bsync_slave_rollback(struct bsync_operation *oper)
 {
-	struct bsync_host_info *elem = (struct bsync_host_info *)
-		region_alloc(&fiber()->gc, sizeof(struct bsync_host_info));
 	tt_pthread_mutex_lock(&bsync_state.mutex);
+	rlist_foreach_entry(oper, &bsync_state.commit_queue, list) {
+		oper->txn_data->repeat = true;
+	}
 	bool was_empty = STAILQ_EMPTY(&bsync_state.txn_proxy_queue);
 	STAILQ_INSERT_TAIL(&bsync_state.txn_proxy_queue, oper->txn_data, fifo);
 	if (was_empty) ev_async_send(txn_loop, &txn_process_event);
 	tt_pthread_cond_wait(&bsync_state.cond, &bsync_state.mutex);
-	struct rlist reapply_queue;
-	rlist_create(&reapply_queue);
-	rlist_swap(&reapply_queue, &bsync_state.commit_queue);
-	rlist_foreach_entry(oper, &reapply_queue, list) {
-		oper->txn_data->repeat = true;
-	}
-	rlist_del(&reapply_queue);
-	tt_pthread_cond_signal(&bsync_state.cond);
 	tt_pthread_mutex_unlock(&bsync_state.mutex);
 	/*
 	 * cleanup TXN => bsync queue
@@ -601,6 +594,8 @@ bsync_slave_rollback(struct bsync_operation *oper)
 	 * move commit queue to reapply queue
 	 * cleanup commit queue
 	 */
+	struct bsync_host_info *elem = (struct bsync_host_info *)
+		region_alloc(&fiber()->gc, sizeof(struct bsync_host_info));
 	elem->code = bsync_mtype_proxy_join;
 	bsync_send_data(&BSYNC_LEADER, elem);
 }
@@ -1046,9 +1041,14 @@ restart:BSYNC_TRACE
 	if (info->result < 0) {
 		SWITCH_TO_BSYNC
 	} else {
-		do {
+		while (true) {
 			bsync_txn_proceed_request(info);
-		} while (info->repeat);
+			if (info->repeat) {
+				fiber_yield();
+			} else {
+				break;
+			}
+		}
 	}
 	fiber_gc();
 	rlist_add_tail_entry(&bsync_state.txn_fiber_cache, fiber(), state);
