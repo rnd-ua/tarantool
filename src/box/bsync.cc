@@ -1045,11 +1045,11 @@ bsync_txn_process(ev_loop *loop, ev_async *watcher, int event)
 	while (!STAILQ_EMPTY(&bsync_state.txn_proxy_input)) {
 		struct bsync_txn_info *info =
 			STAILQ_FIRST(&bsync_state.txn_proxy_input);
-		if (info->owner) {
+		if (info->owner) {BSYNC_TRACE
 			STAILQ_REMOVE_HEAD(&bsync_state.txn_proxy_input, fifo);
 			say_debug("send request %ld to txn", info->op->gsn);
 			fiber_call(info->owner);
-		} else {
+		} else {BSYNC_TRACE
 			fiber_call(bsync_fiber(&bsync_state.txn_fiber_cache,
 				bsync_txn_process_fiber));
 		}
