@@ -103,6 +103,7 @@ struct bsync_txn_info { /* txn information about operation */
 	struct bsync_common *common;
 	int result;
 	bool repeat;
+	bool proxy;
 
 	struct rlist list;
 	STAILQ_ENTRY(bsync_txn_info) fifo;
@@ -346,6 +347,7 @@ static const char* bsync_mtype_name[] = {
 	tt_pthread_mutex_unlock(&bsync_state.mutex); }
 
 #define SWITCH_TO_TXN {\
+	say_debug("send to TXN operation %ld from %d", oper->gsn, __LINE__); \
 	tt_pthread_mutex_lock(&bsync_state.mutex); \
 	bool was_empty = STAILQ_EMPTY(&bsync_state.txn_proxy_queue); \
 	STAILQ_INSERT_TAIL(&bsync_state.txn_proxy_queue, oper->txn_data, fifo); \
@@ -493,6 +495,7 @@ bsync_write(struct recovery_state *r, struct xrow_header *row) try
 		info->op = NULL;
 		info->result = -1;
 		info->repeat = false;
+		info->proxy = false;
 		if (stmt->new_tuple) {
 			bsync_parse_dup_key(info->common,
 				stmt->space->index[0]->key_def, stmt->new_tuple);
@@ -710,8 +713,8 @@ bsync_queue_leader(struct bsync_operation *oper, bool proxy)
 		fiber_yield_timeout(bsync_state.operation_timeout);BSYNC_TRACE
 	}
 	oper->txn_data->result = (2 * oper->accepted > bsync_state.num_hosts ? 0 : -1);
-	SWITCH_TO_TXN
 	if (!proxy) {
+		SWITCH_TO_TXN
 		bsync_wait_slow(oper);
 		bsync_free_region(oper->common);
 	}
@@ -737,6 +740,7 @@ bsync_proxy_processor()
 	oper->txn_data->result = 0;
 	oper->txn_data->owner = NULL;
 	oper->txn_data->repeat = false;
+	oper->txn_data->proxy = true;
 	xrow_header_decode(oper->txn_data->stmt->row, bsync_state.iproxy_pos,
 			   bsync_state.iproxy_end);
 	struct iovec xrow_body[XROW_BODY_IOVMAX];
@@ -773,9 +777,10 @@ bsync_proxy_processor()
 	if (slave_proxy) {
 		if (oper->status != bsync_op_status_submit) {
 			oper->status = bsync_op_status_yield;
-			fiber_yield();
+			fiber_yield();BSYNC_TRACE
 		}
 		SWITCH_TO_TXN
+		fiber_yield();
 	} else if (oper->txn_data->result < 0) {
 		uint8_t host_id = oper->server_id - 1;
 		if (BSYNC_REMOTE.flags & bsync_host_rollback) {
@@ -806,6 +811,8 @@ bsync_proxy_processor()
 							   bsync_mtype_commit);
 		bsync_send_data(&BSYNC_REMOTE, send);
 		bsync_wait_slow(oper);
+		SWITCH_TO_TXN
+		fiber_yield();
 	}
 	bsync_free_region(oper->common);
 }
@@ -1014,7 +1021,7 @@ bsync_txn_proceed_request(struct bsync_txn_info *info)
 	if (info->op->server_id == BSYNC_SERVER_ID ||
 		bsync_begin_active_op(info->op))
 	{
-		say_debug("send request %ld to txn", info->op->gsn);
+		say_debug("[%p] send request %ld to txn", fiber(), info->op->gsn);
 		rlist_add_tail_entry(&bsync_state.txn_queue, info, list);
 		box_process(&null_port, req);
 	} else {BSYNC_TRACE
@@ -1039,6 +1046,9 @@ restart:BSYNC_TRACE
 				break;
 			}
 		}
+		if (info->proxy) {
+			SWITCH_TO_BSYNC
+		}
 	}
 	fiber_gc();
 	rlist_add_tail_entry(&bsync_state.txn_fiber_cache, fiber(), state);
@@ -1059,7 +1069,8 @@ bsync_txn_process(ev_loop *loop, ev_async *watcher, int event)
 			STAILQ_FIRST(&bsync_state.txn_proxy_input);
 		if (info->owner) {BSYNC_TRACE
 			STAILQ_REMOVE_HEAD(&bsync_state.txn_proxy_input, fifo);
-			say_debug("send request %ld to txn", info->op->gsn);
+			say_debug("[%p] send request %ld to txn",
+				  fiber(), info->op->gsn);
 			fiber_call(info->owner);
 		} else {BSYNC_TRACE
 			fiber_call(bsync_fiber(&bsync_state.txn_fiber_cache,
