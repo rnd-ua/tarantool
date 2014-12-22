@@ -579,21 +579,10 @@ bsync_wal_write(struct xrow_header *row)
 static void
 bsync_slave_rollback(struct bsync_operation *oper)
 {
-	tt_pthread_mutex_lock(&bsync_state.mutex);
 	rlist_foreach_entry(oper, &bsync_state.commit_queue, list) {
 		oper->txn_data->repeat = true;
 	}
-	bool was_empty = STAILQ_EMPTY(&bsync_state.txn_proxy_queue);
-	STAILQ_INSERT_TAIL(&bsync_state.txn_proxy_queue, oper->txn_data, fifo);
-	if (was_empty) ev_async_send(txn_loop, &txn_process_event);
-	tt_pthread_cond_wait(&bsync_state.cond, &bsync_state.mutex);
-	tt_pthread_mutex_unlock(&bsync_state.mutex);
-	/*
-	 * cleanup TXN => bsync queue
-	 * cleanup proxy queue
-	 * move commit queue to reapply queue
-	 * cleanup commit queue
-	 */
+	SWITCH_TO_TXN
 	struct bsync_host_info *elem = (struct bsync_host_info *)
 		region_alloc(&fiber()->gc, sizeof(struct bsync_host_info));
 	elem->code = bsync_mtype_proxy_join;
@@ -627,11 +616,12 @@ bsync_queue_slave(struct bsync_operation *oper)
 	oper->status = bsync_op_status_accept;
 	oper->txn_data->stmt->row->server_id = BSYNC_SERVER_ID;
 	oper->txn_data->stmt->row->lsn = bsync_update_gsn(oper->gsn);
-	rlist_add_tail_entry(&bsync_state.commit_queue, oper, list);
 	oper->status = bsync_op_status_wal;
 	int wal_result = bsync_wal_write(oper->txn_data->stmt->row);
 	elem->code = wal_result < 0 ? bsync_mtype_reject
 				    : bsync_mtype_submit;
+	assert(wal_result >= 0);
+	rlist_add_tail_entry(&bsync_state.commit_queue, oper, list);
 	bsync_send_data(&BSYNC_LEADER, elem);
 	if (oper->status == bsync_op_status_wal) {
 		oper->status = bsync_op_status_yield;
