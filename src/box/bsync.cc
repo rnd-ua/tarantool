@@ -543,7 +543,8 @@ bsync_write(struct recovery_state *r, struct xrow_header *row) try
 }
 
 static void
-bsync_send_data(struct bsync_host_data *host, struct bsync_host_info *elem) {
+bsync_send_data(struct bsync_host_data *host, struct bsync_host_info *elem)
+{BSYNC_TRACE
 	rlist_add_tail_entry(&host->send_queue, elem, list);
 	if ((host->flags & bsync_host_active_write) == 0) {
 		fiber_call(host->fiber_out);
@@ -552,7 +553,7 @@ bsync_send_data(struct bsync_host_data *host, struct bsync_host_info *elem) {
 
 static uint64_t
 bsync_update_gsn(uint64_t gsn)
-{
+{BSYNC_TRACE
 	assert(BSYNC_LOCAL.gsn <= gsn);
 	assert(wal_local_writer->vclock.lsn[BSYNC_SERVER_ID] <= BSYNC_LOCAL.gsn);
 	BSYNC_LOCAL.gsn = gsn;
@@ -561,7 +562,7 @@ bsync_update_gsn(uint64_t gsn)
 
 static int
 bsync_wal_write(struct xrow_header *row)
-{
+{BSYNC_TRACE
 	if (bsync_state.wal_commit_gsn) {
 		row->commit_sn = bsync_state.wal_commit_gsn;
 		bsync_state.wal_commit_gsn = 0;
@@ -579,14 +580,16 @@ bsync_wal_write(struct xrow_header *row)
 
 static void
 bsync_slave_rollback(struct bsync_operation *oper)
-{
-	rlist_foreach_entry(oper, &bsync_state.commit_queue, list) {
-		oper->txn_data->repeat = true;
+{BSYNC_TRACE
+	struct bsync_operation *op;
+	rlist_foreach_entry(op, &bsync_state.commit_queue, list) {
+		op->txn_data->repeat = true;
 	}
 	SWITCH_TO_TXN
 	struct bsync_host_info *elem = (struct bsync_host_info *)
 		region_alloc(&fiber()->gc, sizeof(struct bsync_host_info));
 	elem->code = bsync_mtype_proxy_join;
+	elem->op = NULL;
 	bsync_send_data(&BSYNC_LEADER, elem);
 }
 
@@ -778,7 +781,6 @@ bsync_proxy_processor()
 			fiber_yield();BSYNC_TRACE
 		}
 		SWITCH_TO_TXN
-		fiber_yield();
 	} else if (oper->txn_data->result < 0) {
 		uint8_t host_id = oper->server_id - 1;
 		if (BSYNC_REMOTE.flags & bsync_host_rollback) {
@@ -800,6 +802,7 @@ bsync_proxy_processor()
 		}
 		tt_pthread_cond_signal(&bsync_state.cond);
 		tt_pthread_mutex_unlock(&bsync_state.mutex);
+		oper->gsn = -1;
 		send->code = bsync_mtype_proxy_reject;
 		bsync_send_data(&BSYNC_REMOTE, send);
 	} else {
@@ -810,8 +813,8 @@ bsync_proxy_processor()
 		bsync_send_data(&BSYNC_REMOTE, send);
 		bsync_wait_slow(oper);
 		SWITCH_TO_TXN
-		fiber_yield();
 	}
+	fiber_yield();
 	bsync_free_region(oper->common);
 }
 
@@ -1510,6 +1513,7 @@ encode_request(uint8_t host_id, struct bsync_host_info *elem, struct iovec *iov)
 			mp_sizeof_uint(elem->code);
 	if (elem->code != bsync_mtype_proxy_request &&
 	    elem->code != bsync_mtype_proxy_reject &&
+	    elem->code != bsync_mtype_proxy_join &&
 	    elem->code != bsync_mtype_commit)
 	{
 		bsize += mp_sizeof_uint(elem->op->gsn);
@@ -1531,6 +1535,7 @@ encode_request(uint8_t host_id, struct bsync_host_info *elem, struct iovec *iov)
 	pos = mp_encode_uint(pos, elem->code);
 	if (elem->code != bsync_mtype_proxy_request &&
 	    elem->code != bsync_mtype_proxy_reject &&
+	    elem->code != bsync_mtype_proxy_join &&
 	    elem->code != bsync_mtype_commit)
 	{
 		pos = mp_encode_uint(pos, elem->op->gsn);
@@ -1613,7 +1618,7 @@ bsync_send(struct ev_io *coio, uint8_t host_id)
 			assert(elem->code <= bsync_mtype_hello);
 			say_debug("send to %s message with type %s, gsn %ld",
 				BSYNC_REMOTE.source, bsync_mtype_name[elem->code],
-				elem->op->gsn);
+				elem->op ? elem->op->gsn : -1);
 			struct iovec iov[XROW_IOVMAX];
 			int iovcnt = encode_request(host_id, elem, iov);
 			bsync_writev(coio, iov, iovcnt, host_id);
