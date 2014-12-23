@@ -290,6 +290,7 @@ signal_init(void)
 	sa.sa_handler = sig_fatal_cb;
 
 	if (sigaction(SIGSEGV, &sa, 0) == -1 ||
+	    sigaction(SIGABRT, &sa, 0) == -1 ||
 	    sigaction(SIGFPE, &sa, 0) == -1) {
 		panic_syserror("sigaction");
 	}
