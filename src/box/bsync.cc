@@ -674,8 +674,6 @@ bsync_queue_leader(struct bsync_operation *oper, bool proxy)
 	oper->txn_data->op = oper;
 	if (oper->server_id == 0) {BSYNC_TRACE
 		/* local operation */
-		oper->common->dup_key = oper->txn_data->common->dup_key;
-		oper->common->region = oper->txn_data->common->region;
 		bsync_begin_active_op(oper);
 	}
 	for (uint8_t host_id = 0; host_id < bsync_state.num_hosts; ++host_id) {
@@ -1099,8 +1097,9 @@ restart:BSYNC_TRACE
 				region_alloc(&fiber()->gc, sizeof(struct bsync_operation));
 			oper->common = (struct bsync_common *)
 				region_alloc(&fiber()->gc, sizeof(struct bsync_common));
-			oper->common->region = NULL;
 			oper->txn_data = info;
+			oper->common->dup_key = oper->txn_data->common->dup_key;
+			oper->common->region = oper->txn_data->common->region;
 			oper->lsn = oper->txn_data->stmt->row->lsn = ++bsync_state.lsn;
 			oper->owner = fiber();
 			if (bsync_state.state != bsync_state_ready) {
