@@ -845,19 +845,33 @@ bsync_body(uint8_t host_id, const char **ipos, const char *iend)
 }
 
 static void
-bsync_submit(uint8_t host_id, const char **ipos, const char *iend)
+bsync_do_submit(uint8_t host_id, struct bsync_host_info *info)
 {BSYNC_TRACE
-	*ipos = iend;
-	assert(!rlist_empty(&BSYNC_REMOTE.op_queue));
-	bsync_print_op_queue(host_id);
-	struct bsync_host_info *info = rlist_shift_entry(&BSYNC_REMOTE.op_queue,
-						struct bsync_host_info, list);
 	++info->op->accepted;
 	BSYNC_REMOTE.submit_gsn = info->op->gsn;
 	bsync_end_active_op(host_id, info->op);
 	if (info->op->status == bsync_op_status_yield)
 		fiber_call(info->op->owner);
+}
+
+static void
+bsync_submit(uint8_t host_id, const char **ipos, const char *iend)
+{BSYNC_TRACE
+	*ipos = iend;
+	assert(!rlist_empty(&BSYNC_REMOTE.op_queue));
+	bsync_print_op_queue(host_id);
+	bsync_do_submit(host_id, rlist_shift_entry(&BSYNC_REMOTE.op_queue,
+						struct bsync_host_info, list));
 	BSYNC_TRACE
+}
+
+static void
+bsync_do_reject(uint8_t host_id, struct bsync_host_info *info)
+{BSYNC_TRACE
+	++info->op->rejected;
+	bsync_end_active_op(host_id, info->op);
+	if (info->op->status == bsync_op_status_yield)
+		fiber_call(info->op->owner);
 }
 
 static void
@@ -866,12 +880,8 @@ bsync_reject(uint8_t host_id, const char **ipos, const char *iend)
 	*ipos = iend;
 	assert(!rlist_empty(&BSYNC_REMOTE.op_queue));
 	bsync_print_op_queue(host_id);
-	struct bsync_host_info *info = rlist_shift_entry(&BSYNC_REMOTE.op_queue,
-						struct bsync_host_info, list);
-	++info->op->rejected;
-	bsync_end_active_op(host_id, info->op);
-	if (info->op->status == bsync_op_status_yield)
-		fiber_call(info->op->owner);
+	bsync_do_reject(host_id, rlist_shift_entry(&BSYNC_REMOTE.op_queue,
+						struct bsync_host_info, list));
 }
 
 static void
@@ -1214,8 +1224,23 @@ bsync_disconnected(uint8_t host_id)
 	BSYNC_REMOTE.flags = bsync_host_disconnected;
 	--bsync_state.num_connected;
 	mh_strptr_clear(BSYNC_REMOTE.active_ops);
-	rlist_create(&BSYNC_REMOTE.send_queue);
 	/* TODO : clean up wait queue using fiber_call() */
+	struct bsync_host_info *elem;
+	rlist_foreach_entry(elem, &BSYNC_REMOTE.op_queue, list) {
+		bsync_do_reject(host_id, elem);
+	}
+	rlist_foreach_entry(elem, &BSYNC_REMOTE.send_queue, list) {
+		switch (elem->code) {
+		case bsync_mtype_body:
+		case bsync_mtype_proxy_accept:
+			bsync_do_reject(host_id, elem);
+			break;
+		case bsync_mtype_rollback:
+			/* TODO */
+			break;
+		}
+	}
+	rlist_create(&BSYNC_REMOTE.send_queue);
 	rlist_create(&BSYNC_REMOTE.op_queue);
 	if (host_id == bsync_state.leader_id) {
 		struct bsync_operation *oper;
