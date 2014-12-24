@@ -598,11 +598,9 @@ bsync_queue_slave(struct bsync_operation *oper)
 {BSYNC_TRACE
 	struct bsync_host_info *elem = (struct bsync_host_info *)
 		region_alloc(&fiber()->gc, sizeof(struct bsync_host_info));
-	oper->owner = fiber();
 	oper->gsn = 0;
 	oper->txn_data->stmt->row->server_id =
 		oper->server_id = bsync_state.local_id + 1;
-	oper->txn_data->op = oper;
 	elem->code = bsync_mtype_proxy_request;
 	elem->op = oper;
 	oper->txn_data->result = 0;
@@ -674,7 +672,6 @@ bsync_queue_leader(struct bsync_operation *oper, bool proxy)
 	oper->server_id = oper->txn_data->stmt->row->server_id;
 	oper->rejected = 0;
 	oper->accepted = 0;
-	oper->txn_data->op = oper;
 	if (oper->server_id == 0) {BSYNC_TRACE
 		/* local operation */
 		bsync_begin_active_op(oper);
@@ -1101,6 +1098,7 @@ restart:BSYNC_TRACE
 			oper->common = (struct bsync_common *)
 				region_alloc(&fiber()->gc, sizeof(struct bsync_common));
 			oper->txn_data = info;
+			oper->txn_data->op = oper;
 			oper->common->dup_key = oper->txn_data->common->dup_key;
 			oper->common->region = oper->txn_data->common->region;
 			oper->lsn = oper->txn_data->stmt->row->lsn = ++bsync_state.lsn;
@@ -1229,6 +1227,7 @@ bsync_disconnected(uint8_t host_id)
 	--bsync_state.num_connected;
 	mh_strptr_clear(BSYNC_REMOTE.active_ops);
 	rlist_create(&BSYNC_REMOTE.send_queue);
+	/* TODO : clean up wait queue using fiber_call() */
 	rlist_create(&BSYNC_REMOTE.op_queue);
 	if (host_id == bsync_state.leader_id) {
 		struct bsync_operation *oper;
@@ -1886,9 +1885,7 @@ bsync_writer_stop(struct recovery_state *r)
 	tt_pthread_mutex_lock(&bsync_state.mutex);
 	ev_async_send(bsync_loop, &bsync_process_event);
 	tt_pthread_mutex_unlock(&bsync_state.mutex);
-/*	TODO: temporary disable, uncomment after move network managment from
-	bsync to tarantool iproto (main thread)
-*/	if (cord_join(&bsync_state.cord)) {
+	if (cord_join(&bsync_state.cord)) {
 		panic_syserror("BSYNC writer: thread join failed");
 	}
 	ev_async_stop(txn_loop, &txn_process_event);
