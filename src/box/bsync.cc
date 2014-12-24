@@ -1042,6 +1042,7 @@ bsync_txn_proceed_request(struct bsync_txn_info *info)
 		}
 		return;
 	}
+	assert(info->op->server_id == BSYNC_SERVER_ID);
 error:
 	info->owner = fiber();
 	SWITCH_TO_BSYNC
