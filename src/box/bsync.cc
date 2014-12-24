@@ -1243,21 +1243,14 @@ bsync_disconnected(uint8_t host_id)
 	rlist_create(&BSYNC_REMOTE.send_queue);
 	rlist_create(&BSYNC_REMOTE.op_queue);
 	if (host_id == bsync_state.leader_id) {
-		struct bsync_operation *oper;
-		rlist_foreach_entry(oper, &bsync_state.commit_queue, list) {
-			oper->txn_data->result = 0;
-			if (oper->status == bsync_op_status_wal) {
-				fiber_call(oper->txn_data->owner);
-			} else {
-				oper->status = bsync_op_status_submit;
-			}
-		}
-		rlist_foreach_entry_reverse(oper, &bsync_state.proxy_queue, list) {
+		if (!rlist_empty(&bsync_state.proxy_queue)) {
+			struct bsync_operation *oper =
+				rlist_shift_entry(&bsync_state.proxy_queue,
+						struct bsync_operation, list);
 			oper->txn_data->result = -1;
-			fiber_call(oper->txn_data->owner);
+			fiber_call(oper->owner);
+			rlist_create(&bsync_state.proxy_queue);
 		}
-		rlist_create(&bsync_state.proxy_queue);
-		rlist_create(&bsync_state.commit_queue);
 	}
 	if (2 * bsync_state.num_connected <= bsync_state.num_hosts ||
 		host_id == bsync_state.leader_id)
