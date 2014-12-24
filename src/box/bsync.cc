@@ -91,7 +91,7 @@ struct bsync_common {
 };
 
 struct bsync_txn_info { /* txn information about operation */
-	struct txn_stmt *stmt;
+	struct xrow_header *row;
 	struct fiber *owner;
 	struct bsync_operation *op;
 	struct bsync_common *common;
@@ -485,7 +485,7 @@ bsync_write(struct recovery_state *r, struct txn_stmt *stmt) try
 		info->common = (struct bsync_common *)
 			region_alloc(&fiber()->gc, sizeof(struct bsync_common));
 		info->common->region = bsync_new_region();
-		info->stmt = stmt;
+		info->row = stmt->row;
 		info->op = NULL;
 		info->result = -1;
 		info->repeat = false;
@@ -593,7 +593,7 @@ bsync_queue_slave(struct bsync_operation *oper)
 	struct bsync_host_info *elem = (struct bsync_host_info *)
 		region_alloc(&fiber()->gc, sizeof(struct bsync_host_info));
 	oper->gsn = 0;
-	oper->txn_data->stmt->row->server_id =
+	oper->txn_data->row->server_id =
 		oper->server_id = bsync_state.local_id + 1;
 	elem->code = bsync_mtype_proxy_request;
 	elem->op = oper;
@@ -610,10 +610,10 @@ bsync_queue_slave(struct bsync_operation *oper)
 	}
 	say_debug("request %ld accepted to gsn %ld", oper->lsn, oper->gsn);
 	oper->status = bsync_op_status_accept;
-	oper->txn_data->stmt->row->server_id = BSYNC_SERVER_ID;
-	oper->txn_data->stmt->row->lsn = bsync_update_gsn(oper->gsn);
+	oper->txn_data->row->server_id = BSYNC_SERVER_ID;
+	oper->txn_data->row->lsn = bsync_update_gsn(oper->gsn);
 	oper->status = bsync_op_status_wal;
-	int wal_result = bsync_wal_write(oper->txn_data->stmt->row);
+	int wal_result = bsync_wal_write(oper->txn_data->row);
 	elem->code = wal_result < 0 ? bsync_mtype_reject
 				    : bsync_mtype_submit;
 	assert(wal_result >= 0);
@@ -657,7 +657,7 @@ bsync_queue_leader(struct bsync_operation *oper, bool proxy)
 	oper->status = bsync_op_status_init;
 	oper->gsn = ++BSYNC_LOCAL.gsn;
 	say_debug("start to proceed request %ld", oper->gsn);
-	oper->server_id = oper->txn_data->stmt->row->server_id;
+	oper->server_id = oper->txn_data->row->server_id;
 	oper->rejected = 0;
 	oper->accepted = 0;
 	if (oper->server_id == 0) {BSYNC_TRACE
@@ -672,20 +672,20 @@ bsync_queue_leader(struct bsync_operation *oper, bool proxy)
 		elem->op = oper;
 		if (oper->server_id == (host_id + 1)) {
 			elem->code = bsync_mtype_proxy_accept;
-			oper->txn_data->stmt->row->lsn = oper->lsn;
-			oper->txn_data->stmt->row->server_id = oper->server_id;
+			oper->txn_data->row->lsn = oper->lsn;
+			oper->txn_data->row->server_id = oper->server_id;
 		} else {
 			elem->code = bsync_mtype_body;
-			oper->txn_data->stmt->row->lsn = oper->gsn;
-			oper->txn_data->stmt->row->server_id = BSYNC_SERVER_ID;
+			oper->txn_data->row->lsn = oper->gsn;
+			oper->txn_data->row->server_id = BSYNC_SERVER_ID;
 		}
 		say_debug("********** send accept/body from fiber %ld", (ptrdiff_t)elem->op->owner);
 		bsync_send_data(&BSYNC_REMOTE, elem);
 	}
-	oper->txn_data->stmt->row->lsn = bsync_update_gsn(oper->gsn);
-	oper->txn_data->stmt->row->server_id = BSYNC_SERVER_ID;
+	oper->txn_data->row->lsn = bsync_update_gsn(oper->gsn);
+	oper->txn_data->row->server_id = BSYNC_SERVER_ID;
 	oper->status = bsync_op_status_wal;
-	oper->txn_data->result = bsync_wal_write(oper->txn_data->stmt->row);
+	oper->txn_data->result = bsync_wal_write(oper->txn_data->row);
 	if (oper->txn_data->result < 0) ++oper->rejected;
 	else ++oper->accepted;
 	ev_tstamp start = ev_now(loop());
@@ -710,45 +710,43 @@ static void
 bsync_proxy_processor()
 {BSYNC_TRACE
 	struct bsync_operation *oper = (struct bsync_operation *)
-		region_alloc(&fiber()->gc, sizeof(struct bsync_operation));
+		region_alloc0(&fiber()->gc, sizeof(struct bsync_operation));
 	struct bsync_host_info *send = (struct bsync_host_info *)
-		region_alloc(&fiber()->gc, sizeof(bsync_host_info));
+		region_alloc0(&fiber()->gc, sizeof(bsync_host_info));
 	send->op = oper;
 	oper->txn_data = (struct bsync_txn_info *)
 		region_alloc(&fiber()->gc, sizeof(struct bsync_txn_info));
 	oper->txn_data->common = oper->common = (struct bsync_common *)
-		region_alloc(&fiber()->gc, sizeof(struct bsync_common));
-	oper->txn_data->stmt = (struct txn_stmt *)
-			region_alloc(&fiber()->gc, sizeof(struct txn_stmt));
-	oper->txn_data->stmt->row = (struct xrow_header *)
-		region_alloc(&fiber()->gc, sizeof(struct xrow_header));
+		region_alloc0(&fiber()->gc, sizeof(struct bsync_common));
+	oper->txn_data->row = (struct xrow_header *)
+		region_alloc0(&fiber()->gc, sizeof(struct xrow_header));
 	oper->txn_data->op = oper;
 	oper->txn_data->result = 0;
 	oper->txn_data->owner = NULL;
 	oper->txn_data->repeat = false;
 	oper->txn_data->proxy = true;
-	xrow_header_decode(oper->txn_data->stmt->row, bsync_state.iproxy_pos,
+	xrow_header_decode(oper->txn_data->row, bsync_state.iproxy_pos,
 			   bsync_state.iproxy_end);
 	struct iovec xrow_body[XROW_BODY_IOVMAX];
-	memcpy(xrow_body, oper->txn_data->stmt->row->body,
-		sizeof(oper->txn_data->stmt->row->body));
-	for (int i = 0; i < oper->txn_data->stmt->row->bodycnt; ++i) {
-		oper->txn_data->stmt->row->body[i].iov_base =
+	memcpy(xrow_body, oper->txn_data->row->body,
+		sizeof(oper->txn_data->row->body));
+	for (int i = 0; i < oper->txn_data->row->bodycnt; ++i) {
+		oper->txn_data->row->body[i].iov_base =
 			region_alloc(&fiber()->gc, xrow_body[i].iov_len);
-		memcpy(oper->txn_data->stmt->row->body[i].iov_base,
+		memcpy(oper->txn_data->row->body[i].iov_base,
 			xrow_body[i].iov_base, xrow_body[i].iov_len);
 	}
 	bsync_state.iproxy_pos = NULL;
 	bsync_state.iproxy_end = NULL;
-	oper->server_id = oper->txn_data->stmt->row->server_id;
-	oper->lsn = oper->txn_data->stmt->row->lsn;
+	oper->server_id = oper->txn_data->row->server_id;
+	oper->lsn = oper->txn_data->row->lsn;
 	oper->owner = fiber();
 	bool slave_proxy = (bsync_state.leader_id != bsync_state.local_id);
 	if (slave_proxy) {
 		oper->status = bsync_op_status_wal;
-		oper->gsn = bsync_update_gsn(oper->txn_data->stmt->row->lsn);
+		oper->gsn = bsync_update_gsn(oper->txn_data->row->lsn);
 		say_debug("start to apply request %ld to WAL", oper->gsn);
-		oper->txn_data->result = bsync_wal_write(oper->txn_data->stmt->row);
+		oper->txn_data->result = bsync_wal_write(oper->txn_data->row);
 		say_debug("submit request %ld", oper->gsn);
 		send->code = (oper->txn_data->result < 0 ? bsync_mtype_reject :
 							   bsync_mtype_submit);
@@ -776,12 +774,12 @@ bsync_proxy_processor()
 		tt_pthread_mutex_lock(&bsync_state.mutex);
 		struct bsync_txn_info *info;
 		STAILQ_FOREACH(info, &bsync_state.txn_proxy_input, fifo) {
-			if (info->stmt->row->server_id == oper->server_id) {
+			if (info->row->server_id == oper->server_id) {
 				info->result = -1;
 			}
 		}
 		STAILQ_FOREACH(info, &bsync_state.txn_proxy_queue, fifo) {
-			if (info->stmt->row->server_id == oper->server_id) {
+			if (info->row->server_id == oper->server_id) {
 				info->result = -1;
 			}
 		}
@@ -992,15 +990,14 @@ bsync_txn_proceed_request(struct bsync_txn_info *info)
 {BSYNC_TRACE
 	struct request *req = (struct request *)
 		region_alloc(&fiber()->gc, sizeof(struct request));
-	request_create(req, info->stmt->row->type);
-	request_decode(req, (const char*)info->stmt->row->body[0].iov_base,
-			info->stmt->row->body[0].iov_len);
-	req->header = info->stmt->row;
+	request_create(req, info->row->type);
+	request_decode(req, (const char*)info->row->body[0].iov_base,
+			info->row->body[0].iov_len);
+	req->header = info->row;
 	info->op->common->region = bsync_new_region();
 
 	struct bsync_parse_data data;
-	request_header_decode(info->stmt->row, bsync_space_cb,
-				bsync_tuple_cb, &data);
+	request_header_decode(info->row, bsync_space_cb, bsync_tuple_cb, &data);
 	struct space *space = space_cache_find(data.space_id);
 	if (space && space->index_count > 0) {
 		assert(space->index[0]->key_def->iid == 0);
@@ -1114,7 +1111,7 @@ restart:BSYNC_TRACE
 			oper->txn_data->op = oper;
 			oper->common->dup_key = oper->txn_data->common->dup_key;
 			oper->common->region = oper->txn_data->common->region;
-			oper->lsn = oper->txn_data->stmt->row->lsn = ++bsync_state.lsn;
+			oper->lsn = oper->txn_data->row->lsn = ++bsync_state.lsn;
 			oper->owner = fiber();
 			if (bsync_state.state != bsync_state_ready) {
 				rlist_add_tail_entry(&bsync_state.election_ops,
@@ -1542,7 +1539,7 @@ encode_request(uint8_t host_id, struct bsync_host_info *elem, struct iovec *iov)
 	if (elem->code == bsync_mtype_body ||
 		elem->code == bsync_mtype_proxy_request)
 	{
-		iovcnt += xrow_header_encode(elem->op->txn_data->stmt->row, iov + 1);
+		iovcnt += xrow_header_encode(elem->op->txn_data->row, iov + 1);
 		for (int i = 1; i < iovcnt; ++i) {
 			bsize += iov[i].iov_len;
 		}
