@@ -544,6 +544,8 @@ bsync_write(struct recovery_state *r, struct txn_stmt *stmt) try
 static void
 bsync_send_data(struct bsync_host_data *host, struct bsync_host_info *elem)
 {BSYNC_TRACE
+	/* TODO : check all send ops for memory leak case */
+	if (host->connected < 2) return;
 	rlist_add_tail_entry(&host->send_queue, elem, list);
 	if ((host->flags & bsync_host_active_write) == 0) {
 		fiber_call(host->fiber_out);
