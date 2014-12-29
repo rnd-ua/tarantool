@@ -45,9 +45,9 @@ struct bsync_key {
 };
 
 struct bsync_val {
-	uint32_t leader_ops;
-	uint32_t slave_ops;
-	uint32_t slave_id;
+	uint32_t local_ops;
+	uint32_t remote_ops;
+	uint32_t remote_id;
 };
 
 #if MH_SOURCE

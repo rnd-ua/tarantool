@@ -152,10 +152,9 @@ struct bsync_host_data {
 	uint64_t commit_gsn;
 	uint64_t submit_gsn;
 
-	struct mh_strptr_t *active_ops;
-
 	struct rlist send_queue;
 	struct rlist op_queue;
+	struct mh_strptr_t *active_ops;
 	/* election buffers */
 	uint8_t election_code;
 	uint8_t election_host;
@@ -209,6 +208,7 @@ static struct bsync_state_ {
 	bool is_shutdown;
 	struct cord cord;
 	pthread_mutex_t mutex;
+	pthread_mutex_t active_ops_mutex;
 	pthread_cond_t cond;
 } bsync_state;
 
@@ -355,80 +355,73 @@ static const char* bsync_mtype_name[] = {
 	tt_pthread_mutex_unlock(&bsync_state.mutex); }
 
 static bool
-bsync_check_op(struct bsync_operation *oper)
+bsync_begin_op(struct bsync_key *key, uint32_t server_id)
 {BSYNC_TRACE
-	tt_pthread_mutex_lock(&bsync_state.mutex);
-	auto guard = make_scoped_guard([&](){
-		tt_pthread_mutex_unlock(&bsync_state.mutex);
-	});
-	for (int host_id = 0; host_id < bsync_state.num_hosts; ++host_id) {
-		if (host_id == bsync_state.local_id) continue;
-		mh_int_t k = mh_strptr_find(BSYNC_REMOTE.active_ops,
-					*oper->common->dup_key, NULL);
-		if (k != mh_end(BSYNC_REMOTE.active_ops)) {
-			struct mh_strptr_node_t *node =
-				mh_strptr_node(BSYNC_REMOTE.active_ops, k);
-			if (oper->server_id != 0 &&
-				node->val.slave_id != oper->server_id)
-			{
-				return false;
-			}
-		}
-	}
-	return true;
-}
-
-static bool
-bsync_begin_op(uint8_t host_id, struct bsync_operation *oper)
-{BSYNC_TRACE
+	if (server_id == BSYNC_SERVER_ID) return true;
 	/*
 	 * TODO : special analyze for operations with spaces (remove/create)
 	 */
-	tt_pthread_mutex_lock(&bsync_state.mutex);
-	auto guard = make_scoped_guard([&](){
-		tt_pthread_mutex_unlock(&bsync_state.mutex);
+	tt_pthread_mutex_lock(&bsync_state.active_ops_mutex);
+	auto guard = make_scoped_guard([&]() {
+		tt_pthread_mutex_unlock(&bsync_state.active_ops_mutex);
 	});
-	mh_int_t k = mh_strptr_find(BSYNC_REMOTE.active_ops,
-				    *oper->common->dup_key, NULL);
-	if (k != mh_end(BSYNC_REMOTE.active_ops)) {
-		struct mh_strptr_node_t *node =
-			mh_strptr_node(BSYNC_REMOTE.active_ops, k);
-		if (oper->server_id == 0) ++node->val.leader_ops;
-		else ++node->val.slave_ops;
-	} else {
-		struct mh_strptr_node_t node;
-		node.key = *oper->common->dup_key;
-		if (oper->server_id == 0) {
-			node.val.slave_id = 0;
-			node.val.slave_ops = 0;
-			node.val.leader_ops = 1;
-		} else {
-			node.val.slave_id = oper->server_id;
-			node.val.slave_ops = 1;
-			node.val.leader_ops = 0;
+	mh_int_t keys[BSYNC_MAX_HOSTS];
+	for (uint8_t host_id = 0; host_id < bsync_state.num_hosts; ++host_id) {
+		if (BSYNC_REMOTE.connected < 2 || host_id == bsync_state.local_id) {
+			keys[host_id] = -1;
+			continue;
 		}
-		mh_strptr_put(BSYNC_REMOTE.active_ops, &node, NULL, NULL);
+		keys[host_id] = mh_strptr_find(BSYNC_REMOTE.active_ops, *key, NULL);
+		if (keys[host_id] == mh_end(BSYNC_REMOTE.active_ops))
+			continue;
+		struct mh_strptr_node_t *node =
+			mh_strptr_node(BSYNC_REMOTE.active_ops, keys[host_id]);
+		if (server_id != 0 && node->val.remote_id != server_id)
+			return false;
+		++node->val.remote_ops;
+	}
+	for (uint8_t host_id = 0; host_id < bsync_state.num_hosts; ++host_id) {
+		if (keys[host_id] == -1) continue;
+		if (keys[host_id] != mh_end(BSYNC_REMOTE.active_ops)) {
+			struct mh_strptr_node_t *node =
+				mh_strptr_node(BSYNC_REMOTE.active_ops, keys[host_id]);
+			if (server_id == 0) ++node->val.local_ops;
+			else ++node->val.remote_ops;
+		} else {
+			struct mh_strptr_node_t node;
+			node.key = *key;
+			if (server_id == 0) {
+				node.val.local_ops = 1;
+				node.val.remote_ops = 0;
+			} else {
+				node.val.local_ops = 0;
+				node.val.remote_ops = 1;
+			}
+			node.val.remote_id = server_id;
+			mh_strptr_put(BSYNC_REMOTE.active_ops, &node, NULL, NULL);
+		}
 	}
 	return true;
 }
 
 static void
-bsync_end_op(uint8_t host_id, struct bsync_operation *oper)
+bsync_end_op(uint8_t host_id, struct bsync_key *key, uint32_t server_id)
 {BSYNC_TRACE
-	tt_pthread_mutex_lock(&bsync_state.mutex);
-	auto guard = make_scoped_guard([&](){
-		tt_pthread_mutex_unlock(&bsync_state.mutex);
+	if (server_id == BSYNC_SERVER_ID) return;
+	tt_pthread_mutex_lock(&bsync_state.active_ops_mutex);
+	auto guard = make_scoped_guard([&]() {
+		tt_pthread_mutex_unlock(&bsync_state.active_ops_mutex);
 	});
-	mh_int_t k = mh_strptr_find(BSYNC_REMOTE.active_ops,
-				    *oper->common->dup_key, NULL);
-	assert(k != mh_end(BSYNC_REMOTE.active_ops));
-	struct mh_strptr_node_t *node = mh_strptr_node(BSYNC_REMOTE.active_ops, k);
-	if (oper->server_id != 0) {
-		--node->val.slave_ops;
+	mh_int_t k = mh_strptr_find(BSYNC_REMOTE.active_ops, *key, NULL);
+	if (k == mh_end(BSYNC_REMOTE.active_ops)) return;
+	struct mh_strptr_node_t *node =
+		mh_strptr_node(BSYNC_REMOTE.active_ops, k);
+	if (server_id != 0) {
+		--node->val.remote_ops;
 	} else {
-		--node->val.leader_ops;
+		--node->val.local_ops;
 	}
-	if ((node->val.slave_ops + node->val.leader_ops) == 0)
+	if ((node->val.local_ops + node->val.remote_ops) == 0)
 		mh_strptr_del(BSYNC_REMOTE.active_ops, k, NULL);
 }
 
@@ -490,7 +483,8 @@ bsync_write(struct recovery_state *r, struct xrow_header *row) try
 	stmt->row->tm = ev_now(loop());
 	stmt->row->sync = 0;
 	struct bsync_txn_info *info = NULL;
-	if (stmt->row->server_id == 0) { /* local request */
+	uint32_t server_id = stmt->row->server_id;
+	if (server_id == 0) { /* local request */
 		info = (struct bsync_txn_info *)
 			region_alloc(&fiber()->gc, sizeof(struct bsync_txn_info));
 		info->common = (struct bsync_common *)
@@ -508,6 +502,8 @@ bsync_write(struct recovery_state *r, struct xrow_header *row) try
 			bsync_parse_dup_key(info->common,
 				stmt->space->index[0]->key_def, stmt->old_tuple);
 		}
+		bool begin_result = bsync_begin_op(info->common->dup_key, server_id);
+		assert(begin_result);
 	} else { /* proxy request */
 		info = rlist_shift_entry(&bsync_state.txn_queue,
 					 struct bsync_txn_info, list);
@@ -682,7 +678,6 @@ bsync_queue_leader(struct bsync_operation *oper, bool proxy)
 	for (uint8_t host_id = 0; host_id < bsync_state.num_hosts; ++host_id) {
 		if (BSYNC_REMOTE.connected < 2 || host_id == bsync_state.local_id)
 			continue;
-		bsync_begin_op(host_id, oper);
 		struct bsync_host_info *elem = (struct bsync_host_info *)
 			region_alloc(&fiber()->gc, sizeof(struct bsync_host_info));
 		elem->op = oper;
@@ -862,8 +857,8 @@ static void
 bsync_do_submit(uint8_t host_id, struct bsync_host_info *info)
 {BSYNC_TRACE
 	++info->op->accepted;
+	bsync_end_op(host_id, info->op->common->dup_key, info->op->server_id);
 	BSYNC_REMOTE.submit_gsn = info->op->gsn;
-	bsync_end_op(host_id, info->op);
 	if (info->op->status == bsync_op_status_yield)
 		fiber_call(info->op->owner);
 }
@@ -883,7 +878,7 @@ static void
 bsync_do_reject(uint8_t host_id, struct bsync_host_info *info)
 {BSYNC_TRACE
 	++info->op->rejected;
-	bsync_end_op(host_id, info->op);
+	bsync_end_op(host_id, info->op->common->dup_key, info->op->server_id);
 	if (info->op->status == bsync_op_status_yield)
 		fiber_call(info->op->owner);
 }
@@ -1028,9 +1023,7 @@ bsync_txn_proceed_request(struct bsync_txn_info *info)
 	}
 	TupleGuard guard(tuple);
 	bsync_parse_dup_key(info->common, space->index[0]->key_def, tuple);
-	if (info->op->server_id == BSYNC_SERVER_ID ||
-		bsync_check_op(info->op))
-	{
+	if (bsync_begin_op(info->common->dup_key, info->op->server_id)) {
 		rlist_add_tail_entry(&bsync_state.txn_queue, info, list);
 		try {
 			box_process(&null_port, req);
@@ -1833,6 +1826,7 @@ bsync_init(wal_writer* initial, struct vclock *vclock)
 #endif
 	/* Initialize queue lock mutex. */
 	(void) tt_pthread_mutex_init(&bsync_state.mutex, &errorcheck);
+	(void) tt_pthread_mutex_init(&bsync_state.active_ops_mutex, &errorcheck);
 	(void) tt_pthread_mutexattr_destroy(&errorcheck);
 
 	(void) tt_pthread_cond_init(&bsync_state.cond, NULL);
@@ -1935,7 +1929,8 @@ bsync_writer_stop(struct recovery_state *r)
 	for (uint8_t host_id = 0; host_id < bsync_state.num_hosts; ++host_id) {
 		rlist_del(&BSYNC_REMOTE.send_queue);
 		rlist_del(&BSYNC_REMOTE.op_queue);
-		if (BSYNC_REMOTE.active_ops)
-			mh_strptr_delete(BSYNC_REMOTE.active_ops);
+		mh_strptr_delete(BSYNC_REMOTE.active_ops);
 	}
+	tt_pthread_mutex_destroy(&bsync_state.mutex);
+	tt_pthread_mutex_destroy(&bsync_state.active_ops_mutex);
 }
