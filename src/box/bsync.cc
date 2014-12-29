@@ -1011,38 +1011,36 @@ bsync_txn_proceed_request(struct bsync_txn_info *info)
 	struct bsync_parse_data data;
 	request_header_decode(info->row, bsync_space_cb, bsync_tuple_cb, &data);
 	struct space *space = space_cache_find(data.space_id);
-	if (space && space->index_count > 0) {
-		assert(space->index[0]->key_def->iid == 0);
-		struct tuple *tuple = NULL;
-		if (data.is_tuple) {
-			tuple = tuple_new(space->format, data.data, data.end);
-			space_validate_tuple(space, tuple);
-		} else {
-			const char *key = req->key;
-			uint32_t part_count = mp_decode_array(&key);
-			tuple = space->index[0]->findByKey(key, part_count);
-		}
-		TupleGuard guard(tuple);
-		bsync_parse_dup_key(info->common, space->index[0]->key_def, tuple);
-		if (info->op->server_id == BSYNC_SERVER_ID ||
-			bsync_begin_active_op(info->op))
-		{
-			rlist_add_tail_entry(&bsync_state.txn_queue, info, list);
-			try {
-				box_process(&null_port, req);
-			} catch (Exception *e) {
-				if (info->op->server_id == BSYNC_SERVER_ID) {
-					rlist_del_entry(info, list);
-					goto error;
-				}
-				throw;
-			}
-		} else {BSYNC_TRACE
-			bsync_proceed_rollback(info);
-		}
-		return;
+	assert(space && space->index_count > 0 &&
+		space->index[0]->key_def->iid == 0);
+	struct tuple *tuple = NULL;
+	if (data.is_tuple) {
+		tuple = tuple_new(space->format, data.data, data.end);
+		space_validate_tuple(space, tuple);
+	} else {
+		const char *key = req->key;
+		uint32_t part_count = mp_decode_array(&key);
+		tuple = space->index[0]->findByKey(key, part_count);
 	}
-	assert(info->op->server_id == BSYNC_SERVER_ID);
+	TupleGuard guard(tuple);
+	bsync_parse_dup_key(info->common, space->index[0]->key_def, tuple);
+	if (info->op->server_id == BSYNC_SERVER_ID ||
+		bsync_begin_active_op(info->op))
+	{
+		rlist_add_tail_entry(&bsync_state.txn_queue, info, list);
+		try {
+			box_process(&null_port, req);
+		} catch (Exception *e) {
+			if (info->op->server_id == BSYNC_SERVER_ID) {
+				rlist_del_entry(info, list);
+				goto error;
+			}
+			throw;
+		}
+	} else {BSYNC_TRACE
+		bsync_proceed_rollback(info);
+	}
+	return;
 error:
 	info->owner = fiber();
 	SWITCH_TO_BSYNC
