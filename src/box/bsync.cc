@@ -1100,8 +1100,10 @@ bsync_txn_process(ev_loop *loop, ev_async *watcher, int event)
 				bsync_txn_process_fiber));
 		}
 	}
-	if (bsync_state.is_proceed_system)
+	if (bsync_state.is_proceed_system) {
+		bsync_state.is_proceed_system = false;
 		bsync_txn_process(loop, watcher, event);
+	}
 }
 
 static void
