@@ -205,6 +205,8 @@ static struct bsync_state_ {
 	struct rlist region_free;
 	struct rlist region_gc;
 
+	/* TODO : temporary hack for support system operations on proxy side */
+	bool is_proceed_system;
 	bool is_shutdown;
 	struct cord cord;
 	pthread_mutex_t mutex;
@@ -1012,6 +1014,7 @@ bsync_txn_proceed_request(struct bsync_txn_info *info)
 	struct space *space = space_cache_find(data.space_id);
 	assert(space && space->index_count > 0 &&
 		space->index[0]->key_def->iid == 0);
+	bsync_state.is_proceed_system = space_is_system(space);
 	struct tuple *tuple = NULL;
 	if (data.is_tuple) {
 		tuple = tuple_new(space->format, data.data, data.end);
@@ -1039,6 +1042,7 @@ bsync_txn_proceed_request(struct bsync_txn_info *info)
 	}
 	return;
 error:
+	bsync_state.is_proceed_system = false;
 	info->owner = fiber();
 	SWITCH_TO_BSYNC
 	fiber_yield();BSYNC_TRACE
@@ -1076,10 +1080,13 @@ static void
 bsync_txn_process(ev_loop *loop, ev_async *watcher, int event)
 {BSYNC_TRACE
 	(void)loop; (void)watcher; (void)event;
+	if (bsync_state.is_proceed_system)
+		return;
 	tt_pthread_mutex_lock(&bsync_state.mutex);
 	STAILQ_CONCAT(&bsync_state.txn_proxy_input,
 			&bsync_state.txn_proxy_queue);
 	tt_pthread_mutex_unlock(&bsync_state.mutex);
+	bsync_state.is_proceed_system = false;
 	while (!STAILQ_EMPTY(&bsync_state.txn_proxy_input)) {
 		struct bsync_txn_info *info =
 			STAILQ_FIRST(&bsync_state.txn_proxy_input);
@@ -1093,6 +1100,8 @@ bsync_txn_process(ev_loop *loop, ev_async *watcher, int event)
 				bsync_txn_process_fiber));
 		}
 	}
+	if (bsync_state.is_proceed_system)
+		bsync_txn_process(loop, watcher, event);
 }
 
 static void
@@ -1816,6 +1825,7 @@ bsync_init(wal_writer* initial, struct vclock *vclock)
 	bsync_state.wal_commit_gsn = 0;
 	bsync_state.wal_rollback_gsn = 0;
 	bsync_state.is_shutdown = false;
+	bsync_state.is_proceed_system = false;
 
 	/* I. Initialize the state. */
 	pthread_mutexattr_t errorcheck;
