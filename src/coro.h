@@ -39,6 +39,12 @@ struct tarantool_coro {
 };
 
 void
+tarantool_coro_init();
+
+void
+tarantool_coro_stop();
+
+void
 tarantool_coro_create(struct tarantool_coro *ctx,
 		      struct slab_cache *cache,
 		      void (*f) (void *), void *data);

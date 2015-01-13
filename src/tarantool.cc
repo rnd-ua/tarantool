@@ -513,6 +513,7 @@ tarantool_free(void)
 	}
 
 	fiber_free();
+	tarantool_coro_stop();
 	memory_free();
 	random_free();
 #ifdef ENABLE_GCOV
@@ -632,6 +633,7 @@ main(int argc, char **argv)
 	main_argv = argv;
 
 	fiber_init();
+	tarantool_coro_init();
 	/* Init iobuf library with default readahead */
 	iobuf_init();
 	coeio_init();
