@@ -554,7 +554,6 @@ static uint64_t
 bsync_update_gsn(uint64_t gsn)
 {BSYNC_TRACE
 	assert(BSYNC_LOCAL.gsn <= gsn);
-	assert(wal_local_writer->vclock.lsn[BSYNC_SERVER_ID] <= BSYNC_LOCAL.gsn);
 	BSYNC_LOCAL.gsn = gsn;
 	return gsn;
 }
@@ -663,7 +662,7 @@ bsync_queue_leader(struct bsync_operation *oper, bool proxy)
 	oper->gsn = ++BSYNC_LOCAL.gsn;
 	say_debug("start to proceed request %ld", oper->gsn);
 	oper->server_id = oper->txn_data->row->server_id;
-	oper->rejected = 0;
+	oper->rejected = bsync_state.num_hosts - bsync_state.num_connected;
 	oper->accepted = 0;
 	for (uint8_t host_id = 0; host_id < bsync_state.num_hosts; ++host_id) {
 		if (BSYNC_REMOTE.connected < 2 || host_id == bsync_state.local_id)
@@ -1869,6 +1868,7 @@ static void*
 bsync_thread(void*)
 {BSYNC_TRACE
 	tt_pthread_mutex_lock(&bsync_state.mutex);
+	iobuf_init();
 	coio_service_init(&bsync_coio, "bsync",
 		BSYNC_LOCAL.source, bsync_accept_handler, NULL);
 	evio_service_start(&bsync_coio.evio_service);
