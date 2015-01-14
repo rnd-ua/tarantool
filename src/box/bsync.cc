@@ -505,6 +505,7 @@ bsync_write(struct recovery_state *r, struct xrow_header *row) try
 				stmt->space->index[0]->key_def, stmt->old_tuple);
 		}
 		bool begin_result = bsync_begin_op(info->common->dup_key, server_id);
+		(void)begin_result;
 		assert(begin_result);
 	} else { /* proxy request */
 		info = rlist_shift_entry(&bsync_state.txn_queue,
@@ -827,19 +828,6 @@ bsync_proceed_rollback(struct bsync_txn_info *info)
  * Command handlers block
  */
 
-#include <sstream>
-static void
-bsync_print_op_queue(uint8_t host_id)
-{
-	struct bsync_host_info *info = NULL;
-	std::stringstream stream;
-	rlist_foreach_entry(info, &BSYNC_REMOTE.op_queue, list) {
-		stream << info->op->owner << ":" << info->op->gsn << "; ";
-	}
-	say_debug("op_queue %s contains %s", BSYNC_REMOTE.source,
-		  stream.str().c_str());
-}
-
 static void
 bsync_body(uint8_t host_id, const char **ipos, const char *iend)
 {BSYNC_TRACE
@@ -869,7 +857,6 @@ bsync_submit(uint8_t host_id, const char **ipos, const char *iend)
 {BSYNC_TRACE
 	*ipos = iend;
 	assert(!rlist_empty(&BSYNC_REMOTE.op_queue));
-	bsync_print_op_queue(host_id);
 	bsync_do_submit(host_id, rlist_shift_entry(&BSYNC_REMOTE.op_queue,
 						struct bsync_host_info, list));
 	BSYNC_TRACE
@@ -889,7 +876,6 @@ bsync_reject(uint8_t host_id, const char **ipos, const char *iend)
 {BSYNC_TRACE
 	*ipos = iend;
 	assert(!rlist_empty(&BSYNC_REMOTE.op_queue));
-	bsync_print_op_queue(host_id);
 	bsync_do_reject(host_id, rlist_shift_entry(&BSYNC_REMOTE.op_queue,
 						struct bsync_host_info, list));
 }
@@ -1478,6 +1464,7 @@ bsync_accept_handler(va_list ap)
 	bsync_read_package(&coio, in, BSYNC_MAX_HOSTS);
 	const char **ipos = (const char **)&in->pos;
 	uint32_t type = mp_decode_uint(ipos);
+	(void)type;
 	assert(type == bsync_mtype_hello);
 	uint8_t host_id = mp_decode_uint(ipos);
 	assert(host_id < bsync_state.num_hosts);
@@ -1648,7 +1635,6 @@ bsync_send(struct ev_io *coio, uint8_t host_id)
 			{
 				rlist_add_tail_entry(&BSYNC_REMOTE.op_queue,
 						     elem, list);
-				bsync_print_op_queue(host_id);
 			}
 			assert(elem->code <= bsync_mtype_hello);
 			say_debug("send to %s message with type %s, gsn %ld",
