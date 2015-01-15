@@ -137,6 +137,8 @@ enum { TNT_ERRMSG_MAX = 512 };
 	/* 85 */_(ER_INDEX_EXISTS,		2, "Index '%s' already exists") \
 	/* 86 */_(ER_TUPLE_REF_OVERFLOW,	1, "Tuple reference counter overflow") \
 	/* 87 */_(ER_ROLE_LOOP,			2, "Granting role '%s' to role '%s' would create a loop") \
+	/* 88 */_(ER_BSYNC_REJECT,		2, "Operation was rejected by certification") \
+	/* 89 */_(ER_BSYNC_ROLLBACK,		2, "Operation was rejected by quorum") \
 
 /*
  * !IMPORTANT! Please follow instructions at start of the file
