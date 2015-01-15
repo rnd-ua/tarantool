@@ -145,6 +145,8 @@ struct errcode_record {
 	/* 91 */_(ER_PRIV_NOT_GRANTED,		2, "User '%s' does not have %s access on %s '%s'") \
 	/* 92 */_(ER_ROLE_NOT_GRANTED,		2, "User '%s' does not have role '%s'") \
 	/* 93 */_(ER_MISSING_SNAPSHOT,		2, "Can't find snapshot") \
+	/* 94 */_(ER_BSYNC_REJECT,		2, "Operation was rejected by certification") \
+	/* 95 */_(ER_BSYNC_ROLLBACK,		2, "Operation was rejected by quorum") \
 
 /*
  * !IMPORTANT! Please follow instructions at start of the file
