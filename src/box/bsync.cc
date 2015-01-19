@@ -1738,7 +1738,8 @@ bsync_outgoing(struct ev_io *coio, uint8_t host_id)
 	}
 	while(!bsync_state.is_shutdown && BSYNC_REMOTE.fiber_out == fiber()) {
 		if (bsync_extended_header_size(host_id) > 0 &&
-			rlist_empty(&BSYNC_REMOTE.send_queue))
+			rlist_empty(&BSYNC_REMOTE.send_queue) &&
+			!bsync_state.is_shutdown)
 		{
 			fiber_yield_timeout(bsync_state.submit_timeout);
 		}

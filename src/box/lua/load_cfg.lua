@@ -71,6 +71,7 @@ local default_cfg = {
     bsync_election_timeout  = 5.0,
     bsync_slow_host_timeout = 30.0,
     bsync_operation_timeout = 10.0,
+    bsync_submit_timeout    = 0.1,
 }
 
 -- see template_cfg below
@@ -125,6 +126,7 @@ local template_cfg = {
     bsync_election_timeout  = 'number',
     bsync_slow_host_timeout = 'number',
     bsync_operation_timeout = 'number',
+    bsync_submit_timeout    = 'number',
 }
 
 local function normalize_uri(port)
