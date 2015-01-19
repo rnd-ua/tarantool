@@ -1244,6 +1244,7 @@ bsync_connected(uint8_t host_id)
 	}
 	bsync_state.state = bsync_state_initial;
 	uint8_t max_host_id = bsync_max_host();
+	say_info("next leader should be %s", bsync_index[max_host_id].source);
 	if (max_host_id != bsync_state.local_id) return;
 	bsync_state.num_accepted = 1;
 	bsync_state.state = bsync_state_leader_accept;
@@ -1276,6 +1277,7 @@ bsync_disconnected(uint8_t host_id)
 	--bsync_state.num_connected;
 	mh_strptr_clear(BSYNC_REMOTE.active_ops);
 	/* TODO : clean up wait queue using fiber_call() */
+	say_warn("disconnecting host %s", BSYNC_REMOTE.source);
 	struct bsync_host_info *elem;
 	rlist_foreach_entry(elem, &BSYNC_REMOTE.op_queue, list) {
 		bsync_do_reject(host_id, elem);
@@ -1321,9 +1323,11 @@ bsync_leader_promise(uint8_t host_id, const char **ipos, const char *iend)
 		BSYNC_REMOTE.gsn = mp_decode_uint(ipos);
 	uint8_t max_host_id = bsync_max_host();
 	if (host_id != max_host_id || bsync_state.state > bsync_state_initial) {
+		say_warn("reject leader promise from %s", BSYNC_REMOTE.source);
 		BSYNC_REMOTE.election_code = bsync_mtype_leader_reject;
 		BSYNC_REMOTE.election_host = max_host_id;
 	} else {
+		say_info("accept leader promise from %s", BSYNC_REMOTE.source);
 		BSYNC_REMOTE.election_code = bsync_mtype_leader_accept;
 		bsync_state.state = bsync_state_leader_accept;
 	}
@@ -1389,6 +1393,7 @@ bsync_leader_reject(uint8_t host_id, const char **ipos, const char *iend)
 	uint8_t max_id = mp_decode_uint(ipos);
 	bsync_index[max_id].commit_gsn = bsync_index[max_id].submit_gsn =
 		bsync_index[max_id].gsn = mp_decode_uint(ipos);
+	bsync_state.state = bsync_state_initial;
 	bsync_connected(host_id);
 }
 
