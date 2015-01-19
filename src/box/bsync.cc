@@ -298,7 +298,7 @@ bsync_max_host()
 }
 
 enum bsync_message_type {
-	bsync_mtype_none = 0,
+	bsync_mtype_leader_proposal = 0,
 	bsync_mtype_leader_promise = 1,
 	bsync_mtype_leader_accept = 2,
 	bsync_mtype_leader_submit = 3,
@@ -314,7 +314,8 @@ enum bsync_message_type {
 	bsync_mtype_rollback = 13,
 	bsync_mtype_ping = 14,
 	bsync_mtype_count = 15,
-	bsync_mtype_hello = 16
+	bsync_mtype_hello = 16,
+	bsync_mtype_none = 17
 };
 
 enum bsync_machine_state {
@@ -331,7 +332,7 @@ enum bsync_iproto_flags {
 };
 
 static const char* bsync_mtype_name[] = {
-	"INVALID",
+	"leader_proposal",
 	"leader_promise",
 	"leader_accept",
 	"leader_submit",
@@ -347,7 +348,8 @@ static const char* bsync_mtype_name[] = {
 	"rollback",
 	"ping",
 	"INVALID",
-	"hello"
+	"hello",
+	"INVALID"
 };
 
 #define SWITCH_TO_BSYNC {\
@@ -1257,7 +1259,15 @@ bsync_connected(uint8_t host_id)
 	bsync_state.state = bsync_state_initial;
 	uint8_t max_host_id = bsync_max_host();
 	say_info("next leader should be %s", bsync_index[max_host_id].source);
-	if (max_host_id != bsync_state.local_id) return;
+	if (max_host_id != bsync_state.local_id) {
+		bsync_index[max_host_id].election_code =
+			bsync_mtype_leader_proposal;
+		bsync_index[max_host_id].election_host = max_host_id;
+		if (bsync_index[max_host_id].fiber_out != fiber()) {
+			fiber_call(bsync_index[max_host_id].fiber_out);
+		}
+		return;
+	}
 	bsync_state.num_accepted = 1;
 	bsync_state.state = bsync_state_leader_accept;
 	for (uint8_t i = 0; i < bsync_state.num_hosts; ++i) {
@@ -1325,6 +1335,18 @@ bsync_disconnected(uint8_t host_id)
 		rlist_create(&bsync_state.election_ops);
 		bsync_connected(host_id);
 	}
+}
+
+static void
+bsync_leader_proposal(uint8_t host_id, const char **ipos, const char *iend)
+{BSYNC_TRACE
+	(void)host_id; (void)ipos; (void)iend;
+	BSYNC_REMOTE.commit_gsn = BSYNC_REMOTE.submit_gsn =
+		BSYNC_REMOTE.gsn = mp_decode_uint(ipos);
+	if (bsync_state.state == bsync_state_started) {
+		bsync_state.state = bsync_state_initial;
+	}
+	bsync_connected(host_id);
 }
 
 static void
@@ -1416,7 +1438,7 @@ bsync_leader_reject(uint8_t host_id, const char **ipos, const char *iend)
 typedef void (*bsync_handler_t)(uint8_t host_id,
 				const char** ipos, const char* iend);
 static bsync_handler_t bsync_handlers[] = {
-	0,
+	bsync_leader_proposal,
 	bsync_leader_promise,
 	bsync_leader_accept,
 	bsync_leader_submit,
@@ -1648,6 +1670,7 @@ bsync_send(struct ev_io *coio, uint8_t host_id)
 			/* no break */
 		case bsync_mtype_ping:
 		case bsync_mtype_leader_promise:
+		case bsync_mtype_leader_proposal:
 			size += mp_sizeof_uint(host->gsn);
 			/* no break */
 		default:
@@ -1666,6 +1689,7 @@ bsync_send(struct ev_io *coio, uint8_t host_id)
 			/* no break */
 		case bsync_mtype_ping:
 		case bsync_mtype_leader_promise:
+		case bsync_mtype_leader_proposal:
 			pos = mp_encode_uint(pos, host->gsn);
 			/* no break */
 		default:
