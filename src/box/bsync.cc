@@ -183,6 +183,7 @@ static struct bsync_state_ {
 	ev_tstamp slow_host_timeout;
 	ev_tstamp ping_timeout;
 	ev_tstamp election_timeout;
+	ev_tstamp submit_timeout;
 
 	const char** iproxy_pos;
 	const char* iproxy_end;
@@ -1736,6 +1737,11 @@ bsync_outgoing(struct ev_io *coio, uint8_t host_id)
 		}
 	}
 	while(!bsync_state.is_shutdown && BSYNC_REMOTE.fiber_out == fiber()) {
+		if (bsync_extended_header_size(host_id) > 0 &&
+			rlist_empty(&BSYNC_REMOTE.send_queue))
+		{
+			fiber_yield_timeout(bsync_state.submit_timeout);
+		}
 		bsync_send(coio, host_id);
 		fiber_gc();
 		fiber_yield_timeout(bsync_state.ping_timeout);
@@ -1840,6 +1846,7 @@ bsync_cfg_read()
 	bsync_state.ping_timeout = cfg_getd("bsync_ping_timeout");
 	bsync_state.election_timeout = cfg_getd("bsync_election_timeout");
 	bsync_state.slow_host_timeout = cfg_getd("bsync_slow_host_timeout");
+	bsync_state.submit_timeout = cfg_getd("bsync_submit_timeout");
 
 	const char* hosts = cfg_gets("bsync_replica");
 	const char* localhost = cfg_gets("bsync_local");
