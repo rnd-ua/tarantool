@@ -230,10 +230,12 @@ static struct bsync_state_ {
 static struct fiber*
 bsync_fiber(struct rlist *lst, void (*f) (va_list))
 {
+	struct fiber *result = NULL;
 	if (! rlist_empty(lst))
-		return rlist_shift_entry(lst, struct fiber, state);
+		result =  rlist_shift_entry(lst, struct fiber, state);
 	else
-		return fiber_new("bsync_proc", f);
+		result = fiber_new("bsync_proc", f);
+	return result;
 }
 
 static struct bsync_region *
@@ -515,8 +517,10 @@ int
 bsync_write(struct recovery_state *r, struct xrow_header *row) try
 {BSYNC_TRACE
 	if (bsync_state.rollback) {
-		if (stmt->row->server_id != 0)
+		if (stmt->row->server_id != 0) {
 			rlist_shift(&bsync_state.txn_queue);
+			fiber_yield();
+		}
 		return 0;
 	}
 	if (wal_local_writer == NULL) return wal_write_lsn(r, stmt->row);
@@ -615,6 +619,7 @@ bsync_update_gsn(uint64_t gsn)
 static int
 bsync_wal_write(struct xrow_header *row)
 {BSYNC_TRACE
+	if (bsync_state.is_shutdown) return -1;
 	if (bsync_state.wal_commit_gsn) {
 		row->commit_sn = bsync_state.wal_commit_gsn;
 		bsync_state.wal_commit_gsn = 0;
@@ -674,7 +679,6 @@ bsync_queue_slave(struct bsync_operation *oper)
 	int wal_result = bsync_wal_write(oper->txn_data->row);
 	elem->code = wal_result < 0 ? bsync_mtype_reject
 				    : bsync_mtype_submit;
-	assert(wal_result >= 0);
 	rlist_add_tail_entry(&bsync_state.commit_queue, oper, list);
 	bsync_send_data(&BSYNC_LEADER, elem);
 	if (oper->status == bsync_op_status_wal) {
@@ -704,7 +708,9 @@ bsync_wait_slow(struct bsync_operation *oper)
 		if (BSYNC_REMOTE.commit_gsn == BSYNC_REMOTE.submit_gsn) continue;
 		if (bsync_state.local_id == host_id) continue;
 		if (BSYNC_REMOTE.flags & bsync_host_active_write) continue;
-		fiber_call(BSYNC_REMOTE.fiber_out);
+		if (BSYNC_REMOTE.fiber_out) {
+			fiber_call(BSYNC_REMOTE.fiber_out);
+		}
 	}
 	BSYNC_TRACE
 }
@@ -933,8 +939,13 @@ static void
 bsync_proxy_request(uint8_t host_id, const char **ipos, const char *iend)
 {BSYNC_TRACE
 	(void)host_id;
-	if (BSYNC_REMOTE.flags & bsync_host_rollback) {
-		/* skip all proxy requests from node in conflict state */
+	if ((BSYNC_REMOTE.flags & bsync_host_rollback) != 0 ||
+		bsync_state.state != bsync_state_ready)
+	{
+		/*
+		 * skip all proxy requests from node in conflict state or
+		 * if we lost consensus
+		 */
 		*ipos = iend;
 		return;
 	}
@@ -1065,7 +1076,9 @@ bsync_txn_proceed_request(struct bsync_txn_info *info)
 			box_process(&null_port, req);
 		} catch (Exception *e) {
 			if (info->op->server_id == BSYNC_SERVER_ID) {
-				rlist_del_entry(info, list);
+				if (!bsync_state.rollback) {
+					rlist_del_entry(info, list);
+				}
 				goto error;
 			}
 			throw;
@@ -1077,9 +1090,7 @@ bsync_txn_proceed_request(struct bsync_txn_info *info)
 error:
 	bsync_state.is_proceed_system = false;
 	info->owner = fiber();
-	if (info->repeat) {
-		fiber_yield();BSYNC_TRACE
-	} else {
+	if (!info->repeat) {
 		SWITCH_TO_BSYNC
 	}
 }
@@ -1096,6 +1107,7 @@ restart:BSYNC_TRACE
 		while (true) {
 			bsync_txn_proceed_request(info);
 			if (info->repeat) {
+				info->repeat = false;
 				fiber_yield();
 			} else {
 				break;
@@ -1250,6 +1262,7 @@ bsync_connected(uint8_t host_id)
 	if (bsync_state.num_connected == bsync_state.num_hosts &&
 		bsync_state.state == bsync_state_started)
 	{
+		say_info("all hosts connected");
 		bsync_state.state = bsync_state_initial;
 	}
 	if (2 * bsync_state.num_connected <= bsync_state.num_hosts ||
@@ -1257,6 +1270,7 @@ bsync_connected(uint8_t host_id)
 	{
 		return;
 	}
+	say_info("consensus connected");
 	bsync_state.state = bsync_state_initial;
 	uint8_t max_host_id = bsync_max_host();
 	say_info("next leader should be %s", bsync_index[max_host_id].source);
@@ -1298,7 +1312,10 @@ bsync_disconnected(uint8_t host_id)
 {BSYNC_TRACE
 	BSYNC_REMOTE.flags = bsync_host_disconnected;
 	--bsync_state.num_connected;
-	mh_strptr_clear(BSYNC_REMOTE.active_ops);
+	{
+		BSYNC_LOCK(bsync_state.active_ops_mutex);
+		mh_strptr_clear(BSYNC_REMOTE.active_ops);
+	}
 	/* TODO : clean up wait queue using fiber_call() */
 	say_warn("disconnecting host %s", BSYNC_REMOTE.source);
 	struct bsync_host_info *elem;
@@ -1342,6 +1359,7 @@ static void
 bsync_leader_proposal(uint8_t host_id, const char **ipos, const char *iend)
 {BSYNC_TRACE
 	(void)host_id; (void)ipos; (void)iend;
+	say_info("receive leader proposal from %s", BSYNC_REMOTE.source);
 	BSYNC_REMOTE.commit_gsn = BSYNC_REMOTE.submit_gsn =
 		BSYNC_REMOTE.gsn = mp_decode_uint(ipos);
 	if (bsync_state.state == bsync_state_started) {
@@ -1515,12 +1533,18 @@ bsync_incoming(struct ev_io *coio, struct iobuf *iobuf, uint8_t host_id)
 		/* proceed message */
 		const char* iend = (const char *)in->pos + len;
 		const char **ipos = (const char **)&in->pos;
-		uint32_t type = mp_decode_uint(ipos);
-		assert(type < bsync_mtype_count);
-		say_debug("receive message from %s, type %s, length %d",
-			BSYNC_REMOTE.source, bsync_mtype_name[type], len);
-		assert(type < sizeof(bsync_handlers));
-		(*bsync_handlers[type])(host_id, ipos, iend);
+		if (BSYNC_REMOTE.connected == 2) {
+			uint32_t type = mp_decode_uint(ipos);
+			assert(type < bsync_mtype_count);
+			say_debug("receive message from %s, type %s, length %d",
+				BSYNC_REMOTE.source, bsync_mtype_name[type], len);
+			assert(type < sizeof(bsync_handlers));
+			(*bsync_handlers[type])(host_id, ipos, iend);
+		} else {
+			*ipos = iend;
+			say_warn("receive message from disconnected host %s",
+				 BSYNC_REMOTE.source);
+		}
 	}
 }
 
@@ -1559,6 +1583,7 @@ bsync_accept_handler(va_list ap)
 	}
 	if (BSYNC_REMOTE.connected == 2) {
 		++bsync_state.num_connected;
+		say_info("host %s connected", BSYNC_REMOTE.source);
 		bsync_connected(host_id);
 	}
 	try {
@@ -1651,9 +1676,38 @@ bsync_writev(struct ev_io *coio, struct iovec *iov, int iovcnt, uint8_t host_id)
 	}
 }
 
+#define BUFV_IOVMAX 10*XROW_IOVMAX
+static void
+bsync_send_queue(struct ev_io *coio, uint8_t host_id)
+{BSYNC_TRACE
+	assert(bsync_state.state == bsync_state_ready);
+	while(!rlist_empty(&BSYNC_REMOTE.send_queue)) {
+		struct iovec iov[BUFV_IOVMAX];
+		int iovcnt = 0;
+		do {
+			struct bsync_host_info *elem =
+				rlist_shift_entry(&BSYNC_REMOTE.send_queue,
+					struct bsync_host_info, list);
+			if (elem->code == bsync_mtype_body ||
+				elem->code == bsync_mtype_proxy_accept)
+			{
+				rlist_add_tail_entry(&BSYNC_REMOTE.op_queue,
+						     elem, list);
+			}
+			assert(elem->code <= bsync_mtype_hello);
+			say_debug("send to %s message with type %s, gsn %ld",
+				BSYNC_REMOTE.source, bsync_mtype_name[elem->code],
+				elem->op ? elem->op->gsn : -1);
+			iovcnt += encode_request(host_id, elem, iov + iovcnt);
+		} while (!rlist_empty(&BSYNC_REMOTE.send_queue) &&
+			 (iovcnt + XROW_IOVMAX) < BUFV_IOVMAX);
+		bsync_writev(coio, iov, iovcnt, host_id);
+	}
+}
+
 static void
 bsync_send(struct ev_io *coio, uint8_t host_id)
-{
+{BSYNC_TRACE
 	if (rlist_empty(&BSYNC_REMOTE.send_queue)) {
 		if (BSYNC_REMOTE.election_code == bsync_mtype_none) {
 			BSYNC_REMOTE.election_code = bsync_mtype_ping;
@@ -1698,29 +1752,12 @@ bsync_send(struct ev_io *coio, uint8_t host_id)
 		}
 		assert(BSYNC_REMOTE.election_code <= bsync_mtype_hello);
 		say_debug("send to %s message with type %s",
-			BSYNC_REMOTE.source, bsync_mtype_name[BSYNC_REMOTE.election_code]);
+			BSYNC_REMOTE.source,
+			bsync_mtype_name[BSYNC_REMOTE.election_code]);
 		BSYNC_REMOTE.election_code = bsync_mtype_none;
 		bsync_writev(coio, iov, 1, host_id);
 	} else {
-		assert(bsync_state.state == bsync_state_ready);
-		while(!rlist_empty(&BSYNC_REMOTE.send_queue)) {
-			struct bsync_host_info *elem =
-				rlist_shift_entry(&BSYNC_REMOTE.send_queue,
-					struct bsync_host_info, list);
-			if (elem->code == bsync_mtype_body ||
-				elem->code == bsync_mtype_proxy_accept)
-			{
-				rlist_add_tail_entry(&BSYNC_REMOTE.op_queue,
-						     elem, list);
-			}
-			assert(elem->code <= bsync_mtype_hello);
-			say_debug("send to %s message with type %s, gsn %ld",
-				BSYNC_REMOTE.source, bsync_mtype_name[elem->code],
-				elem->op ? elem->op->gsn : -1);
-			struct iovec iov[XROW_IOVMAX];
-			int iovcnt = encode_request(host_id, elem, iov);
-			bsync_writev(coio, iov, iovcnt, host_id);
-		}
+		bsync_send_queue(coio, host_id);
 	}
 }
 
@@ -1733,6 +1770,7 @@ bsync_outgoing(struct ev_io *coio, uint8_t host_id)
 		bsync_send(coio, host_id);
 		if (++BSYNC_REMOTE.connected == 2) {
 			++bsync_state.num_connected;
+			say_info("host %s connected", BSYNC_REMOTE.source);
 			bsync_connected(host_id);
 		}
 	}
