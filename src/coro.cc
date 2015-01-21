@@ -30,32 +30,12 @@
 
 #include "trivia/config.h"
 #include "exception.h"
-#include "tt_pthread.h"
 #include <unistd.h>
 #include <string.h>
 #include <sys/mman.h>
 
 #include "third_party/valgrind/memcheck.h"
 #include "fiber.h"
-
-static pthread_mutex_t coro_mutex;
-
-void
-tarantool_coro_init()
-{
-	pthread_mutexattr_t errorcheck;
-	(void) tt_pthread_mutexattr_init(&errorcheck);
-#ifndef NDEBUG
-	(void) tt_pthread_mutexattr_settype(&errorcheck, PTHREAD_MUTEX_ERRORCHECK);
-#endif
-	tt_pthread_mutex_init(&coro_mutex, &errorcheck);
-}
-
-void
-tarantool_coro_stop()
-{
-	tt_pthread_mutex_destroy(&coro_mutex);
-}
 
 void
 tarantool_coro_create(struct tarantool_coro *coro,
@@ -79,9 +59,7 @@ tarantool_coro_create(struct tarantool_coro *coro,
 	(void) VALGRIND_STACK_REGISTER(coro->stack, (char *)
 				       coro->stack + coro->stack_size);
 
-	tt_pthread_mutex_lock(&coro_mutex);
 	coro_create(&coro->ctx, f, data, coro->stack, coro->stack_size);
-	tt_pthread_mutex_unlock(&coro_mutex);
 }
 
 void
