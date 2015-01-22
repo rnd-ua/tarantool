@@ -453,11 +453,10 @@ bsync_end_op(uint8_t host_id, struct bsync_key *key, uint32_t server_id)
 	if (k == mh_end(BSYNC_REMOTE.active_ops)) return;
 	struct mh_strptr_node_t *node =
 		mh_strptr_node(BSYNC_REMOTE.active_ops, k);
-	if (server_id != 0) {
+	if (server_id != 0)
 		--node->val.remote_ops;
-	} else {
+	else
 		--node->val.local_ops;
-	}
 	if ((node->val.local_ops + node->val.remote_ops) == 0)
 		mh_strptr_del(BSYNC_REMOTE.active_ops, k, NULL);
 }
@@ -705,12 +704,14 @@ bsync_wait_slow(struct bsync_operation *oper)
 			continue;
 	}
 	for (uint8_t host_id = 0; host_id < bsync_state.num_hosts; ++host_id) {
-		if (BSYNC_REMOTE.commit_gsn == BSYNC_REMOTE.submit_gsn) continue;
-		if (bsync_state.local_id == host_id) continue;
-		if (BSYNC_REMOTE.flags & bsync_host_active_write) continue;
-		if (BSYNC_REMOTE.fiber_out) {
-			fiber_call(BSYNC_REMOTE.fiber_out);
+		if (BSYNC_REMOTE.commit_gsn == BSYNC_REMOTE.submit_gsn ||
+			bsync_state.local_id == host_id ||
+			(BSYNC_REMOTE.flags & bsync_host_active_write) != 0)
+		{
+			continue;
 		}
+		if (BSYNC_REMOTE.fiber_out)
+			fiber_call(BSYNC_REMOTE.fiber_out);
 	}
 	BSYNC_TRACE
 }
@@ -745,7 +746,8 @@ bsync_queue_leader(struct bsync_operation *oper, bool proxy)
 			oper->txn_data->row->lsn = oper->gsn;
 			oper->txn_data->row->server_id = BSYNC_SERVER_ID;
 		}
-		say_debug("********** send accept/body from fiber %ld", (ptrdiff_t)elem->op->owner);
+		say_debug("********** send accept/body from fiber %ld",
+			  (ptrdiff_t)elem->op->owner);
 		bsync_send_data(&BSYNC_REMOTE, elem);
 	}
 	oper->txn_data->row->lsn = bsync_update_gsn(oper->gsn);
@@ -764,7 +766,8 @@ bsync_queue_leader(struct bsync_operation *oper, bool proxy)
 		}
 		fiber_yield_timeout(bsync_state.operation_timeout);BSYNC_TRACE
 	}
-	oper->txn_data->result = (2 * oper->accepted > bsync_state.num_hosts ? 0 : -1);
+	oper->txn_data->result =
+		(2 * oper->accepted > bsync_state.num_hosts ? 0 : -1);
 	if (!proxy) {
 		SWITCH_TO_TXN
 		bsync_wait_slow(oper);
@@ -834,22 +837,19 @@ bsync_proxy_processor()
 		SWITCH_TO_TXN
 	} else if (oper->txn_data->result < 0) {
 		uint8_t host_id = oper->server_id - 1;
-		if (BSYNC_REMOTE.flags & bsync_host_rollback) {
+		if (BSYNC_REMOTE.flags & bsync_host_rollback)
 			return;
-		}
 		BSYNC_REMOTE.flags |= bsync_host_rollback;
 		/* drop all active operations from host */
 		tt_pthread_mutex_lock(&bsync_state.mutex);
 		struct bsync_txn_info *info;
 		STAILQ_FOREACH(info, &bsync_state.txn_proxy_input, fifo) {
-			if (info->row->server_id == oper->server_id) {
+			if (info->row->server_id == oper->server_id)
 				info->result = -1;
-			}
 		}
 		STAILQ_FOREACH(info, &bsync_state.txn_proxy_queue, fifo) {
-			if (info->row->server_id == oper->server_id) {
+			if (info->row->server_id == oper->server_id)
 				info->result = -1;
-			}
 		}
 		tt_pthread_cond_signal(&bsync_state.cond);
 		tt_pthread_mutex_unlock(&bsync_state.mutex);
@@ -1035,8 +1035,10 @@ bsync_ping(uint8_t host_id, const char **ipos, const char *iend)
 	if (gsn == BSYNC_REMOTE.gsn) return;
 	uint8_t max_host = bsync_max_host();
 	BSYNC_REMOTE.gsn = gsn;
-	if (bsync_state.state == bsync_state_ready) return;
-	if (bsync_max_host() != max_host) bsync_connected(host_id);
+	if (bsync_state.state == bsync_state_ready)
+		return;
+	if (bsync_max_host() != max_host)
+		bsync_connected(host_id);
 }
 
 /*
@@ -1278,9 +1280,8 @@ bsync_connected(uint8_t host_id)
 		bsync_index[max_host_id].election_code =
 			bsync_mtype_leader_proposal;
 		bsync_index[max_host_id].election_host = max_host_id;
-		if (bsync_index[max_host_id].fiber_out != fiber()) {
+		if (bsync_index[max_host_id].fiber_out != fiber())
 			fiber_call(bsync_index[max_host_id].fiber_out);
-		}
 		return;
 	}
 	bsync_state.num_accepted = 1;
@@ -1289,9 +1290,8 @@ bsync_connected(uint8_t host_id)
 		if (i == max_host_id || bsync_index[i].connected < 2) continue;
 		bsync_index[i].election_code = bsync_mtype_leader_promise;
 		bsync_index[i].election_host = max_host_id;
-		if (bsync_index[i].fiber_out != fiber()) {
+		if (bsync_index[i].fiber_out != fiber())
 			fiber_call(bsync_index[i].fiber_out);
-		}
 	}
 }
 
@@ -1362,9 +1362,8 @@ bsync_leader_proposal(uint8_t host_id, const char **ipos, const char *iend)
 	say_info("receive leader proposal from %s", BSYNC_REMOTE.source);
 	BSYNC_REMOTE.commit_gsn = BSYNC_REMOTE.submit_gsn =
 		BSYNC_REMOTE.gsn = mp_decode_uint(ipos);
-	if (bsync_state.state == bsync_state_started) {
+	if (bsync_state.state == bsync_state_started)
 		bsync_state.state = bsync_state_initial;
-	}
 	bsync_connected(host_id);
 }
 
@@ -1482,9 +1481,8 @@ bsync_decode_extended_header(uint8_t /* host_id */, const char **pos)
 	if (!len) return;
 	uint32_t flags = mp_decode_uint(pos);
 	assert(flags);
-	if (flags & bsync_iproto_commit_gsn) {
+	if (flags & bsync_iproto_commit_gsn)
 		bsync_commit_op(mp_decode_uint(pos));
-	}
 	/* ignore all unknown data from extended header */
 	*pos = end;
 }
@@ -1495,9 +1493,8 @@ bsync_read_package(struct ev_io *coio, struct ibuf *in, uint8_t host_id)
 	if (host_id < BSYNC_MAX_HOSTS)
 		BSYNC_REMOTE.flags |= bsync_host_active_read;
 	/* Read fixed header */
-	if (ibuf_size(in) < 1) {
+	if (ibuf_size(in) < 1)
 		coio_breadn(coio, in, 1);
-	}
 	/* Read length */
 	if (mp_typeof(*in->pos) != MP_UINT) {
 		tnt_raise(ClientError, ER_INVALID_MSGPACK,
@@ -1601,12 +1598,11 @@ bsync_accept_handler(va_list ap)
 static int
 bsync_extended_header_size(uint8_t host_id)
 {
-	if (BSYNC_REMOTE.submit_gsn > BSYNC_REMOTE.commit_gsn) {
+	if (BSYNC_REMOTE.submit_gsn > BSYNC_REMOTE.commit_gsn)
 		return mp_sizeof_uint(bsync_iproto_commit_gsn) +
 			mp_sizeof_uint(BSYNC_REMOTE.submit_gsn);
-	} else {
+	else
 		return 0;
-	}
 }
 
 static char *
