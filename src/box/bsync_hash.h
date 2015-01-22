@@ -75,14 +75,14 @@ bsync_hash_cmp(const struct bsync_key *k1, const struct bsync_key *k2)
 /*
  * Map: (const char *) => (void *)
  */
-#define mh_name _strptr
+#define mh_name _bsync
 #define mh_key_t struct bsync_key
-struct mh_strptr_node_t {
+struct mh_bsync_node_t {
 	mh_key_t key;
 	bsync_val val;
 };
 
-#define mh_node_t struct mh_strptr_node_t
+#define mh_node_t struct mh_bsync_node_t
 #define mh_arg_t void *
 #define mh_hash(a, arg) (bsync_hash_key(&(a)->key))
 #define mh_hash_key(a, arg) (bsync_hash_key(&(a)))
