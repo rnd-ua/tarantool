@@ -49,6 +49,8 @@
 #include "stat.h"
 #include "lua/call.h"
 
+static struct mempool iproto_obuf_pool;
+
 /* {{{ iproto_request - declaration */
 
 struct iproto_connection;
@@ -334,8 +336,12 @@ iproto_connection_new(const char *name, int fd, struct sockaddr *addr)
 	con->loop = loop();
 	ev_io_init(&con->input, iproto_connection_on_input, fd, EV_READ);
 	ev_io_init(&con->output, iproto_connection_on_output, fd, EV_WRITE);
-	con->iobuf[0] = iobuf_new(name);
-	con->iobuf[1] = iobuf_new(name);
+	con->iobuf[0] = iobuf_alloc(name);
+	con->iobuf[1] = iobuf_alloc(name);
+	if (con->iobuf[0]->in.pool == NULL)
+		iobuf_ibuf_init(con->iobuf[0], &con->iobuf[0]->pool);
+	if (con->iobuf[1]->in.pool == NULL)
+		iobuf_ibuf_init(con->iobuf[1], &con->iobuf[1]->pool);
 	con->parse_size = 0;
 	con->write_pos = obuf_create_svp(&con->iobuf[0]->out);
 	con->session = NULL;
@@ -429,8 +435,10 @@ iproto_response_schedule(ev_loop * /* loop */, struct ev_async * /* watcher */,
 		struct iproto_connection *con = req->connection;
 		switch (req->type) {
 		case iproto_request_shutdown:
-			iobuf_delete(con->iobuf[0]);
-			iobuf_delete(con->iobuf[1]);
+			iobuf_ibuf_delete(con->iobuf[0]);
+			iobuf_ibuf_delete(con->iobuf[1]);
+			iobuf_free(con->iobuf[0]);
+			iobuf_free(con->iobuf[1]);
 			mempool_free(&iproto_connection_pool, con);
 			break;
 		case iproto_request_connect:
@@ -448,6 +456,7 @@ iproto_response_schedule(ev_loop * /* loop */, struct ev_async * /* watcher */,
 				ev_feed_event(con->loop, &con->input, EV_READ);
 			}
 		case iproto_request_user:
+			req->iobuf->in.pos += req->total_len;
 			if (evio_is_active(&con->output)) {
 				if (! ev_is_active(&con->output))
 					ev_feed_event(con->loop,
@@ -719,11 +728,6 @@ iproto_process(struct iproto_request *ireq)
 	struct obuf *out = &iobuf->out;
 	struct iproto_connection *con = ireq->connection;
 
-	auto scope_guard = make_scoped_guard([=]{
-		/* Discard request (see iproto_enqueue_batch()) */
-		iobuf->in.pos += ireq->total_len;
-	});
-
 	if (unlikely(! evio_is_active(&con->output)))
 		return;
 
@@ -815,6 +819,16 @@ iproto_greeting(const char *salt)
 	return greeting;
 }
 
+static void
+iproto_init_obuf(struct iobuf *iobuf)
+{
+	if (iobuf->out.pool)
+		return;
+	struct region *pool = (struct region *)mempool_alloc(&iproto_obuf_pool);
+	region_create(pool, &cord()->slabc);
+	region_set_name(pool, "obuf_cache");
+	iobuf_obuf_init(iobuf, pool);
+}
 /**
  * Handshake a connection: invoke the on-connect trigger
  * and possibly authenticate. Try to send the client an error
@@ -826,6 +840,8 @@ iproto_process_connect(struct iproto_request *request)
 	struct iproto_connection *con = request->connection;
 	struct iobuf *iobuf = request->iobuf;
 	int fd = con->input.fd;
+	iproto_init_obuf(con->iobuf[0]);
+	iproto_init_obuf(con->iobuf[1]);
 	try {              /* connect. */
 		con->session = session_create(fd, con->cookie);
 		obuf_dup(&iobuf->out, iproto_greeting(con->session->salt),
@@ -844,6 +860,8 @@ iproto_process_disconnect(struct iproto_request *request)
 {
 	/* Runs the trigger, which may yield. */
 	iproto_connection_delete(request->connection);
+	iobuf_obuf_delete(request->connection->iobuf[0]);
+	iobuf_obuf_delete(request->connection->iobuf[1]);
 }
 
 /** }}} */
@@ -870,6 +888,7 @@ iproto_on_accept(struct evio_service * /* service */, int fd,
 	struct iproto_request *ireq =
 		iproto_request_new(con, iproto_process_connect,
 				   iproto_request_connect);
+	ireq->total_len = 0;
 	iproto_queue_push(&request_queue, ireq);
 }
 
@@ -894,6 +913,8 @@ iproto_init(struct evio_service *service)
 	evio_service_init(loop(), service, "binary",
 			  iproto_on_accept, NULL);
 	evio_service_on_bind(service, on_bind, NULL);
+	mempool_create(&iproto_obuf_pool, &cord()->slabc,
+		       sizeof(struct region));
 }
 
 /* vim: set foldmethod=marker */
