@@ -272,6 +272,27 @@ struct iobuf
 struct iobuf *
 iobuf_new(const char *name);
 
+struct iobuf *
+iobuf_alloc(const char *name);
+
+void
+iobuf_ibuf_init(struct iobuf *iobuf, struct region *pool);
+
+void
+iobuf_obuf_init(struct iobuf *iobuf, struct region *pool);
+
+/** Destroy an output part in input/output buffer. */
+void
+iobuf_obuf_delete(struct iobuf *iobuf);
+
+/** Destroy an input part in input/output buffer. */
+void
+iobuf_ibuf_delete(struct iobuf *iobuf);
+
+/** Destroy an input/output buffer with deleted parts */
+void
+iobuf_free(struct iobuf *iobuf);
+
 /** Destroy an input/output buffer. */
 void
 iobuf_delete(struct iobuf *iobuf);

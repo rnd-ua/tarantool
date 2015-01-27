@@ -282,13 +282,23 @@ __thread SLIST_HEAD(iobuf_cache, iobuf) iobuf_cache;
 struct iobuf *
 iobuf_new(const char *name)
 {
+	struct iobuf *iobuf = iobuf_alloc(name);
+	if (iobuf->in.pool == NULL)
+		ibuf_create(&iobuf->in, &iobuf->pool);
+	if (iobuf->out.pool == NULL)
+		obuf_create(&iobuf->out, &iobuf->pool, iobuf_readahead);
+	return iobuf;
+}
+
+struct iobuf *
+iobuf_alloc(const char *name)
+{
 	struct iobuf *iobuf;
 	if (SLIST_EMPTY(&iobuf_cache)) {
 		iobuf = (struct iobuf *) mempool_alloc(&iobuf_pool);
 		region_create(&iobuf->pool, &cord()->slabc);
-		/* Note: do not allocate memory upfront. */
-		ibuf_create(&iobuf->in, &iobuf->pool);
-		obuf_create(&iobuf->out, &iobuf->pool, iobuf_readahead);
+		ibuf_create(&iobuf->in, NULL);
+		obuf_create(&iobuf->out, NULL, iobuf_readahead);
 	} else {
 		iobuf = SLIST_FIRST(&iobuf_cache);
 		SLIST_REMOVE_HEAD(&iobuf_cache, next);
@@ -299,21 +309,60 @@ iobuf_new(const char *name)
 	return iobuf;
 }
 
+void
+iobuf_ibuf_init(struct iobuf *iobuf, struct region *pool)
+{
+	ibuf_create(&iobuf->in, pool);
+}
+
+void
+iobuf_obuf_init(struct iobuf *iobuf, struct region *pool)
+{
+	obuf_create(&iobuf->out, pool, iobuf_readahead);
+}
+
+
 /** Put an instance back to the iobuf_cache. */
+void
+iobuf_obuf_delete(struct iobuf *iobuf)
+{
+	struct region *pool = iobuf->out.pool;
+	if (region_used(pool) < iobuf_max_pool_size()) {
+		obuf_reset(&iobuf->out);
+	} else {
+		region_free(pool);
+		obuf_create(&iobuf->out, pool, iobuf_readahead);
+	}
+	region_set_name(pool, "obuf_cache");
+}
+
+void
+iobuf_ibuf_delete(struct iobuf *iobuf)
+{
+	struct region *pool = iobuf->in.pool;
+	if (region_used(pool) < iobuf_max_pool_size()) {
+		ibuf_reset(&iobuf->in);
+	} else {
+		region_free(pool);
+		ibuf_create(&iobuf->in, pool);
+	}
+	region_set_name(pool, "ibuf_cache");
+}
+
+void
+iobuf_free(struct iobuf *iobuf)
+{
+	SLIST_INSERT_HEAD(&iobuf_cache, iobuf, next);
+}
+
 void
 iobuf_delete(struct iobuf *iobuf)
 {
 	struct region *pool = &iobuf->pool;
-	if (region_used(pool) < iobuf_max_pool_size()) {
-		ibuf_reset(&iobuf->in);
-		obuf_reset(&iobuf->out);
-	} else {
-		region_free(pool);
-		ibuf_create(&iobuf->in, pool);
-		obuf_create(&iobuf->out, pool, iobuf_readahead);
-	}
+	iobuf_ibuf_delete(iobuf);
+	iobuf_obuf_delete(iobuf);
 	region_set_name(pool, "iobuf_cache");
-	SLIST_INSERT_HEAD(&iobuf_cache, iobuf, next);
+	iobuf_free(iobuf);
 }
 
 /** Send all data in the output buffer and garbage collect. */
