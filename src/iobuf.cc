@@ -276,7 +276,7 @@ static int iobuf_max_pool_size()
 	return 18 * iobuf_readahead;
 }
 
-SLIST_HEAD(iobuf_cache, iobuf) iobuf_cache;
+__thread SLIST_HEAD(iobuf_cache, iobuf) iobuf_cache;
 
 /** Create an instance of input/output buffer or take one from cache. */
 struct iobuf *
