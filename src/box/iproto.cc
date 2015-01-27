@@ -42,7 +42,6 @@
 #include "msgpuck/msgpuck.h"
 #include "session.h"
 #include "third_party/base64.h"
-#include "coio.h"
 #include "xrow.h"
 #include "iproto_constants.h"
 #include "user_def.h"
@@ -415,7 +414,7 @@ iproto_response_push(struct iproto_request *req)
 	rlist_add_tail_entry(&iproto_response_queue.queue, req, link);
 	if (!empty)
 		return;
-	ev_invoke(loop(), &iproto_response_queue.watcher, EV_CUSTOM);
+	ev_feed_event(loop(), &iproto_response_queue.watcher, EV_CUSTOM);
 }
 
 static void
