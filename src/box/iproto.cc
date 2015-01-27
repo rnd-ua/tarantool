@@ -56,6 +56,12 @@ struct iproto_connection;
 
 typedef void (*iproto_request_f)(struct iproto_request *);
 
+enum iproto_request_type {
+	iproto_request_connect = 0,
+	iproto_request_user = 1,
+	iproto_request_shutdown = 2
+};
+
 /**
  * A single request from the client. All requests
  * from all clients are queued into a single queue
@@ -72,13 +78,18 @@ struct iproto_request
 	/* Box request, if this is a DML */
 	struct request request;
 	size_t total_len;
+
+	/* fields for proceed request result in IPROTO context */
+	uint8_t type;
+	bool result;
+	rlist link;
 };
 
 struct mempool iproto_request_pool;
 
 static struct iproto_request *
 iproto_request_new(struct iproto_connection *con,
-		   iproto_request_f process);
+		   iproto_request_f process, uint8_t type);
 
 static void
 iproto_process_connect(struct iproto_request *request);
@@ -88,6 +99,9 @@ iproto_process_disconnect(struct iproto_request *request);
 
 static void
 iproto_process(struct iproto_request *request);
+
+static void
+iproto_response_push(struct iproto_request *req);
 
 struct IprotoRequestGuard {
 	struct iproto_request *ireq;
@@ -169,7 +183,7 @@ iproto_queue_push(struct iproto_queue *i_queue,
 	 * handled.
 	 */
 	if (iproto_queue_is_empty(i_queue))
-		ev_feed_event(loop(), &request_queue.watcher, EV_CUSTOM);
+		ev_feed_event(loop(), &i_queue->watcher, EV_CUSTOM);
 	i_queue->queue[i_queue->end++] = request;
 }
 
@@ -195,7 +209,9 @@ iproto_queue_handler(va_list ap)
 	struct iproto_request *request;
 restart:
 	while ((request = iproto_queue_pop(i_queue))) {
-		IprotoRequestGuard guard(request);
+		auto scope_guard = make_scoped_guard([=]{
+			iproto_response_push(request);
+		});
 		fiber_set_session(fiber(), request->session);
 		fiber_set_user(fiber(), &request->session->credentials);
 		request->process(request);
@@ -307,6 +323,9 @@ static void
 iproto_connection_on_output(ev_loop * /* loop */, struct ev_io *watcher,
 			    int /* revents */);
 
+static int
+iproto_flush(struct iobuf *iobuf, int fd, struct obuf_svp *svp);
+
 static struct iproto_connection *
 iproto_connection_new(const char *name, int fd, struct sockaddr *addr)
 {
@@ -323,7 +342,8 @@ iproto_connection_new(const char *name, int fd, struct sockaddr *addr)
 	con->session = NULL;
 	con->cookie = *(uint64_t *) addr;
 	/* It may be very awkward to allocate at close. */
-	con->disconnect = iproto_request_new(con, iproto_process_disconnect);
+	con->disconnect = iproto_request_new(con, iproto_process_disconnect,
+					     iproto_request_shutdown);
 	return con;
 }
 
@@ -338,24 +358,11 @@ iproto_connection_delete(struct iproto_connection *con)
 			session_run_on_disconnect_triggers(con->session);
 		session_destroy(con->session);
 	}
-	iobuf_delete(con->iobuf[0]);
-	iobuf_delete(con->iobuf[1]);
-	if (con->disconnect)
-		mempool_free(&iproto_request_pool, con->disconnect);
-	mempool_free(&iproto_connection_pool, con);
 }
 
 static inline void
-iproto_connection_shutdown(struct iproto_connection *con)
+iproto_connection_try_delete(struct iproto_connection *con)
 {
-	ev_io_stop(con->loop, &con->input);
-	ev_io_stop(con->loop, &con->output);
-	con->input.fd = con->output.fd = -1;
-	/*
-	 * Discard unparsed data, to recycle the con
-	 * as soon as all parsed data is processed.
-	 */
-	con->iobuf[0]->in.end -= con->parse_size;
 	/*
 	 * If the con is not idle, it is destroyed
 	 * after the last request is handled. Otherwise,
@@ -372,11 +379,87 @@ iproto_connection_shutdown(struct iproto_connection *con)
 }
 
 static inline void
+iproto_connection_shutdown(struct iproto_connection *con)
+{
+	ev_io_stop(con->loop, &con->input);
+	ev_io_stop(con->loop, &con->output);
+	con->input.fd = con->output.fd = -1;
+	/*
+	 * Discard unparsed data, to recycle the con
+	 * as soon as all parsed data is processed.
+	 */
+	con->iobuf[0]->in.end -= con->parse_size;
+
+	iproto_connection_try_delete(con);
+}
+
+static inline void
 iproto_connection_close(struct iproto_connection *con)
 {
 	int fd = con->input.fd;
 	iproto_connection_shutdown(con);
 	close(fd);
+}
+
+struct iproto_response_queue {
+	struct rlist queue;
+	struct ev_async watcher;
+};
+
+static struct iproto_response_queue iproto_response_queue;
+
+static void
+iproto_response_push(struct iproto_request *req)
+{
+	bool empty = rlist_empty(&iproto_response_queue.queue);
+	rlist_add_tail_entry(&iproto_response_queue.queue, req, link);
+	if (!empty)
+		return;
+	ev_invoke(loop(), &iproto_response_queue.watcher, EV_CUSTOM);
+}
+
+static void
+iproto_response_schedule(ev_loop * /* loop */, struct ev_async * /* watcher */,
+			 int /* events */)
+{
+	struct iproto_request *req;
+	while (!rlist_empty(&iproto_response_queue.queue)) {
+		req = rlist_shift_entry(&iproto_response_queue.queue,
+			struct iproto_request, link);
+		IprotoRequestGuard guard(req);
+		struct iproto_connection *con = req->connection;
+		switch (req->type) {
+		case iproto_request_shutdown:
+			iobuf_delete(con->iobuf[0]);
+			iobuf_delete(con->iobuf[1]);
+			mempool_free(&iproto_connection_pool, con);
+			break;
+		case iproto_request_connect:
+			if (!req->result) {
+				try {
+					iproto_flush(req->iobuf, con->output.fd,
+						     &con->write_pos);
+				} catch (Exception *e) {
+					e->log();
+				}
+				iproto_connection_close(con);
+				break;
+			} else {
+				/* Handshake OK, start reading input. */
+				ev_feed_event(con->loop, &con->input, EV_READ);
+			}
+		case iproto_request_user:
+			if (evio_is_active(&con->output)) {
+				if (! ev_is_active(&con->output))
+					ev_feed_event(con->loop,
+						&con->output,
+						EV_WRITE);
+			} else {
+				iproto_connection_try_delete(con);
+			}
+			break;
+		}
+	}
 }
 
 /**
@@ -471,7 +554,8 @@ iproto_enqueue_batch(struct iproto_connection *con, struct ibuf *in)
 		if (reqend > in->end)
 			break;
 		struct iproto_request *ireq =
-			iproto_request_new(con, iproto_process);
+			iproto_request_new(con, iproto_process,
+					   iproto_request_user);
 		IprotoRequestGuard guard(ireq);
 
 		xrow_header_decode(&ireq->header, &pos, reqend);
@@ -639,15 +723,6 @@ iproto_process(struct iproto_request *ireq)
 	auto scope_guard = make_scoped_guard([=]{
 		/* Discard request (see iproto_enqueue_batch()) */
 		iobuf->in.pos += ireq->total_len;
-
-		if (evio_is_active(&con->output)) {
-			if (! ev_is_active(&con->output))
-				ev_feed_event(con->loop,
-					      &con->output,
-					      EV_WRITE);
-		} else if (iproto_connection_is_idle(con)) {
-			iproto_connection_delete(con);
-		}
 	});
 
 	if (unlikely(! evio_is_active(&con->output)))
@@ -715,7 +790,7 @@ iproto_process(struct iproto_request *ireq)
 
 static struct iproto_request *
 iproto_request_new(struct iproto_connection *con,
-		   iproto_request_f process)
+		   iproto_request_f process, uint8_t type)
 {
 	struct iproto_request *ireq =
 		(struct iproto_request *) mempool_alloc(&iproto_request_pool);
@@ -723,6 +798,8 @@ iproto_request_new(struct iproto_connection *con,
 	ireq->iobuf = con->iobuf[0];
 	ireq->session = con->session;
 	ireq->process = process;
+	ireq->type = type;
+	ireq->result = false;
 	return ireq;
 }
 
@@ -752,32 +829,15 @@ iproto_process_connect(struct iproto_request *request)
 	int fd = con->input.fd;
 	try {              /* connect. */
 		con->session = session_create(fd, con->cookie);
-		coio_write(&con->input, iproto_greeting(con->session->salt),
+		obuf_dup(&iobuf->out, iproto_greeting(con->session->salt),
 			   IPROTO_GREETING_SIZE);
 		if (! rlist_empty(&session_on_connect))
 			session_run_on_connect_triggers(con->session);
-	} catch (SocketError *e) {
-		e->log();
-		iproto_connection_close(con);
-		return;
+		request->result = true;
 	} catch (Exception *e) {
 		iproto_reply_error(&iobuf->out, e, request->header.type);
-		try {
-			iproto_flush(iobuf, fd, &con->write_pos);
-		} catch (Exception *e) {
-			e->log();
-		}
-		iproto_connection_close(con);
 		return;
 	}
-	/*
-	 * Connect is synchronous, so no one could have been
-	 * messing up with the connection while it was in
-	 * progress.
-	 */
-	assert(evio_is_active(&con->input));
-	/* Handshake OK, start reading input. */
-	ev_feed_event(con->loop, &con->input, EV_READ);
 }
 
 static void
@@ -809,7 +869,8 @@ iproto_on_accept(struct evio_service * /* service */, int fd,
 	 * use, all stored in just a few blocks of the memory pool.
 	 */
 	struct iproto_request *ireq =
-		iproto_request_new(con, iproto_process_connect);
+		iproto_request_new(con, iproto_process_connect,
+				   iproto_request_connect);
 	iproto_queue_push(&request_queue, ireq);
 }
 
@@ -828,6 +889,8 @@ iproto_init(struct evio_service *service)
 	iproto_queue_init(&request_queue);
 	mempool_create(&iproto_connection_pool, &cord()->slabc,
 		       sizeof(struct iproto_connection));
+	rlist_create(&iproto_response_queue.queue);
+        ev_async_init(&iproto_response_queue.watcher, iproto_response_schedule);
 
 	evio_service_init(loop(), service, "binary",
 			  iproto_on_accept, NULL);
