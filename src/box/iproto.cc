@@ -50,6 +50,7 @@
 #include "lua/call.h"
 
 static struct mempool iproto_obuf_pool;
+#define IPROTO_TRACE say_info("%s:%d", __PRETTY_FUNCTION__, __LINE__);
 
 /* {{{ iproto_request - declaration */
 
@@ -81,10 +82,43 @@ struct iproto_request
 	size_t total_len;
 
 	/* fields for proceed request result in IPROTO context */
+	struct obuf_svp response_pos;
 	uint8_t type;
 	bool result;
-	rlist link;
+	STAILQ_ENTRY(iproto_request) fifo;
 };
+STAILQ_HEAD(iproto_fifo, iproto_request);
+
+static struct iproto_state_ {
+	struct cord cord;
+	pthread_cond_t cond;
+	pthread_mutex_t mutex;
+	ev_async txn_event;
+	ev_async iproto_event;
+
+	struct ev_loop* txn_loop;
+	struct ev_loop* iproto_loop;
+
+	struct iproto_fifo txn_queue;
+	struct iproto_fifo txn_input;
+	struct iproto_fifo iproto_queue;
+	struct iproto_fifo iproto_input;
+
+	struct rlist fiber_cache;
+} iproto_state;
+
+#define SWITCH_TO_TXN { \
+	++ireq->iobuf->ref_count; \
+	tt_pthread_mutex_lock(&iproto_state.mutex); \
+	bool was_empty = STAILQ_EMPTY(&iproto_state.txn_queue); \
+	STAILQ_INSERT_TAIL(&iproto_state.txn_queue, ireq, fifo); \
+	if (was_empty) \
+		ev_async_send(iproto_state.txn_loop, \
+			      &iproto_state.txn_event); \
+	tt_pthread_mutex_unlock(&iproto_state.mutex); }
+
+static void*
+iproto_thread(void *worker_args);
 
 struct mempool iproto_request_pool;
 
@@ -101,9 +135,6 @@ iproto_process_disconnect(struct iproto_request *request);
 static void
 iproto_process(struct iproto_request *request);
 
-static void
-iproto_response_push(struct iproto_request *req);
-
 struct IprotoRequestGuard {
 	struct iproto_request *ireq;
 	IprotoRequestGuard(struct iproto_request *ireq_arg):ireq(ireq_arg) {}
@@ -117,142 +148,51 @@ struct IprotoRequestGuard {
 
 /* {{{ iproto_queue */
 
-struct iproto_request;
-
-enum { IPROTO_REQUEST_QUEUE_SIZE = 2048, };
-
-/**
- * Implementation of an input queue of the box request processor.
- *
- * Event handlers read data, determine request boundaries
- * and enqueue requests. Once all input/output events are
- * processed, an own handler is invoked to deal with the
- * requests in the queue. It leases a fiber from a pool
- * and runs the request in the fiber.
- *
- * @sa iproto_queue_schedule
- */
-struct iproto_queue
-{
-	/** Ring buffer of fixed size */
-	struct iproto_request *queue[IPROTO_REQUEST_QUEUE_SIZE];
-	/**
-	 * Cache of fibers which work on requests
-	 * in this queue.
-	 */
-	struct rlist fiber_cache;
-	/**
-	 * Used to trigger request processing when
-	 * the queue becomes non-empty.
-	 */
-	struct ev_async watcher;
-	/* Ring buffer position. */
-	int begin, end;
-	/* Ring buffer size. */
-	int size;
-};
-
-static inline bool
-iproto_queue_is_empty(struct iproto_queue *i_queue)
-{
-	return i_queue->begin == i_queue->end;
-}
-
-/**
- * A single global queue for all requests in all connections. All
- * requests are processed concurrently.
- * Is also used as a queue for just established connections and to
- * execute disconnect triggers. A few notes about these triggers:
- * - they need to be run in a fiber
- * - unlike an ordinary request failure, on_connect trigger
- *   failure must lead to connection close.
- * - on_connect trigger must be processed before any other
- *   request on this connection.
- */
-static struct iproto_queue request_queue;
-
-static void
-iproto_queue_push(struct iproto_queue *i_queue,
-		  struct iproto_request *request)
-{
-	/* If the queue is full, invoke the handler to work it off. */
-	if (i_queue->end == i_queue->size)
-		ev_invoke(loop(), &i_queue->watcher, EV_CUSTOM);
-	assert(i_queue->end < i_queue->size);
-	/*
-	 * There were some queued requests, ensure they are
-	 * handled.
-	 */
-	if (iproto_queue_is_empty(i_queue))
-		ev_feed_event(loop(), &i_queue->watcher, EV_CUSTOM);
-	i_queue->queue[i_queue->end++] = request;
-}
-
-static struct iproto_request *
-iproto_queue_pop(struct iproto_queue *i_queue)
-{
-	if (i_queue->begin == i_queue->end)
-		return NULL;
-	struct iproto_request *request = i_queue->queue[i_queue->begin++];
-	if (i_queue->begin == i_queue->end)
-		i_queue->begin = i_queue->end = 0;
-	return request;
-}
-
 /**
  * Main function of the fiber invoked to handle all outstanding
  * tasks in a queue.
  */
 static void
-iproto_queue_handler(va_list ap)
+iproto_queue_handler(va_list /* ap */)
 {
-	struct iproto_queue *i_queue = va_arg(ap, struct iproto_queue *);
-	struct iproto_request *request;
 restart:
-	while ((request = iproto_queue_pop(i_queue))) {
-		auto scope_guard = make_scoped_guard([=]{
-			iproto_response_push(request);
-		});
-		fiber_set_session(fiber(), request->session);
-		fiber_set_user(fiber(), &request->session->credentials);
-		request->process(request);
-	}
+	struct iproto_request *ireq = STAILQ_FIRST(&iproto_state.txn_input);
+	STAILQ_REMOVE_HEAD(&iproto_state.txn_input, fifo);
+	fiber_set_session(fiber(), ireq->session);
+	fiber_set_user(fiber(), &ireq->session->credentials);
+	ireq->process(ireq);
+	ireq->response_pos = obuf_create_svp(&ireq->iobuf->out);
+	tt_pthread_mutex_lock(&iproto_state.mutex);
+	bool was_empty = STAILQ_EMPTY(&iproto_state.iproto_queue);
+	STAILQ_INSERT_TAIL(&iproto_state.iproto_queue, ireq, fifo);
+	if (was_empty)
+		ev_async_send(iproto_state.iproto_loop,
+				&iproto_state.iproto_event);
+	tt_pthread_mutex_unlock(&iproto_state.mutex);
+
 	/** Put the current fiber into a queue fiber cache. */
-	rlist_add_entry(&i_queue->fiber_cache, fiber(), state);
+	rlist_add_entry(&iproto_state.fiber_cache, fiber(), state);
 	fiber_yield();
 	goto restart;
 }
 
 /** Create fibers to handle all outstanding tasks. */
 static void
-iproto_queue_schedule(ev_loop * /* loop */, struct ev_async *watcher,
+iproto_queue_schedule(ev_loop * /* loop */, struct ev_async * /* watcher */,
 		      int /* events */)
 {
-	struct iproto_queue *i_queue = (struct iproto_queue *) watcher->data;
-	while (! iproto_queue_is_empty(i_queue)) {
-
-		struct fiber *f;
-		if (! rlist_empty(&i_queue->fiber_cache))
-			f = rlist_shift_entry(&i_queue->fiber_cache,
+	tt_pthread_mutex_lock(&iproto_state.mutex);
+	STAILQ_CONCAT(&iproto_state.txn_input, &iproto_state.txn_queue);
+	tt_pthread_mutex_unlock(&iproto_state.mutex);
+	struct fiber *f;
+	while (!STAILQ_EMPTY(&iproto_state.txn_input)) {
+		if (! rlist_empty(&iproto_state.fiber_cache))
+			f = rlist_shift_entry(&iproto_state.fiber_cache,
 					      struct fiber, state);
 		else
 			f = fiber_new("iproto", iproto_queue_handler);
-		fiber_call(f, i_queue);
+		fiber_call(f);
 	}
-}
-
-static inline void
-iproto_queue_init(struct iproto_queue *i_queue)
-{
-	i_queue->size = IPROTO_REQUEST_QUEUE_SIZE;
-	i_queue->begin = i_queue->end = 0;
-	/**
-	 * Initialize an ev_async event which would start
-	 * workers for all outstanding tasks.
-	 */
-	ev_async_init(&i_queue->watcher, iproto_queue_schedule);
-	i_queue->watcher.data = i_queue;
-	rlist_create(&i_queue->fiber_cache);
 }
 
 /* }}} */
@@ -379,7 +319,7 @@ iproto_connection_try_delete(struct iproto_connection *con)
 	if (iproto_connection_is_idle(con)) {
 		struct iproto_request *ireq = con->disconnect;
 		con->disconnect = NULL;
-		iproto_queue_push(&request_queue, ireq);
+		SWITCH_TO_TXN
 	}
 }
 
@@ -406,34 +346,25 @@ iproto_connection_close(struct iproto_connection *con)
 	close(fd);
 }
 
-struct iproto_response_queue {
-	struct rlist queue;
-	struct ev_async watcher;
-};
-
-static struct iproto_response_queue iproto_response_queue;
-
-static void
-iproto_response_push(struct iproto_request *req)
-{
-	bool empty = rlist_empty(&iproto_response_queue.queue);
-	rlist_add_tail_entry(&iproto_response_queue.queue, req, link);
-	if (!empty)
-		return;
-	ev_feed_event(loop(), &iproto_response_queue.watcher, EV_CUSTOM);
-}
-
 static void
 iproto_response_schedule(ev_loop * /* loop */, struct ev_async * /* watcher */,
 			 int /* events */)
 {
-	struct iproto_request *req;
-	while (!rlist_empty(&iproto_response_queue.queue)) {
-		req = rlist_shift_entry(&iproto_response_queue.queue,
-			struct iproto_request, link);
-		IprotoRequestGuard guard(req);
-		struct iproto_connection *con = req->connection;
-		switch (req->type) {
+	tt_pthread_mutex_lock(&iproto_state.mutex);
+	STAILQ_CONCAT(&iproto_state.iproto_input, &iproto_state.iproto_queue);
+	tt_pthread_mutex_unlock(&iproto_state.mutex);
+	struct iproto_request *ireq = NULL;
+	while (!STAILQ_EMPTY(&iproto_state.iproto_input)) {
+		ireq = STAILQ_FIRST(&iproto_state.iproto_input);
+		STAILQ_REMOVE_HEAD(&iproto_state.iproto_input, fifo);
+		IprotoRequestGuard guard(ireq);
+		struct iproto_connection *con = ireq->connection;
+		--ireq->iobuf->ref_count;
+		assert(ireq->iobuf->out_pos.pos <= ireq->response_pos.pos ||
+			ireq->iobuf->out_pos.iov_len <= ireq->response_pos.iov_len);
+		assert(ireq->response_pos.pos <= ireq->iobuf->out.pos);
+		ireq->iobuf->out_pos = ireq->response_pos;
+		switch (ireq->type) {
 		case iproto_request_shutdown:
 			iobuf_ibuf_delete(con->iobuf[0]);
 			iobuf_ibuf_delete(con->iobuf[1]);
@@ -442,9 +373,9 @@ iproto_response_schedule(ev_loop * /* loop */, struct ev_async * /* watcher */,
 			mempool_free(&iproto_connection_pool, con);
 			break;
 		case iproto_request_connect:
-			if (!req->result) {
+			if (!ireq->result) {
 				try {
-					iproto_flush(req->iobuf, con->output.fd,
+					iproto_flush(ireq->iobuf, con->output.fd,
 						     &con->write_pos);
 				} catch (Exception *e) {
 					e->log();
@@ -456,7 +387,14 @@ iproto_response_schedule(ev_loop * /* loop */, struct ev_async * /* watcher */,
 				ev_feed_event(con->loop, &con->input, EV_READ);
 			}
 		case iproto_request_user:
-			req->iobuf->in.pos += req->total_len;
+			if (ireq->header.type == IPROTO_JOIN ||
+				ireq->header.type == IPROTO_SUBSCRIBE)
+			{
+				/* TODO: check requests in `con' queue */
+				iproto_connection_shutdown(con);
+				break;
+			}
+			ireq->iobuf->in.pos += ireq->total_len;
 			if (evio_is_active(&con->output)) {
 				if (! ev_is_active(&con->output))
 					ev_feed_event(con->loop,
@@ -587,7 +525,15 @@ iproto_enqueue_batch(struct iproto_connection *con, struct ibuf *in)
 				       ireq->header.body[0].iov_len);
 		}
 		ireq->request.header = &ireq->header;
-		iproto_queue_push(&request_queue, guard.release());
+		ireq = guard.release();
+		switch (ireq->header.type) {
+		case IPROTO_JOIN:
+		case IPROTO_SUBSCRIBE:
+			ev_io_stop(con->loop, &con->input);
+			ev_io_stop(con->loop, &con->output);
+			break;
+		}
+		SWITCH_TO_TXN
 		/* Request will be discarded in iproto_process_XXX */
 
 		/* Request is parsed */
@@ -646,8 +592,10 @@ iproto_connection_on_input(ev_loop *loop, struct ev_io *watcher,
 static inline struct iobuf *
 iproto_connection_output_iobuf(struct iproto_connection *con)
 {
-	if (obuf_size(&con->iobuf[1]->out))
+	if (con->iobuf[1]->out_pos.size > con->write_pos.size)
 		return con->iobuf[1];
+	else if (con->iobuf[1]->ref_count > 0)
+		return NULL;
 	/*
 	 * Don't try to write from a newer buffer if an older one
 	 * exists: in case of a partial write of a newer buffer,
@@ -655,7 +603,7 @@ iproto_connection_output_iobuf(struct iproto_connection *con)
 	 * pieces of replies from both buffers.
 	 */
 	if (ibuf_size(&con->iobuf[1]->in) == 0 &&
-	    obuf_size(&con->iobuf[0]->out))
+	    con->iobuf[0]->out_pos.size > con->write_pos.size)
 		return con->iobuf[0];
 	return NULL;
 }
@@ -665,28 +613,35 @@ static int
 iproto_flush(struct iobuf *iobuf, int fd, struct obuf_svp *svp)
 {
 	/* Begin writing from the saved position. */
-	struct iovec *iov = iobuf->out.iov + svp->pos;
-	int iovcnt = obuf_iovcnt(&iobuf->out) - svp->pos;
-	assert(iovcnt);
+	struct iovec iov[IOBUF_IOV_MAX];
+	int iovcnt = iobuf->out_pos.pos - svp->pos + 1;
+	assert(iovcnt > 0);
 	ssize_t nwr;
-	try {
-		sio_add_to_iov(iov, -svp->iov_len);
-		nwr = sio_writev(fd, iov, iovcnt);
-
-		sio_add_to_iov(iov, svp->iov_len);
-	} catch (SocketError *) {
-		sio_add_to_iov(iov, svp->iov_len);
-		throw;
+	if (svp->pos == iobuf->out_pos.pos) {
+		iov[0].iov_base = (char *) iobuf->out.iov[iobuf->out_pos.pos].iov_base + svp->iov_len;
+		iov[0].iov_len = iobuf->out_pos.iov_len - svp->iov_len;
+	} else {
+		iov[0].iov_base = (char *) iobuf->out.iov[svp->pos].iov_base + svp->iov_len;
+		iov[0].iov_len = iobuf->out.iov[svp->pos].iov_len - svp->iov_len;
+		iov[iovcnt - 1].iov_base = iobuf->out.iov[iobuf->out_pos.pos].iov_base;
+		iov[iovcnt - 1].iov_len = iobuf->out_pos.iov_len;
+		for (int i = 1; i < (iovcnt - 1); ++i) {
+			iov[i].iov_base = iobuf->out.iov[svp->pos + i].iov_base;
+			iov[i].iov_len = iobuf->out.iov[svp->pos + i].iov_len;
+		}
 	}
-
+	nwr = sio_writev(fd, iov, iovcnt);
 	if (nwr > 0) {
-		if (svp->size + nwr == obuf_size(&iobuf->out)) {
+		svp->size += nwr;
+		if (iobuf->ref_count == 0 &&
+			svp->size == obuf_size(&iobuf->out))
+		{
 			iobuf_reset(iobuf);
 			*svp = obuf_create_svp(&iobuf->out);
 			return 0;
 		}
-		svp->size += nwr;
-		svp->pos += sio_move_iov(iov, nwr, &svp->iov_len);
+		sio_move_iov(iobuf, svp, nwr);
+		assert(svp->pos <= iobuf->out.pos);
 	}
 	return -1;
 }
@@ -724,8 +679,7 @@ iproto_connection_on_output(ev_loop *loop, struct ev_io *watcher,
 static void
 iproto_process(struct iproto_request *ireq)
 {
-	struct iobuf *iobuf = ireq->iobuf;
-	struct obuf *out = &iobuf->out;
+	struct obuf *out = &ireq->iobuf->out;
 	struct iproto_connection *con = ireq->connection;
 
 	if (unlikely(! evio_is_active(&con->output)))
@@ -747,12 +701,12 @@ iproto_process(struct iproto_request *ireq)
 		case IPROTO_CALL:
 			assert(ireq->request.type == ireq->header.type);
 			stat_collect(stat_base, ireq->request.type, 1);
-			box_lua_call(&ireq->request, &iobuf->out);
+			box_lua_call(&ireq->request, out);
 			break;
 		case IPROTO_EVAL:
 			assert(ireq->request.type == ireq->header.type);
 			stat_collect(stat_base, ireq->request.type, 1);
-			box_lua_eval(&ireq->request, &iobuf->out);
+			box_lua_eval(&ireq->request, out);
 			break;
 		case IPROTO_AUTH:
 		{
@@ -761,33 +715,25 @@ iproto_process(struct iproto_request *ireq)
 			uint32_t len = mp_decode_strl(&user);
 			authenticate(user, len, ireq->request.tuple,
 				     ireq->request.tuple_end);
-			iproto_reply_ok(&ireq->iobuf->out, ireq->header.sync);
+			iproto_reply_ok(out, ireq->header.sync);
 			break;
 		}
 		case IPROTO_PING:
-			iproto_reply_ok(&ireq->iobuf->out, ireq->header.sync);
+			iproto_reply_ok(out, ireq->header.sync);
 			break;
 		case IPROTO_JOIN:
-			ev_io_stop(con->loop, &con->input);
-			ev_io_stop(con->loop, &con->output);
 			box_process_join(con->input.fd, &ireq->header);
-			/* TODO: check requests in `con' queue */
-			iproto_connection_shutdown(con);
 			return;
 		case IPROTO_SUBSCRIBE:
-			ev_io_stop(con->loop, &con->input);
-			ev_io_stop(con->loop, &con->output);
 			box_process_subscribe(con->input.fd, &ireq->header);
-			/* TODO: check requests in `con' queue */
-			iproto_connection_shutdown(con);
 			return;
 		default:
 			tnt_raise(ClientError, ER_UNKNOWN_REQUEST_TYPE,
 				   (uint32_t) ireq->header.type);
 		}
 	} catch (Exception *e) {
-		obuf_rollback_to_svp(&iobuf->out, &svp);
-		iproto_reply_error(&iobuf->out, e, ireq->header.sync);
+		obuf_rollback_to_svp(out, &svp);
+		iproto_reply_error(out, e, ireq->header.sync);
 	}
 }
 
@@ -889,7 +835,7 @@ iproto_on_accept(struct evio_service * /* service */, int fd,
 		iproto_request_new(con, iproto_process_connect,
 				   iproto_request_connect);
 	ireq->total_len = 0;
-	iproto_queue_push(&request_queue, ireq);
+	SWITCH_TO_TXN
 }
 
 static void on_bind(void *arg __attribute__((unused)))
@@ -906,23 +852,63 @@ iproto_init(const char *uri)
 	if (!uri)
 		return;
 
+	ev_async_init(&iproto_state.txn_event, iproto_queue_schedule);
+	ev_async_init(&iproto_state.iproto_event, iproto_response_schedule);
+	mempool_create(&iproto_obuf_pool, &cord()->slabc,
+			sizeof(struct region));
+	rlist_create(&iproto_state.fiber_cache);
+	STAILQ_INIT(&iproto_state.txn_queue);
+	STAILQ_INIT(&iproto_state.txn_input);
+	STAILQ_INIT(&iproto_state.iproto_queue);
+	STAILQ_INIT(&iproto_state.iproto_input);
+	iproto_state.txn_loop = loop();
+	ev_async_start(iproto_state.txn_loop, &iproto_state.txn_event);
+
+	pthread_mutexattr_t errorcheck;
+	(void) tt_pthread_mutexattr_init(&errorcheck);
+#ifndef NDEBUG
+	(void) tt_pthread_mutexattr_settype(&errorcheck, PTHREAD_MUTEX_ERRORCHECK);
+#endif
+	/* Initialize queue lock mutex. */
+	(void) tt_pthread_mutex_init(&iproto_state.mutex, &errorcheck);
+	(void) tt_pthread_mutexattr_destroy(&errorcheck);
+	(void) tt_pthread_cond_init(&iproto_state.cond, NULL);
+
+	tt_pthread_mutex_lock(&iproto_state.mutex);
+	if (cord_start(&iproto_state.cord, "iproto", iproto_thread, (void *)uri))
+		tnt_raise(ClientError, ER_CFG, "cant create iproto thread");
+	tt_pthread_cond_wait(&iproto_state.cond, &iproto_state.mutex);
+	tt_pthread_mutex_unlock(&iproto_state.mutex);
+	on_bind(NULL);
+}
+
+static void*
+iproto_thread(void *worker_args)
+{
+	const char *uri = (const char *) worker_args;
+	tt_pthread_mutex_lock(&iproto_state.mutex);
+	iobuf_init();
 	static struct evio_service primary;
 	evio_service_init(loop(), &primary, "primary",
-			  uri,
-			  iproto_on_accept, NULL);
-	evio_service_on_bind(&primary, on_bind, NULL);
+			  uri, iproto_on_accept, NULL);
 	evio_service_start(&primary);
-
-	rlist_create(&iproto_response_queue.queue);
-	ev_async_init(&iproto_response_queue.watcher, iproto_response_schedule);
-
+	iproto_state.iproto_loop = loop();
 	mempool_create(&iproto_request_pool, &cord()->slabc,
-		       sizeof(struct iproto_request));
-	iproto_queue_init(&request_queue);
+			sizeof(struct iproto_request));
 	mempool_create(&iproto_connection_pool, &cord()->slabc,
-		       sizeof(struct iproto_connection));
-	mempool_create(&iproto_obuf_pool, &cord()->slabc,
-		       sizeof(struct region));
+			sizeof(struct iproto_connection));
+	ev_async_start(iproto_state.iproto_loop, &iproto_state.iproto_event);
+	tt_pthread_cond_signal(&iproto_state.cond);
+	tt_pthread_mutex_unlock(&iproto_state.mutex);
+	try {
+		ev_run(iproto_state.iproto_loop, 0);
+	} catch (...) {
+		say_crit("iproto_thread found unhandled exception");
+		throw;
+	}
+	ev_async_stop(iproto_state.iproto_loop, &iproto_state.iproto_event);
+	say_info("iproto stopped");
+	return NULL;
 }
 
 /* vim: set foldmethod=marker */
