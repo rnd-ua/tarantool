@@ -111,6 +111,7 @@ obuf_init_pos(struct obuf *buf, size_t pos)
 static inline void
 obuf_alloc_pos(struct obuf *buf, size_t pos, size_t size)
 {
+	assert(buf->capacity[pos] == 0);
 	size_t capacity = pos > 0 ?  buf->capacity[pos-1] * 2 : buf->alloc_factor;
 	while (capacity < size) {
 		capacity *=2;
@@ -197,6 +198,7 @@ obuf_dup(struct obuf *buf, const void *data, size_t size)
 		}
 		assert(capacity == iov->iov_len);
 		buf->pos++;
+		assert(buf->pos < IOBUF_IOV_MAX);
 		iov = &buf->iov[buf->pos];
 		capacity = buf->capacity[buf->pos];
 	}
@@ -214,10 +216,12 @@ obuf_ensure_resize(struct obuf *buf, size_t size)
 	if (iov->iov_len > 0) {
 		/* Move to the next buffer. */
 		buf->pos++;
+		assert(buf->pos < IOBUF_IOV_MAX);
 		iov = &buf->iov[buf->pos];
 		capacity = buf->capacity[buf->pos];
 	}
 	/* Make sure the next buffer can store size.  */
+	assert(iov->iov_len == 0);
 	if (capacity == 0) {
 		obuf_init_pos(buf, buf->pos + 1);
 		obuf_alloc_pos(buf, buf->pos, size);
@@ -306,6 +310,7 @@ iobuf_alloc(const char *name)
 	/* When releasing the buffer, we trim it to iobuf_max_pool_size. */
 	assert(region_used(&iobuf->pool) <= iobuf_max_pool_size());
 	region_set_name(&iobuf->pool, name);
+	iobuf->ref_count = 0;
 	return iobuf;
 }
 
@@ -319,6 +324,7 @@ void
 iobuf_obuf_init(struct iobuf *iobuf, struct region *pool)
 {
 	obuf_create(&iobuf->out, pool, iobuf_readahead);
+	iobuf->out_pos = obuf_create_svp(&iobuf->out);
 }
 
 
@@ -333,6 +339,7 @@ iobuf_obuf_delete(struct iobuf *iobuf)
 		region_free(pool);
 		obuf_create(&iobuf->out, pool, iobuf_readahead);
 	}
+	iobuf->out_pos = obuf_create_svp(&iobuf->out);
 	region_set_name(pool, "obuf_cache");
 }
 
@@ -397,6 +404,7 @@ iobuf_reset(struct iobuf *iobuf)
 		ibuf_reset(&iobuf->in);
 	/* Cheap to do even if already done. */
 	obuf_reset(&iobuf->out);
+	iobuf->out_pos = obuf_create_svp(&iobuf->out);
 }
 
 void

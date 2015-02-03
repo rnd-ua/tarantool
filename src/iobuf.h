@@ -265,7 +265,9 @@ struct iobuf
 	struct ibuf in;
 	/** Output buffer. */
 	struct obuf out;
+	struct obuf_svp out_pos;
 	struct region pool;
+	size_t ref_count;
 };
 
 /** Create an instance of input/output buffer. */
@@ -315,7 +317,8 @@ iobuf_reset(struct iobuf *iobuf);
 static inline bool
 iobuf_is_idle(struct iobuf *iobuf)
 {
-	return ibuf_size(&iobuf->in) == 0 && obuf_size(&iobuf->out) == 0;
+	return ibuf_size(&iobuf->in) == 0 && iobuf->ref_count == 0 &&
+		obuf_size(&iobuf->out) == 0;
 }
 
 void

@@ -40,6 +40,7 @@
 #include <fcntl.h>
 #include "exception.h"
 #include <tarantool_ev.h>
+#include "iobuf.h"
 
 enum { SERVICE_NAME_MAXLEN = 32 };
 
@@ -156,17 +157,30 @@ const char *sio_strfaddr(struct sockaddr *addr, socklen_t addrlen);
  *
  * @return                offset of iov[0] for the next write
  */
+static inline void
+sio_move_iov(struct iobuf *iobuf, struct obuf_svp *svp, ssize_t nwr)
+{
+	nwr += svp->iov_len;
+	while (svp->pos < iobuf->out_pos.pos &&
+		nwr > iobuf->out.iov[svp->pos].iov_len)
+	{
+		nwr -= iobuf->out.iov[svp->pos++].iov_len;
+	}
+	assert(svp->pos < iobuf->out_pos.pos || nwr <= iobuf->out_pos.iov_len);
+	svp->iov_len = nwr;
+}
+
 static inline int
 sio_move_iov(struct iovec *iov, ssize_t nwr, size_t *iov_len)
 {
-	nwr += *iov_len;
-	struct iovec *begin = iov;
-	while (nwr > 0 && nwr >= iov->iov_len) {
-		nwr -= iov->iov_len;
-		iov++;
-	}
-	*iov_len = nwr;
-	return iov - begin;
+        nwr += *iov_len;
+        struct iovec *begin = iov;
+        while (nwr > 0 && nwr >= iov->iov_len) {
+                nwr -= iov->iov_len;
+                iov++;
+        }
+        *iov_len = nwr;
+        return iov - begin;
 }
 
 /**
