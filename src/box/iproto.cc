@@ -211,6 +211,10 @@ struct iproto_connection
 	 */
 	struct iobuf *iobuf[2];
 	/*
+	 * Copy of out buf for send data
+	 */
+	struct iovec iov[IOBUF_IOV_MAX];
+	/*
 	 * Size of readahead which is not parsed yet, i.e.
 	 * size of a piece of request which is not fully read.
 	 * Is always relative to iobuf[0]->in.end. In other words,
@@ -265,7 +269,7 @@ iproto_connection_on_output(ev_loop * /* loop */, struct ev_io *watcher,
 			    int /* revents */);
 
 static int
-iproto_flush(struct iobuf *iobuf, int fd, struct obuf_svp *svp);
+iproto_flush(struct iobuf *iobuf, struct iproto_connection *con);
 
 static struct iproto_connection *
 iproto_connection_new(const char *name, int fd, struct sockaddr *addr)
@@ -375,8 +379,7 @@ iproto_response_schedule(ev_loop * /* loop */, struct ev_async * /* watcher */,
 		case iproto_request_connect:
 			if (!ireq->result) {
 				try {
-					iproto_flush(ireq->iobuf, con->output.fd,
-						     &con->write_pos);
+					iproto_flush(ireq->iobuf, con);
 				} catch (Exception *e) {
 					e->log();
 				}
@@ -610,38 +613,37 @@ iproto_connection_output_iobuf(struct iproto_connection *con)
 
 /** writev() to the socket and handle the output. */
 static int
-iproto_flush(struct iobuf *iobuf, int fd, struct obuf_svp *svp)
+iproto_flush(struct iobuf *iobuf, struct iproto_connection *con)
 {
 	/* Begin writing from the saved position. */
-	struct iovec iov[IOBUF_IOV_MAX];
-	int iovcnt = iobuf->out_pos.pos - svp->pos + 1;
+	int iovcnt = iobuf->out_pos.pos - con->write_pos.pos + 1;
 	assert(iovcnt > 0);
 	ssize_t nwr;
-	if (svp->pos == iobuf->out_pos.pos) {
-		iov[0].iov_base = (char *) iobuf->out.iov[iobuf->out_pos.pos].iov_base + svp->iov_len;
-		iov[0].iov_len = iobuf->out_pos.iov_len - svp->iov_len;
+	if (con->write_pos.pos == iobuf->out_pos.pos) {
+		con->iov[0].iov_base = (char *) iobuf->out.iov[iobuf->out_pos.pos].iov_base + con->write_pos.iov_len;
+		con->iov[0].iov_len = iobuf->out_pos.iov_len - con->write_pos.iov_len;
 	} else {
-		iov[0].iov_base = (char *) iobuf->out.iov[svp->pos].iov_base + svp->iov_len;
-		iov[0].iov_len = iobuf->out.iov[svp->pos].iov_len - svp->iov_len;
-		iov[iovcnt - 1].iov_base = iobuf->out.iov[iobuf->out_pos.pos].iov_base;
-		iov[iovcnt - 1].iov_len = iobuf->out_pos.iov_len;
+		con->iov[0].iov_base = (char *) iobuf->out.iov[con->write_pos.pos].iov_base + con->write_pos.iov_len;
+		con->iov[0].iov_len = iobuf->out.iov[con->write_pos.pos].iov_len - con->write_pos.iov_len;
+		con->iov[iovcnt - 1].iov_base = iobuf->out.iov[iobuf->out_pos.pos].iov_base;
+		con->iov[iovcnt - 1].iov_len = iobuf->out_pos.iov_len;
 		for (int i = 1; i < (iovcnt - 1); ++i) {
-			iov[i].iov_base = iobuf->out.iov[svp->pos + i].iov_base;
-			iov[i].iov_len = iobuf->out.iov[svp->pos + i].iov_len;
+			con->iov[i].iov_base = iobuf->out.iov[con->write_pos.pos + i].iov_base;
+			con->iov[i].iov_len = iobuf->out.iov[con->write_pos.pos + i].iov_len;
 		}
 	}
-	nwr = sio_writev(fd, iov, iovcnt);
+	nwr = sio_writev(con->output.fd, con->iov, iovcnt);
 	if (nwr > 0) {
-		svp->size += nwr;
+		con->write_pos.size += nwr;
 		if (iobuf->ref_count == 0 &&
-			svp->size == obuf_size(&iobuf->out))
+			con->write_pos.size == obuf_size(&iobuf->out))
 		{
 			iobuf_reset(iobuf);
-			*svp = obuf_create_svp(&iobuf->out);
+			con->write_pos = obuf_create_svp(&iobuf->out);
 			return 0;
 		}
-		sio_move_iov(iobuf, svp, nwr);
-		assert(svp->pos <= iobuf->out.pos);
+		sio_move_iov(iobuf, &con->write_pos, nwr);
+		assert(con->write_pos.pos <= iobuf->out.pos);
 	}
 	return -1;
 }
@@ -651,13 +653,10 @@ iproto_connection_on_output(ev_loop *loop, struct ev_io *watcher,
 			    int /* revents */)
 {
 	struct iproto_connection *con = (struct iproto_connection *) watcher->data;
-	int fd = con->output.fd;
-	struct obuf_svp *svp = &con->write_pos;
-
 	try {
 		struct iobuf *iobuf;
 		while ((iobuf = iproto_connection_output_iobuf(con))) {
-			if (iproto_flush(iobuf, fd, svp) < 0) {
+			if (iproto_flush(iobuf, con) < 0) {
 				ev_io_start(loop, &con->output);
 				return;
 			}
