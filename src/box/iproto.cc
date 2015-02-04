@@ -50,7 +50,6 @@
 #include "lua/call.h"
 
 static struct mempool iproto_obuf_pool;
-#define IPROTO_MAXBUF 2048
 
 /* {{{ iproto_request - declaration */
 
@@ -85,6 +84,8 @@ struct iproto_request
 	struct obuf_svp response_pos;
 	uint8_t type;
 	bool result;
+	bool is_last;
+	bool finished;
 	STAILQ_ENTRY(iproto_request) fifo;
 };
 STAILQ_HEAD(iproto_fifo, iproto_request);
@@ -240,6 +241,8 @@ struct iproto_connection
 	ev_loop *loop;
 	/* Pre-allocated disconnect request. */
 	struct iproto_request *disconnect;
+	struct iproto_fifo txn_request_batch;
+	struct iproto_fifo iproto_request_batch;
 };
 
 static struct mempool iproto_connection_pool;
@@ -293,6 +296,8 @@ iproto_connection_new(const char *name, int fd, struct sockaddr *addr)
 	/* It may be very awkward to allocate at close. */
 	con->disconnect = iproto_request_new(con, iproto_process_disconnect,
 					     iproto_request_shutdown);
+	STAILQ_INIT(&con->txn_request_batch);
+	STAILQ_INIT(&con->iproto_request_batch);
 	return con;
 }
 
@@ -396,7 +401,7 @@ iproto_response_schedule(ev_loop * /* loop */, struct ev_async * /* watcher */,
 			}
 			ireq->iobuf->in.pos += ireq->total_len;
 			if (evio_is_active(&con->output)) {
-				if (!ev_is_active(&con->output))
+				if (!ev_is_active(&con->output) && ireq->is_last)
 					ev_feed_event(con->loop,
 							&con->output,
 							EV_WRITE);
@@ -524,7 +529,7 @@ iproto_enqueue_batch(struct iproto_connection *con, struct ibuf *in)
 				       ireq->header.body[0].iov_len);
 		}
 		ireq->request.header = &ireq->header;
-		ireq = guard.release();
+		++ireq->iobuf->ref_count;
 		switch (ireq->header.type) {
 		case IPROTO_JOIN:
 		case IPROTO_SUBSCRIBE:
@@ -532,14 +537,31 @@ iproto_enqueue_batch(struct iproto_connection *con, struct ibuf *in)
 			ev_io_stop(con->loop, &con->output);
 			break;
 		}
-		SWITCH_TO_TXN
 		/* Request will be discarded in iproto_process_XXX */
+		ireq = guard.release();
+		STAILQ_INSERT_TAIL(&con->iproto_request_batch, ireq, fifo);
 
 		/* Request is parsed */
 		con->parse_size -= reqend - reqstart;
 		if (con->parse_size == 0)
 			break;
 	}
+}
+
+static void
+iproto_flush_batch(struct iproto_connection *con)
+{
+	if (STAILQ_EMPTY(&con->iproto_request_batch))
+		return;
+	STAILQ_LAST(&con->iproto_request_batch,
+		    iproto_request, fifo)->is_last = true;
+	tt_pthread_mutex_lock(&iproto_state.mutex);
+	bool was_empty = STAILQ_EMPTY(&iproto_state.txn_queue);
+	STAILQ_CONCAT(&iproto_state.txn_queue, &con->iproto_request_batch);
+	if (was_empty)
+		ev_async_send(iproto_state.txn_loop,
+			      &iproto_state.txn_event);
+	tt_pthread_mutex_unlock(&iproto_state.mutex);
 }
 
 static void
@@ -550,7 +572,7 @@ iproto_connection_on_input(ev_loop *loop, struct ev_io *watcher,
 		(struct iproto_connection *) watcher->data;
 	int fd = con->input.fd;
 	assert(fd >= 0);
-
+	auto guard = make_scoped_guard([con](){ iproto_flush_batch(con); });
 	try {
 		/* Ensure we have sufficient space for the next round.  */
 		struct iobuf *iobuf = iproto_connection_input_iobuf(con);
@@ -652,9 +674,6 @@ iproto_connection_on_output(ev_loop *loop, struct ev_io *watcher,
 	try {
 		struct iobuf *iobuf;
 		while ((iobuf = iproto_connection_output_iobuf(con))) {
-			if ((iobuf->out_pos.size - con->write_pos.size) < IPROTO_MAXBUF && iobuf->ref_count > 0) {
-				break;
-			}
 			if (iproto_flush(iobuf, con) < 0) {
 				ev_io_start(loop, &con->output);
 				return;
@@ -672,6 +691,79 @@ iproto_connection_on_output(ev_loop *loop, struct ev_io *watcher,
 
 /* }}} */
 
+/* {{{ iproto_queue */
+
+/**
+ * Main function of the fiber invoked to handle all outstanding
+ * tasks in a queue.
+ */
+static inline void
+iproto_queue_flush(struct iproto_connection *con)
+{
+	tt_pthread_mutex_lock(&iproto_state.mutex);
+	bool was_empty = STAILQ_EMPTY(&iproto_state.iproto_queue);
+	STAILQ_CONCAT(&iproto_state.iproto_queue, &con->txn_request_batch);
+	if (was_empty)
+		ev_async_send(iproto_state.iproto_loop,
+			&iproto_state.iproto_event);
+	tt_pthread_mutex_unlock(&iproto_state.mutex);
+}
+
+static void
+iproto_queue_handler(va_list /* ap */)
+{
+restart:
+	struct iproto_request *ireq = STAILQ_FIRST(&iproto_state.txn_input);
+	STAILQ_REMOVE_HEAD(&iproto_state.txn_input, fifo);
+	fiber_set_session(fiber(), ireq->session);
+	fiber_set_user(fiber(), &ireq->session->credentials);
+	ireq->process(ireq);
+	ireq->finished = true;
+	ireq->response_pos = obuf_create_svp(&ireq->iobuf->out);
+	STAILQ_INSERT_TAIL(&ireq->connection->txn_request_batch, ireq, fifo);
+	if (ireq->is_last)
+		iproto_queue_flush(ireq->connection);
+	/** Put the current fiber into a queue fiber cache. */
+	rlist_add_entry(&iproto_state.fiber_cache, fiber(), state);
+	fiber_yield();
+	goto restart;
+}
+
+/** Create fibers to handle all outstanding tasks. */
+static void
+iproto_queue_schedule(ev_loop * /* loop */, struct ev_async * /* watcher */,
+		      int /* events */)
+{
+	tt_pthread_mutex_lock(&iproto_state.mutex);
+	STAILQ_CONCAT(&iproto_state.txn_input, &iproto_state.txn_queue);
+	tt_pthread_mutex_unlock(&iproto_state.mutex);
+	struct fiber *f;
+	struct iproto_request *ireq;
+	while (!STAILQ_EMPTY(&iproto_state.txn_input)) {
+		ireq = STAILQ_FIRST(&iproto_state.txn_input);
+		if (! rlist_empty(&iproto_state.fiber_cache))
+			f = rlist_shift_entry(&iproto_state.fiber_cache,
+					      struct fiber, state);
+		else
+			f = fiber_new("iproto", iproto_queue_handler);
+		fiber_call(f);
+		if (!ireq->finished) {
+			if (ireq->is_last) {
+				struct iproto_connection *con = ireq->connection;
+				if (STAILQ_EMPTY(&con->txn_request_batch))
+					continue;
+				STAILQ_LAST(&con->txn_request_batch,
+					iproto_request, fifo)->is_last = true;
+				iproto_queue_flush(con);
+			} else {
+				ireq->is_last = true;
+			}
+		}
+	}
+}
+
+/* }}} */
+
 /* {{{ iproto_process_* functions */
 
 static void
@@ -679,9 +771,6 @@ iproto_process(struct iproto_request *ireq)
 {
 	struct obuf *out = &ireq->iobuf->out;
 	struct iproto_connection *con = ireq->connection;
-
-	if (unlikely(! evio_is_active(&con->output)))
-		return;
 
 	struct obuf_svp svp = obuf_create_svp(out);
 	try {
@@ -747,6 +836,8 @@ iproto_request_new(struct iproto_connection *con,
 	ireq->process = process;
 	ireq->type = type;
 	ireq->result = false;
+	ireq->is_last = (type != iproto_request_user);
+	ireq->finished = false;
 	return ireq;
 }
 
