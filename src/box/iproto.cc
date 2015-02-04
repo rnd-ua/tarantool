@@ -50,7 +50,7 @@
 #include "lua/call.h"
 
 static struct mempool iproto_obuf_pool;
-#define IPROTO_TRACE say_info("%s:%d", __PRETTY_FUNCTION__, __LINE__);
+#define IPROTO_MAXBUF 2048
 
 /* {{{ iproto_request - declaration */
 
@@ -364,9 +364,6 @@ iproto_response_schedule(ev_loop * /* loop */, struct ev_async * /* watcher */,
 		IprotoRequestGuard guard(ireq);
 		struct iproto_connection *con = ireq->connection;
 		--ireq->iobuf->ref_count;
-		assert(ireq->iobuf->out_pos.pos <= ireq->response_pos.pos ||
-			ireq->iobuf->out_pos.iov_len <= ireq->response_pos.iov_len);
-		assert(ireq->response_pos.pos <= ireq->iobuf->out.pos);
 		ireq->iobuf->out_pos = ireq->response_pos;
 		switch (ireq->type) {
 		case iproto_request_shutdown:
@@ -399,13 +396,12 @@ iproto_response_schedule(ev_loop * /* loop */, struct ev_async * /* watcher */,
 			}
 			ireq->iobuf->in.pos += ireq->total_len;
 			if (evio_is_active(&con->output)) {
-				if (! ev_is_active(&con->output))
+				if (!ev_is_active(&con->output))
 					ev_feed_event(con->loop,
-						&con->output,
-						EV_WRITE);
-			} else {
+							&con->output,
+							EV_WRITE);
+			} else
 				iproto_connection_try_delete(con);
-			}
 			break;
 		}
 	}
@@ -656,6 +652,9 @@ iproto_connection_on_output(ev_loop *loop, struct ev_io *watcher,
 	try {
 		struct iobuf *iobuf;
 		while ((iobuf = iproto_connection_output_iobuf(con))) {
+			if ((iobuf->out_pos.size - con->write_pos.size) < IPROTO_MAXBUF && iobuf->ref_count > 0) {
+				break;
+			}
 			if (iproto_flush(iobuf, con) < 0) {
 				ev_io_start(loop, &con->output);
 				return;
