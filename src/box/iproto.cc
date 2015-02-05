@@ -629,28 +629,38 @@ iproto_connection_output_iobuf(struct iproto_connection *con)
 	return NULL;
 }
 
+static inline int
+iproto_fill_buffer(struct iproto_connection *con, struct iobuf *iobuf)
+{
+	int iovcnt = iobuf->out_pos.pos - con->write_pos.pos;
+	assert(iovcnt >= 0);
+	struct iovec *loc = con->iov;
+	struct iovec *rem = iobuf->out.iov;
+	struct obuf_svp *from = &con->write_pos;
+	struct obuf_svp *to = &iobuf->out_pos;
+	if (iovcnt) {
+		loc[0].iov_base = (char *)rem[from->pos].iov_base + from->iov_len;
+		loc[0].iov_len = rem[from->pos].iov_len - from->iov_len;
+		loc[1].iov_base = rem[iobuf->out_pos.pos].iov_base;
+		loc[1].iov_len = to->iov_len;
+		for (int i = 1; i < iovcnt; ++i) {
+			loc[i].iov_base = rem[from->pos + i].iov_base;
+			loc[i].iov_len = rem[from->pos + i].iov_len;
+		}
+	} else {
+		loc[0].iov_base = (char *) rem[to->pos].iov_base + from->iov_len;
+		loc[0].iov_len = to->iov_len - from->iov_len;
+	}
+	return iovcnt + 1;
+}
+
 /** writev() to the socket and handle the output. */
 static int
 iproto_flush(struct iobuf *iobuf, struct iproto_connection *con)
 {
 	/* Begin writing from the saved position. */
-	int iovcnt = iobuf->out_pos.pos - con->write_pos.pos + 1;
-	assert(iovcnt > 0);
-	ssize_t nwr;
-	if (con->write_pos.pos == iobuf->out_pos.pos) {
-		con->iov[0].iov_base = (char *) iobuf->out.iov[iobuf->out_pos.pos].iov_base + con->write_pos.iov_len;
-		con->iov[0].iov_len = iobuf->out_pos.iov_len - con->write_pos.iov_len;
-	} else {
-		con->iov[0].iov_base = (char *) iobuf->out.iov[con->write_pos.pos].iov_base + con->write_pos.iov_len;
-		con->iov[0].iov_len = iobuf->out.iov[con->write_pos.pos].iov_len - con->write_pos.iov_len;
-		con->iov[iovcnt - 1].iov_base = iobuf->out.iov[iobuf->out_pos.pos].iov_base;
-		con->iov[iovcnt - 1].iov_len = iobuf->out_pos.iov_len;
-		for (int i = 1; i < (iovcnt - 1); ++i) {
-			con->iov[i].iov_base = iobuf->out.iov[con->write_pos.pos + i].iov_base;
-			con->iov[i].iov_len = iobuf->out.iov[con->write_pos.pos + i].iov_len;
-		}
-	}
-	nwr = sio_writev(con->output.fd, con->iov, iovcnt);
+	int iovcnt = iproto_fill_buffer(con, iobuf);
+	ssize_t nwr = sio_writev(con->output.fd, con->iov, iovcnt);
 	if (nwr > 0) {
 		con->write_pos.size += nwr;
 		if (iobuf->ref_count == 0 &&
@@ -968,7 +978,9 @@ iproto_init(struct evio_service *service)
 		tnt_raise(ClientError, ER_CFG, "cant create iproto thread");
 	tt_pthread_cond_wait(&iproto_state.cond, &iproto_state.mutex);
 	tt_pthread_mutex_unlock(&iproto_state.mutex);
-	on_bind(NULL);
+
+	fiber_call(fiber_new("leave_local_hot_standby",
+			     (fiber_func) box_leave_local_standby_mode));
 }
 
 static void*
