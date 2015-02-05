@@ -68,6 +68,11 @@ enum iproto_request_type {
  * from all clients are queued into a single queue
  * and processed in FIFO order.
  */
+enum iproto_bind_status {
+	iproto_bind_init,
+	iproto_bind_evsend,
+	iproto_bind_finish
+};
 struct iproto_request
 {
 	struct iproto_connection *connection;
@@ -95,7 +100,9 @@ static struct iproto_state_ {
 	pthread_cond_t cond;
 	pthread_mutex_t mutex;
 	ev_async txn_event;
+	ev_async bind_event;
 	ev_async iproto_event;
+	uint8_t bind_status;
 
 	struct ev_loop* txn_loop;
 	struct ev_loop* iproto_loop;
@@ -886,6 +893,26 @@ iproto_on_accept(struct evio_service * /* service */, int fd,
 	SWITCH_TO_TXN
 }
 
+static void
+iproto_bind_done(void *arg __attribute__((unused)))
+{
+	if (iproto_state.bind_status == iproto_bind_evsend) {
+		tt_pthread_mutex_lock(&iproto_state.mutex);
+		ev_async_send(iproto_state.txn_loop, &iproto_state.bind_event);
+		tt_pthread_mutex_unlock(&iproto_state.mutex);
+	} else {
+		iproto_state.bind_status = iproto_bind_finish;
+	}
+}
+
+static void
+iproto_on_bind(ev_loop * /* loop */, struct ev_async * /* watcher */,
+	      int /* events */)
+{
+	fiber_call(fiber_new("leave_local_hot_standby",
+			     (fiber_func) box_leave_local_standby_mode));
+}
+
 /** Initialize a read-write port. */
 void
 iproto_init(const char *uri)
@@ -895,6 +922,7 @@ iproto_init(const char *uri)
 		return;
 
 	ev_async_init(&iproto_state.txn_event, iproto_queue_schedule);
+	ev_async_init(&iproto_state.bind_event, iproto_on_bind);
 	ev_async_init(&iproto_state.iproto_event, iproto_response_schedule);
 	mempool_create(&iproto_obuf_pool, &cord()->slabc,
 			sizeof(struct region));
@@ -905,6 +933,7 @@ iproto_init(const char *uri)
 	STAILQ_INIT(&iproto_state.iproto_input);
 	iproto_state.txn_loop = loop();
 	ev_async_start(iproto_state.txn_loop, &iproto_state.txn_event);
+	iproto_state.bind_status = iproto_bind_init;
 
 	pthread_mutexattr_t errorcheck;
 	(void) tt_pthread_mutexattr_init(&errorcheck);
@@ -920,10 +949,13 @@ iproto_init(const char *uri)
 	if (cord_start(&iproto_state.cord, "iproto", iproto_thread, (void *)uri))
 		tnt_raise(ClientError, ER_CFG, "cant create iproto thread");
 	tt_pthread_cond_wait(&iproto_state.cond, &iproto_state.mutex);
+	if (iproto_state.bind_status == iproto_bind_finish) {
+		iproto_on_bind(NULL, NULL, 0);
+	} else {
+		iproto_state.bind_status = iproto_bind_evsend;
+		ev_async_start(iproto_state.txn_loop, &iproto_state.bind_event);
+	}
 	tt_pthread_mutex_unlock(&iproto_state.mutex);
-
-	fiber_call(fiber_new("leave_local_hot_standby",
-			     (fiber_func) box_leave_local_standby_mode));
 }
 
 static void*
@@ -935,6 +967,7 @@ iproto_thread(void *worker_args)
 	static struct evio_service primary;
 	evio_service_init(loop(), &primary, "primary",
 			  uri, iproto_on_accept, NULL);
+	evio_service_on_bind(&primary, iproto_bind_done, NULL);
 	evio_service_start(&primary);
 	iproto_state.iproto_loop = loop();
 	mempool_create(&iproto_request_pool, &cord()->slabc,
