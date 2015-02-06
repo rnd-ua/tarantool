@@ -57,8 +57,6 @@ box_process_func box_process = process_ro;
 
 struct recovery_state *recovery;
 
-static struct evio_service binary; /* iproto binary listener */
-
 int snapshot_pid = 0; /* snapshot processes pid */
 static void
 process_ro(struct request *request, struct port *port)
@@ -179,14 +177,7 @@ extern "C" void
 box_set_listen(const char *uri)
 {
 	box_check_uri(uri, "listen");
-	if (evio_service_is_active(&binary))
-		evio_service_stop(&binary);
-
-	if (uri != NULL) {
-		evio_service_start(&binary, uri);
-	} else {
-		box_leave_local_standby_mode(NULL);
-	}
+	iproto_set_listen(uri);
 }
 
 extern "C" void
@@ -498,7 +489,7 @@ box_init()
 			      cfg_getd("wal_dir_rescan_delay"));
 	title("hot_standby", NULL);
 
-	iproto_init(&binary);
+	iproto_init();
 	/**
 	 * listen is a dynamic option, so box_set_listen()
 	 * will be called after box_init() as long as there
