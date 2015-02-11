@@ -51,6 +51,7 @@
 #include "cfg.h"
 #include "iobuf.h"
 #include "evio.h"
+#include "bsync.h"
 
 static void process_ro(struct request *request, struct port *port);
 box_process_func box_process = process_ro;
@@ -407,7 +408,7 @@ box_free(void)
 	user_cache_free();
 	schema_free();
 	tuple_free();
-	recovery_delete(recovery);
+	bsync_writer_stop(recovery);
 	recovery = NULL;
 	engine_shutdown();
 	stat_free();

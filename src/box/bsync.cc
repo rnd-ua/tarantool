@@ -1204,7 +1204,7 @@ bsync_shutdown_fiber(va_list /* ap */)
 		bsync_wal_write(row);
 		fiber_gc();
 	}
-	wal_writer_stop(recovery_state);
+	recovery_delete(recovery_state);
 	/* TODO : cancel all active bsync process fibers */
 	evio_service_stop(&bsync_coio.evio_service);
 	ev_break(bsync_loop, 1);
@@ -2010,7 +2010,7 @@ void
 bsync_writer_stop(struct recovery_state *r)
 {BSYNC_TRACE
 	if (wal_local_writer == NULL) {
-		wal_writer_stop(r);
+		recovery_delete(r);
 		return;
 	}
 	recovery_state = r;

@@ -37,7 +37,6 @@
 #include "recovery.h"
 #include "xrow.h"
 #include "msgpuck/msgpuck.h"
-#include "session.h"
 #include "box/bsync.h"
 #include "box/cluster.h"
 #include "iproto_constants.h"

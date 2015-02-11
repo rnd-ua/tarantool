@@ -140,10 +140,8 @@ void recovery_stop_local(struct recovery_state *r);
 
 void recovery_finalize(struct recovery_state *r, int rows_per_wal);
 
-int recover_wal(struct recovery_state *r, struct log_io *l);
 int64_t wal_write_lsn(struct recovery_state *r, struct xrow_header *row);
 int64_t wal_write(struct wal_writer *writer, struct xrow_header *row);
-void wal_writer_stop(struct recovery_state *r);
 
 void recovery_setup_panic(struct recovery_state *r, bool on_snap_error, bool on_wal_error);
 void recovery_apply_row(struct recovery_state *r, struct xrow_header *packet);
