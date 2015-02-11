@@ -211,7 +211,6 @@ request_set_uint(void *data, uint8_t key, uint32_t v)
 		break;
 	case IPROTO_ITERATOR:
 		((struct request *)data)->iterator = v;
-	default:
 		break;
 	}
 }
@@ -229,7 +228,6 @@ request_set_char(void *data, uint8_t key, const char *v, const char *v_end)
 	case IPROTO_USER_NAME:
 		((struct request *)data)->key = v;
 		((struct request *)data)->key_end = v_end;
-	default:
 		break;
 	}
 }
@@ -241,7 +239,7 @@ request_decode_cb(const char *data, uint32_t len, uint32_t type,
 	const char *end = data + len;
 	uint64_t key_map = iproto_body_key_map[type];
 	if (mp_typeof(*data) != MP_MAP || mp_check_map(data, end) > 0) {
-//error:
+error:
 		tnt_raise(ClientError, ER_INVALID_MSGPACK, "packet body");
 	}
 	uint32_t size = mp_decode_map(&data);
@@ -255,9 +253,9 @@ request_decode_cb(const char *data, uint32_t len, uint32_t type,
 		key_map &= ~iproto_key_bit(key);
 		const char *value = data;
 		if (mp_check(&data, end))
-			tnt_raise(ClientError, ER_INVALID_MSGPACK, "packet body"); /*goto error;*/
+			goto error;
 		if (iproto_key_type[key] != mp_typeof(*value))
-			tnt_raise(ClientError, ER_INVALID_MSGPACK, "packet body"); /*goto error;*/
+			goto error;
 		switch (key) {
 		case IPROTO_SPACE_ID:
 		case IPROTO_INDEX_ID:
@@ -272,7 +270,6 @@ request_decode_cb(const char *data, uint32_t len, uint32_t type,
 		case IPROTO_USER_NAME:
 		case IPROTO_EXPR:
 			char_f(data_f, key, value, data);
-		default:
 			break;
 		}
 	}
@@ -289,22 +286,18 @@ request_decode_cb(const char *data, uint32_t len, uint32_t type,
 void
 request_decode(struct request *request, const char *data, uint32_t len)
 {
-	assert(request->execute != NULL);
 	request_decode_cb(data, len, request->type, request_set_uint,
 		request_set_char, request);
 }
 
-static void
-request_null_char(void *, uint8_t, const char *, const char *)
-{}
-
 void
-request_header_decode(struct xrow_header* xrow, request_uint_f uint_f, void *data)
+request_header_decode(struct xrow_header* xrow, request_uint_f uint_f,
+		      request_char_f char_f, void *data)
 {
 	try {
 		request_decode_cb(
-			(const char *)xrow->body[0].iov_base, xrow->body[0].iov_len,
-			xrow->type, uint_f, request_null_char, data);
+			(const char *)xrow->body[0].iov_base,
+			xrow->body[0].iov_len, xrow->type, uint_f, char_f, data);
 	} catch (...) {
 
 	}

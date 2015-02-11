@@ -513,15 +513,6 @@ box_init()
 	 */
 	if (cfg_gets("listen") == NULL)
 		box_leave_local_standby_mode(NULL);
-<<<<<<< HEAD
-=======
-	}
-	if (cfg_getd("io_collect_interval") > 0) {
-		ev_set_io_collect_interval(loop(),
-					   cfg_getd("io_collect_interval"));
-	}
-	too_long_threshold = cfg_getd("too_long_threshold");
->>>>>>> set iobuf read ahead option before start bsync thread (fix possible data race)
 }
 
 void

@@ -31,6 +31,7 @@
 #include "index.h"
 #include "trigger.h"
 #include "fiber.h"
+#include "box/engine.h"
 
 extern double too_long_threshold;
 struct tuple;

@@ -34,7 +34,6 @@
 #include "xlog.h"
 #include "fiber.h"
 #include "tt_pthread.h"
-#include "log_io.h"
 #include "fio.h"
 #include "sio.h"
 #include "errinj.h"
@@ -43,11 +42,13 @@
 #include "replica.h"
 #include "fiber.h"
 #include "msgpuck/msgpuck.h"
+#include "xrow.h"
 #include "crc32.h"
 #include "scoped_guard.h"
 #include "box/cluster.h"
 #include "vclock.h"
 #include "session.h"
+#include "coio.h"
 #include "bsync.h"
 
 /*
@@ -146,9 +147,9 @@ fill_lsn(struct recovery_state *r, struct xrow_header *row)
 /* {{{ Initial recovery */
 
 static int
-wal_writer_start(struct recovery_state *state);
-static void
-recovery_stop_local(struct recovery_state *r);
+wal_writer_start(struct recovery_state *state, int rows_per_wal);
+void
+wal_writer_stop(struct recovery_state *r);
 
 /**
  * Throws an exception in  case of error.
@@ -237,9 +238,8 @@ recovery_delete(struct recovery_state *r)
 {
 	recovery_stop_local(r);
 
-	if (r->writer) {
-		bsync_writer_stop(r);
-	}
+	if (r->writer)
+		wal_writer_stop(r);
 
 	xdir_destroy(&r->snap_dir);
 	xdir_destroy(&r->wal_dir);
@@ -315,7 +315,6 @@ recovery_bootstrap(struct recovery_state *r)
 {
 	/* Add a surrogate server id for snapshot rows */
 	vclock_add_server(&r->vclock, 0);
-	vclock_add_server(&r->vclock, BSYNC_SERVER_ID);
 
 	/* Recover from bootstrap.snap */
 	say_info("initializing an empty data directory");
@@ -367,7 +366,6 @@ recover_snap(struct recovery_state *r)
 
 	/* Add a surrogate server id for snapshot rows */
 	vclock_add_server(&r->vclock, 0);
-	vclock_add_server(&r->vclock, BSYNC_SERVER_ID);
 
 	say_info("recovering from `%s'", snap->filename);
 	recover_xlog(r, snap);
@@ -553,7 +551,8 @@ recovery_finalize(struct recovery_state *r, int rows_per_wal)
 
 		recovery_close_log(r);
 	}
-	wal_writer_start(r);
+
+	wal_writer_start(r, rows_per_wal);
 }
 
 
@@ -643,7 +642,6 @@ struct wal_writer
 	struct vclock vclock;
 	bool is_started;
 };
-static pthread_once_t wal_writer_once = PTHREAD_ONCE_INIT;
 
 static struct wal_writer wal_writer;
 
@@ -767,7 +765,7 @@ wal_writer_init(struct wal_writer *writer, struct vclock *vclock,
 }
 
 /** Destroy a WAL writer structure. */
-void
+static void
 wal_writer_destroy(struct wal_writer *writer)
 {
 	(void) tt_pthread_mutex_destroy(&writer->mutex);
@@ -804,16 +802,17 @@ wal_writer_start(struct recovery_state *r, int rows_per_wal)
 	/* I. Initialize the state. */
 	wal_writer_init(&wal_writer, &r->vclock, rows_per_wal);
 	r->writer = &wal_writer;
-
-	bsync_init(r->writer, &r->vclock);
+	r->writer->txn_loop = bsync_init(r->writer, r->writer->txn_loop, &r->vclock);
 	ev_async_start(wal_writer.txn_loop, &wal_writer.write_event);
 
 	/* II. Start the thread. */
+
 	if (cord_start(&wal_writer.cord, "wal", wal_writer_thread, r)) {
 		wal_writer_destroy(&wal_writer);
 		r->writer = NULL;
 		return -1;
 	}
+	wal_writer.is_started = true;
 	return 0;
 }
 
@@ -1027,7 +1026,8 @@ wal_writer_thread(void *worker_args)
  * WAL writer main entry point: queue a single request
  * to be written to disk and wait until this task is completed.
  */
-int
+
+int64_t
 wal_write_lsn(struct recovery_state *r, struct xrow_header *row)
 {
 	/*
@@ -1040,15 +1040,21 @@ wal_write_lsn(struct recovery_state *r, struct xrow_header *row)
 	return wal_write(r->writer, row);
 }
 
-int wal_write(struct wal_writer *writer, struct xrow_header *row) {
+int64_t
+wal_write(struct wal_writer *writer, struct xrow_header *row)
+{
+
+	ERROR_INJECT_RETURN(ERRINJ_WAL_IO);
+
 	struct wal_write_request *req = (struct wal_write_request *)
 		region_alloc(&fiber()->gc, sizeof(struct wal_write_request));
+
 	req->fiber = fiber();
+	req->res = -1;
 	req->row = row;
 	row->tm = ev_now(loop());
 	row->sync = 0;
-	ERROR_INJECT_RETURN(ERRINJ_WAL_IO);
-	req->res = -1;
+
 	(void) tt_pthread_mutex_lock(&writer->mutex);
 
 	bool input_was_empty = STAILQ_EMPTY(&writer->input);
@@ -1058,8 +1064,6 @@ int wal_write(struct wal_writer *writer, struct xrow_header *row) {
 		(void) tt_pthread_cond_signal(&writer->cond);
 
 	(void) tt_pthread_mutex_unlock(&writer->mutex);
-
-	fiber_yield(); /* Request was inserted. */
 
 	/**
 	 * It's not safe to spuriously wakeup this fiber
@@ -1072,6 +1076,7 @@ int wal_write(struct wal_writer *writer, struct xrow_header *row) {
 	fiber_set_cancellable(cancellable);
 	return req->res;
 }
+
 /* }}} */
 
 /* {{{ box.snapshot() */

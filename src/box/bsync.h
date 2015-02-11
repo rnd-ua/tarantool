@@ -41,8 +41,8 @@ extern "C" {
 
 #define BSYNC_SERVER_ID 0xF
 
-void bsync_init(wal_writer* initial, struct vclock *vclock);
-int bsync_write(struct recovery_state *r, struct xrow_header *packet);
+ev_loop * bsync_init(wal_writer* initial, ev_loop *loop, struct vclock *vclock);
+int bsync_write(struct recovery_state *r, struct txn_stmt *stmt);
 void bsync_writer_stop(struct recovery_state *r);
 
 #if defined(__cplusplus)

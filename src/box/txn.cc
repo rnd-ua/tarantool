@@ -223,7 +223,7 @@ txn_commit(struct txn *txn)
 		/* txn_commit() must be done after txn_add_redo() */
 		assert(recovery->wal_mode == WAL_NONE || stmt->row != NULL);
 		ev_tstamp start = ev_now(loop()), stop;
-		int64_t res = bsync_write(recovery, stmt->row);
+		int64_t res = bsync_write(recovery, stmt);
 		stop = ev_now(loop());
 		if (stop - start > too_long_threshold && stmt->row != NULL) {
 			say_warn("too long %s: %.3f sec",

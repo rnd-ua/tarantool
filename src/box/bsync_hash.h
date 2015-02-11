@@ -40,7 +40,7 @@ extern "C" {
 
 struct bsync_key {
 	uint32_t space_id;
-	const void *data;
+	char *data;
 	size_t size;
 };
 
@@ -54,7 +54,7 @@ struct bsync_val {
 static uint32_t bsync_hash_key(const struct bsync_key *key) {
 	uint32_t v = crc32_calc(0, (const char *)&key->space_id, sizeof(uint32_t));
 	if (key->data) {
-		v = crc32_calc(v, (const char *)key->data, key->size);
+		v = crc32_calc(v, key->data, key->size);
 	}
 	return v;
 }

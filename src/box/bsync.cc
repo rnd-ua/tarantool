@@ -40,8 +40,11 @@
 #include "memory.h"
 #include "scoped_guard.h"
 #include "box/box.h"
+#include "box/txn.h"
 #include "box/port.h"
-#include "box/log_io.h"
+#include "box/schema.h"
+#include "box/space.h"
+#include "box/tuple.h"
 #include "box/request.h"
 #include "msgpuck/msgpuck.h"
 
@@ -68,16 +71,6 @@ static struct ev_loop* txn_loop;
 static struct ev_loop* bsync_loop;
 static struct ev_async txn_process_event;
 static struct ev_async bsync_process_event;
-
-/* TODO: change structure of operation structures:
- * 1. create txn structure (and move to it all info about TXN)
- * 2. remove bsync_op_status structure and use instead of it bsync_send_elem
- * 3. rename bsync_send_elem to bsync_host
- * After finish check, that tarantool have 3 structures about operation:
- * 1. bsync_txn_info - leave time is equal to TXN fiber
- * 2. bsync_host_info - leave time is equal to host part
- * 3. bsync_operation - leave time is equal to BSYNC fiber
- */
 
 struct bsync_host_info {/* for save in host queue */
 	uint8_t code;
@@ -513,7 +506,7 @@ bsync_parse_dup_key(struct bsync_common *data, struct key_def *key,
 }
 
 int
-bsync_write(struct recovery_state *r, struct xrow_header *row) try
+bsync_write(struct recovery_state *r, struct txn_stmt *stmt) try
 {BSYNC_TRACE
 	if (bsync_state.rollback) {
 		if (stmt->row->server_id != 0) {
@@ -714,12 +707,6 @@ bsync_wait_slow(struct bsync_operation *oper)
 			fiber_call(BSYNC_REMOTE.fiber_out);
 	}
 	BSYNC_TRACE
-}
-
-static void
-bsync_space_cb(void *d, uint8_t key, uint32_t v)
-{
-	if (key == IPROTO_SPACE_ID) ((struct bsync_key *)d)->space_id = v;
 }
 
 static void
@@ -1075,7 +1062,7 @@ bsync_txn_proceed_request(struct bsync_txn_info *info)
 	if (bsync_begin_op(info->common->dup_key, info->op->server_id)) {
 		rlist_add_tail_entry(&bsync_state.txn_queue, info, list);
 		try {
-			box_process(&null_port, req);
+			box_process(req, &null_port);
 		} catch (Exception *e) {
 			if (info->op->server_id == BSYNC_SERVER_ID) {
 				if (!bsync_state.rollback) {
@@ -1573,7 +1560,7 @@ bsync_accept_handler(va_list ap)
 		if (BSYNC_REMOTE.flags & bsync_host_reconnect_sleep) {
 			fiber_call(BSYNC_REMOTE.fiber_out);
 		} else if (BSYNC_REMOTE.flags & bsync_host_disconnected) {
-			fiber_call(
+			fiber_start(
 				fiber_new(BSYNC_REMOTE.source, bsync_out_fiber),
 				&host_id);
 		}
@@ -1803,9 +1790,8 @@ bsync_out_fiber(va_list ap)
 	snprintf(service, sizeof(service), "%.*s",
 		(int) BSYNC_REMOTE.uri.service_len, BSYNC_REMOTE.uri.service);
 	while (!bsync_state.is_shutdown) try {BSYNC_TRACE
-		int r = coio_connect_timeout(&coio, host, service, 0, 0,
-				bsync_state.connect_timeout,
-				BSYNC_REMOTE.uri.host_hint);
+		int r = coio_connect_timeout(&coio, &BSYNC_REMOTE.uri, 0, 0,
+					     bsync_state.connect_timeout);
 		if (r == -1) {
 			say_warn("connection timeout to %s, wait %f",
 				 BSYNC_REMOTE.source, bsync_state.reconnect_timeout);
@@ -1915,13 +1901,13 @@ bsync_init_state(const struct vclock* vclock)
 		BSYNC_LOCAL.gsn = vclock->lsn[BSYNC_SERVER_ID];
 }
 
-void
-bsync_init(wal_writer* initial, struct vclock *vclock)
+ev_loop *
+bsync_init(wal_writer* initial, ev_loop *loop, struct vclock *vclock)
 {BSYNC_TRACE
 	assert (initial != NULL);
 	if (cfg_geti("bsync_enable") <= 0) {
 		say_info("bsync_enable=%d\n", cfg_geti("bsync_enable"));
-		return;
+		return loop;
 	}
 	wal_local_writer = initial;
 	bsync_state.iproxy_end = NULL;
@@ -1961,7 +1947,7 @@ bsync_init(wal_writer* initial, struct vclock *vclock)
 	rlist_create(&bsync_state.region_free);
 	rlist_create(&bsync_state.region_gc);
 
-	slab_cache_create(&bsync_state.slabc, &runtime, 0);
+	slab_cache_create(&bsync_state.slabc, &runtime);
 	mempool_create(&bsync_state.region_pool, &bsync_state.slabc,
 			sizeof(struct bsync_region));
 
@@ -1978,11 +1964,11 @@ bsync_init(wal_writer* initial, struct vclock *vclock)
 	tt_pthread_mutex_lock(&bsync_state.mutex);
 	if (cord_start(&bsync_state.cord, "bsync", bsync_thread, NULL)) {
 		wal_local_writer = NULL;
-		return;
+		return loop;
 	}
 	tt_pthread_cond_wait(&bsync_state.cond, &bsync_state.mutex);
 	tt_pthread_mutex_unlock(&bsync_state.mutex);
-	wal_local_writer->txn_loop = bsync_loop;
+	return bsync_loop;
 }
 
 static void*
@@ -1990,13 +1976,12 @@ bsync_thread(void*)
 {BSYNC_TRACE
 	tt_pthread_mutex_lock(&bsync_state.mutex);
 	iobuf_init();
-	coio_service_init(&bsync_coio, "bsync",
-		BSYNC_LOCAL.source, bsync_accept_handler, NULL);
-	evio_service_start(&bsync_coio.evio_service);
+	coio_service_init(&bsync_coio, "bsync", bsync_accept_handler, NULL);
+	evio_service_start(&bsync_coio.evio_service, BSYNC_LOCAL.source);
 	for (uint8_t host_id = 0; host_id < bsync_state.num_hosts; ++host_id) {
 		if (host_id == bsync_state.local_id) continue;
 		BSYNC_REMOTE.connected = 0;
-		fiber_call(
+		fiber_start(
 			fiber_new(BSYNC_REMOTE.source, bsync_out_fiber),
 			&host_id);
 	}

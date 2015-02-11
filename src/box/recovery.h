@@ -58,32 +58,7 @@ typedef void (apply_row_f)(struct recovery_state *, void *,
  * LSN makes it to disk.
  */
 
-struct wal_write_request {
-  STAILQ_ENTRY(wal_write_request) wal_fifo_entry;
-  /* Auxiliary. */
-  int64_t res;
-  struct fiber *fiber;
-  struct xrow_header *row;
-};
-
-/* Context of the WAL writer thread. */
-STAILQ_HEAD(wal_fifo, wal_write_request);
-
-struct wal_writer
-{
-  struct wal_fifo input;
-  struct wal_fifo commit;
-  struct cord cord;
-  pthread_mutex_t mutex;
-  pthread_cond_t cond;
-  ev_async write_event;
-  struct fio_batch *batch;
-  bool is_shutdown;
-  bool is_rollback;
-  ev_loop *txn_loop;
-  struct vclock vclock;
-};
-
+struct wal_writer;
 struct wal_watcher;
 
 enum wal_mode { WAL_NONE = 0, WAL_WRITE, WAL_FSYNC, WAL_MODE_MAX };
@@ -166,9 +141,8 @@ void recovery_stop_local(struct recovery_state *r);
 void recovery_finalize(struct recovery_state *r, int rows_per_wal);
 
 int recover_wal(struct recovery_state *r, struct log_io *l);
-void wal_writer_destroy(struct wal_writer *writer);
-int wal_write_lsn(struct recovery_state *r, struct xrow_header *packet);
-int wal_write(struct wal_writer *writer, struct xrow_header *req);
+int64_t wal_write_lsn(struct recovery_state *r, struct xrow_header *row);
+int64_t wal_write(struct wal_writer *writer, struct xrow_header *row);
 void wal_writer_stop(struct recovery_state *r);
 
 void recovery_setup_panic(struct recovery_state *r, bool on_snap_error, bool on_wal_error);
