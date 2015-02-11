@@ -240,8 +240,7 @@ bsync_new_region()
 					 struct bsync_region, list);
 	} else {
 		struct bsync_region* region = (struct bsync_region *)
-			mempool_alloc(&bsync_state.region_pool);
-		memset(region, 0, sizeof(*region));
+			mempool_alloc0(&bsync_state.region_pool);
 		region_create(&region->pool, &bsync_state.slabc);
 		return region;
 	}
@@ -950,6 +949,8 @@ bsync_proxy_accept(uint8_t host_id, const char **ipos, const char *iend)
 	uint64_t gsn = mp_decode_uint(ipos);
 	struct bsync_operation *op =
 		rlist_shift_entry(&bsync_state.proxy_queue, bsync_operation, list);
+	for (host_id = 0; host_id < bsync_state.num_hosts; ++host_id)
+		bsync_end_op(host_id, op->common->dup_key, op->server_id);
 	op->gsn = gsn;
 	assert(*ipos == iend);
 	fiber_call(op->owner);
@@ -962,6 +963,8 @@ bsync_proxy_reject(uint8_t host_id, const char **ipos, const char *iend)
 	assert(!rlist_empty(&bsync_state.proxy_queue));
 	struct bsync_operation *op =
 		rlist_shift_entry(&bsync_state.proxy_queue, bsync_operation, list);
+	for (host_id = 0; host_id < bsync_state.num_hosts; ++host_id)
+		bsync_end_op(host_id, op->common->dup_key, op->server_id);
 	assert(*ipos == iend);
 	op->txn_data->result = -1;
 	fiber_call(op->owner);
@@ -1059,6 +1062,7 @@ bsync_txn_proceed_request(struct bsync_txn_info *info)
 	}
 	TupleGuard guard(tuple);
 	bsync_parse_dup_key(info->common, space->index[0]->key_def, tuple);
+	assert(cord_is_main());
 	if (bsync_begin_op(info->common->dup_key, info->op->server_id)) {
 		rlist_add_tail_entry(&bsync_state.txn_queue, info, list);
 		try {

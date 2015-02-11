@@ -4,7 +4,7 @@ box.schema.user.grant('guest', 'read,write,execute', 'universe')
 space = box.schema.create_space('test', {id =  42})
 ---
 ...
-space:create_index('primary', { type = 'tree'})
+space:create_index('primary', { type = 'tree', parts = {1, 'NUM'}})
 ---
 - unique: true
   parts:

@@ -14,7 +14,7 @@ bsync2.deploy()
 
 bsync1.admin("box.schema.user.grant('guest', 'read,write,execute', 'universe')")
 bsync1.admin("space = box.schema.create_space('test', {id =  42})")
-bsync1.admin("space:create_index('primary', { type = 'tree'})")
+bsync1.admin("space:create_index('primary', { type = 'tree', parts = {1, 'NUM'}})")
 
 bsync1.admin('for k = 0, 9 do space:insert{k, k*k} end')
 bsync2.admin('for k = 10, 19 do box.space.test:insert{k, k*k} end')
