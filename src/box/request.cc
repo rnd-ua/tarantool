@@ -226,6 +226,7 @@ request_set_char(void *data, uint8_t key, const char *v, const char *v_end)
 	case IPROTO_KEY:
 	case IPROTO_FUNCTION_NAME:
 	case IPROTO_USER_NAME:
+	case IPROTO_EXPR:
 		((struct request *)data)->key = v;
 		((struct request *)data)->key_end = v_end;
 		break;
