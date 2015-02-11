@@ -104,6 +104,7 @@ struct recovery_state {
 	enum wal_mode wal_mode;
 	struct tt_uuid server_uuid;
 	uint32_t server_id;
+	int rows_per_wal;
 
 	bool finalize;
 };
@@ -119,6 +120,8 @@ void
 recovery_atfork(struct recovery_state *r);
 
 void recovery_update_mode(struct recovery_state *r, enum wal_mode mode);
+void recovery_update_rows_per_wal(struct recovery_state *r, int rows_per_wal);
+
 void recovery_update_io_rate_limit(struct recovery_state *r,
 				   double new_limit);
 
@@ -133,7 +136,7 @@ void recover_snap(struct recovery_state *r);
 void recovery_follow_local(struct recovery_state *r, ev_tstamp wal_dir_rescan_delay);
 void recovery_stop_local(struct recovery_state *r);
 
-void recovery_finalize(struct recovery_state *r, int rows_per_wal);
+void recovery_finalize(struct recovery_state *r);
 
 int64_t wal_write(struct recovery_state *r, struct xrow_header *packet);
 

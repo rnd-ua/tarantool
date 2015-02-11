@@ -146,7 +146,7 @@ fill_lsn(struct recovery_state *r, struct xrow_header *row)
 /* {{{ Initial recovery */
 
 static int
-wal_writer_start(struct recovery_state *state, int rows_per_wal);
+wal_writer_start(struct recovery_state *state);
 void
 wal_writer_stop(struct recovery_state *r);
 
@@ -169,19 +169,16 @@ recovery_new(const char *snap_dirname, const char *wal_dirname,
 		free(r);
 	});
 
-	recovery_update_mode(r, WAL_NONE);
-
+	r->wal_mode = WAL_NONE;
 	r->apply_row = apply_row;
 	r->apply_row_param = apply_row_param;
 	r->signature = -1;
+	r->rows_per_wal = 500000;
 	r->snap_io_rate_limit = UINT64_MAX;
 
 	xdir_create(&r->snap_dir, snap_dirname, SNAP, &r->server_uuid);
 
 	xdir_create(&r->wal_dir, wal_dirname, XLOG, &r->server_uuid);
-
-	if (r->wal_mode == WAL_FSYNC)
-		(void) strcat(r->wal_dir.open_wflags, "s");
 
 	vclock_create(&r->vclock);
 
@@ -203,10 +200,47 @@ recovery_new(const char *snap_dirname, const char *wal_dirname,
 }
 
 void
+recovery_update_rows_per_wal(struct recovery_state *r, int rows_per_wal)
+{
+	assert(rows_per_wal > 0);
+	r->rows_per_wal = rows_per_wal;
+}
+
+void
 recovery_update_mode(struct recovery_state *r, enum wal_mode mode)
 {
 	assert(mode < WAL_MODE_MAX);
-	r->wal_mode = mode;
+	if (r->wal_mode == mode)
+		return;
+
+	if (mode == WAL_FSYNC) {
+		/* Add 's' flag to fib_open for wal directory */
+		(void) strcat(r->wal_dir.open_wflags, "s");
+		if (r->current_wal != NULL) {
+			say_warn("fsync will be enabled to the next open xlog");
+		}
+	} else if (r->wal_mode == WAL_FSYNC) {
+		/* Remove 's' flag from fib_open for wal directory */
+		char *s = strchr(r->wal_dir.open_wflags, 's');
+		if (s)
+			*s = '\0';
+	}
+
+	if (r->wal_mode == WAL_NONE) {
+		r->wal_mode = mode;
+		/* Start wal writer if needed */
+		if (wal_writer_start(r))
+			panic("can't start wal writer");
+	} else if (mode == WAL_NONE) {
+		/* Stop wal writer */
+		r->wal_mode = mode;
+		if (r->writer)
+			wal_writer_stop(r);
+		if (r->current_wal) {
+			xlog_close(r->current_wal);
+			r->current_wal = NULL;
+		}
+	}
 }
 
 void
@@ -514,7 +548,7 @@ recover_current_wal:
 }
 
 void
-recovery_finalize(struct recovery_state *r, int rows_per_wal)
+recovery_finalize(struct recovery_state *r)
 {
 
 	recovery_stop_local(r);
@@ -550,8 +584,6 @@ recovery_finalize(struct recovery_state *r, int rows_per_wal)
 
 		recovery_close_log(r);
 	}
-
-	wal_writer_start(r, rows_per_wal);
 }
 
 
@@ -788,18 +820,18 @@ static void *wal_writer_thread(void *worker_args);
  *         points to a newly created WAL writer.
  */
 static int
-wal_writer_start(struct recovery_state *r, int rows_per_wal)
+wal_writer_start(struct recovery_state *r)
 {
 	assert(r->writer == NULL);
 	assert(r->current_wal == NULL);
-	assert(rows_per_wal > 1);
+	assert(r->rows_per_wal > 1);
 	assert(! wal_writer.is_shutdown);
 	assert(STAILQ_EMPTY(&wal_writer.input));
 	assert(STAILQ_EMPTY(&wal_writer.commit));
 
 	assert(wal_writer.is_started == false);
 	/* I. Initialize the state. */
-	wal_writer_init(&wal_writer, &r->vclock, rows_per_wal);
+	wal_writer_init(&wal_writer, &r->vclock, r->rows_per_wal);
 	r->writer = &wal_writer;
 
 	ev_async_start(wal_writer.txn_loop, &wal_writer.write_event);
@@ -812,6 +844,7 @@ wal_writer_start(struct recovery_state *r, int rows_per_wal)
 		return -1;
 	}
 	wal_writer.is_started = true;
+	say_info("WAL writer started");
 	return 0;
 }
 
@@ -834,9 +867,16 @@ wal_writer_stop(struct recovery_state *r)
 
 	ev_async_stop(writer->txn_loop, &writer->write_event);
 	wal_writer.is_started = false;
+	r->writer = NULL;
+	writer->is_shutdown = false;
 	wal_writer_destroy(writer);
 
-	r->writer = NULL;
+	/* Wake-up waiting fibers */
+	wal_schedule_queue(&writer->commit);
+	wal_schedule_queue(&writer->input);
+	STAILQ_INIT(&writer->commit);
+	STAILQ_INIT(&writer->input);
+	say_info("WAL writer stopped");
 }
 
 /**

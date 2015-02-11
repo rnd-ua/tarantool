@@ -130,6 +130,16 @@ box_check_readahead(int readahead)
 	}
 }
 
+static void
+box_check_rows_per_wal(int rows_per_wal)
+{
+	/* check rows_per_wal configuration */
+	if (rows_per_wal <= 1) {
+		tnt_raise(ClientError, ER_CFG, "rows_per_wal",
+			  "the value must be greater than one");
+	}
+}
+
 void
 box_check_config()
 {
@@ -137,12 +147,8 @@ box_check_config()
 	box_check_uri(cfg_gets("listen"), "listen");
 	box_check_uri(cfg_gets("replication_source"), "replication_source");
 	box_check_readahead(cfg_geti("readahead"));
+	box_check_rows_per_wal(cfg_geti("rows_per_wal"));
 
-	/* check rows_per_wal configuration */
-	if (cfg_geti("rows_per_wal") <= 1) {
-		tnt_raise(ClientError, ER_CFG, "rows_per_wal",
-			  "the value must be greater than one");
-	}
 }
 
 extern "C" void
@@ -195,16 +201,23 @@ box_set_wal_mode(const char *mode_name)
 	box_check_wal_mode(mode_name);
 	enum wal_mode mode = (enum wal_mode)
 		strindex(wal_mode_STRS, mode_name, WAL_MODE_MAX);
-	if (mode != recovery->wal_mode &&
-	    (mode == WAL_FSYNC || recovery->wal_mode == WAL_FSYNC)) {
-		tnt_raise(ClientError, ER_CFG, "wal_mode",
-			  "cannot switch to/from fsync");
-	}
+	if (mode == recovery->wal_mode)
+		return;
+
 	/** Really update WAL mode only after we left local hot standby,
 	 * since local hot standby expects it to be NONE.
 	 */
-	if (recovery->finalize)
-		recovery_update_mode(recovery, mode);
+	if (!recovery->finalize)
+		return; /* will be set by box_leave_local_standby_mode */
+
+	recovery_update_mode(recovery, mode);
+}
+
+extern "C" void
+box_set_rows_per_wal(int rows_per_wal)
+{
+	box_check_rows_per_wal(rows_per_wal);
+	recovery_update_rows_per_wal(recovery, rows_per_wal);
 }
 
 extern "C" void
@@ -252,7 +265,7 @@ box_leave_local_standby_mode(void *data __attribute__((unused)))
 		return;
 	}
 	try {
-		recovery_finalize(recovery, cfg_geti("rows_per_wal"));
+		recovery_finalize(recovery);
 	} catch (Exception *e) {
 		e->log();
 		panic("unable to successfully finalize recovery");
@@ -264,6 +277,7 @@ box_leave_local_standby_mode(void *data __attribute__((unused)))
 	engine_end_recovery();
 
 	stat_cleanup(stat_base, IPROTO_TYPE_STAT_MAX);
+	box_set_rows_per_wal(cfg_geti("rows_per_wal"));
 	box_set_wal_mode(cfg_gets("wal_mode"));
 
 	if (recovery_has_remote(recovery))
