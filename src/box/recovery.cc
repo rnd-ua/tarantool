@@ -315,6 +315,7 @@ recovery_bootstrap(struct recovery_state *r)
 {
 	/* Add a surrogate server id for snapshot rows */
 	vclock_add_server(&r->vclock, 0);
+	vclock_add_server(&r->vclock, BSYNC_SERVER_ID);
 
 	/* Recover from bootstrap.snap */
 	say_info("initializing an empty data directory");
@@ -366,6 +367,7 @@ recover_snap(struct recovery_state *r)
 
 	/* Add a surrogate server id for snapshot rows */
 	vclock_add_server(&r->vclock, 0);
+	vclock_add_server(&r->vclock, BSYNC_SERVER_ID);
 
 	say_info("recovering from `%s'", snap->filename);
 	recover_xlog(r, snap);
