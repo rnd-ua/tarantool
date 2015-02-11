@@ -19,31 +19,43 @@ help()
 box.cfg
 ---
 - snapshot_count: 6
+  pid_file: tarantool.pid
+  slab_alloc_maximal: 1048576
+  bsync_read_timeout: 3.5
+  readahead: 16320
+  wal_dir: .
+  bsync_slow_host_timeout: 30
+  bsync_operation_timeout: 10
+  logger_nonblock: true
+  snap_dir: .
+  bsync_replica: 
+  panic_on_snap_error: true
+  bsync_write_timeout: 3.5
+  bsync_election_timeout: 5
   too_long_threshold: 0.5
   slab_alloc_factor: 2
-  slab_alloc_maximal: 1048576
   background: false
-  slab_alloc_arena: 0.1
+  bsync_connect_timeout: 300
+  snapshot_period: 0
+  listen: <uri>
+  bsync_enable: 0
+  log_level: 5
+  bsync_ping_timeout: 1
+  bsync_reconnect_timeout: 300
+  sophia_dir: .
+  wal_mode: write
+  rows_per_wal: 50
+  coredump: false
+  panic_on_wal_error: false
+  bsync_submit_timeout: 0.1
+  bsync_local: 
+  slab_alloc_minimal: 64
   sophia:
     page_size: 131072
     threads: 5
     node_size: 134217728
     memory_limit: 0
-  listen: <uri>
-  logger_nonblock: true
-  snap_dir: .
-  coredump: false
-  slab_alloc_minimal: 64
-  sophia_dir: .
-  wal_mode: write
-  wal_dir: .
-  panic_on_snap_error: true
-  panic_on_wal_error: false
-  log_level: 5
-  readahead: 16320
-  pid_file: tarantool.pid
-  rows_per_wal: 50
-  snapshot_period: 0
+  slab_alloc_arena: 0.1
   wal_dir_rescan_delay: 0.1
 ...
 space:insert{1, 'tuple'}
