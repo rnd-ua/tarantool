@@ -64,7 +64,6 @@ static void bsync_connected(uint8_t host_id);
 static void bsync_out_fiber(va_list ap);
 
 static struct coio_service bsync_coio;
-static struct wal_writer* wal_local_writer = NULL;
 static struct recovery_state *recovery_state;
 
 static struct ev_loop* txn_loop;
@@ -81,7 +80,6 @@ struct bsync_host_info {/* for save in host queue */
 
 struct bsync_region {
 	struct region pool;
-
 	struct rlist list;
 };
 
@@ -123,6 +121,7 @@ struct bsync_operation {
 	struct fiber *owner;
 	struct bsync_common *common;
 	struct bsync_txn_info *txn_data;
+	struct xrow_header *row;
 
 	struct rlist list;
 };
@@ -146,6 +145,7 @@ struct bsync_host_data {
 	uint64_t commit_gsn;
 	uint64_t submit_gsn;
 
+	ssize_t send_queue_size;
 	struct rlist send_queue;
 	struct rlist op_queue;
 	struct mh_bsync_t *active_ops;
@@ -154,6 +154,12 @@ struct bsync_host_data {
 	uint8_t election_host;
 };
 static struct bsync_host_data bsync_index[BSYNC_MAX_HOSTS];
+
+struct bsync_fiber_cache {
+	size_t size;
+	size_t active;
+	struct rlist data;
+};
 
 static struct bsync_state_ {
 	uint8_t local_id;
@@ -186,8 +192,8 @@ static struct bsync_state_ {
 	struct rlist execute_queue; // executing operations
 	struct rlist commit_queue; // submitted operations
 
-	struct rlist txn_fiber_cache;
-	struct rlist bsync_fiber_cache;
+	struct bsync_fiber_cache txn_fibers;
+	struct bsync_fiber_cache bsync_fibers;
 
 	struct rlist election_ops;
 
@@ -221,13 +227,16 @@ static struct bsync_state_ {
 	})
 
 static struct fiber*
-bsync_fiber(struct rlist *lst, void (*f) (va_list))
+bsync_fiber(struct bsync_fiber_cache *lst, void (*f) (va_list), ...)
 {
 	struct fiber *result = NULL;
-	if (! rlist_empty(lst))
-		result =  rlist_shift_entry(lst, struct fiber, state);
-	else
+	if (! rlist_empty(&lst->data)) {
+		result = rlist_shift_entry(&lst->data, struct fiber, state);
+	} else {
 		result = fiber_new("bsync_proc", f);
+		++lst->size;
+	}
+	++lst->active;
 	return result;
 }
 
@@ -251,7 +260,7 @@ bsync_free_region(struct bsync_common *data)
 {BSYNC_TRACE
 	if (!data->region) return;
 	tt_pthread_mutex_lock(&bsync_state.mutex);
-	rlist_add_entry(&bsync_state.region_gc, data->region, list);
+	rlist_add_tail_entry(&bsync_state.region_gc, data->region, list);
 	tt_pthread_mutex_unlock(&bsync_state.mutex);
 	data->region = NULL;
 }
@@ -355,7 +364,6 @@ static const char* bsync_mtype_name[] = {
 	tt_pthread_mutex_unlock(&bsync_state.mutex); }
 
 #define SWITCH_TO_TXN {\
-	say_debug("send to TXN operation %ld from %d", oper->gsn, __LINE__); \
 	tt_pthread_mutex_lock(&bsync_state.mutex); \
 	bool was_empty = STAILQ_EMPTY(&bsync_state.txn_proxy_queue); \
 	STAILQ_INSERT_TAIL(&bsync_state.txn_proxy_queue, oper->txn_data, fifo); \
@@ -507,6 +515,7 @@ bsync_parse_dup_key(struct bsync_common *data, struct key_def *key,
 int
 bsync_write(struct recovery_state *r, struct txn_stmt *stmt) try
 {BSYNC_TRACE
+	assert(recovery_state == NULL || recovery_state == r);
 	if (bsync_state.rollback) {
 		if (stmt->row->server_id != 0) {
 			rlist_shift(&bsync_state.txn_queue);
@@ -514,7 +523,8 @@ bsync_write(struct recovery_state *r, struct txn_stmt *stmt) try
 		}
 		return 0;
 	}
-	if (wal_local_writer == NULL) return wal_write_lsn(r, stmt->row);
+	if (recovery_state == NULL) return wal_write_lsn(r, stmt->row);
+	assert(stmt->row->server_id > 0 || (stmt->row->commit_sn == 0 && stmt->row->rollback_sn == 0));
 	bsync_dump_region();
 
 	stmt->row->tm = ev_now(loop());
@@ -565,7 +575,11 @@ bsync_write(struct recovery_state *r, struct txn_stmt *stmt) try
 		rlist_foreach_entry_reverse(s, &bsync_state.execute_queue, list) {
 			s->result = -1;
 			if (s->repeat && server_id == 0) {
-				// its a local request, we need to copy row for reapply it after rollback all operations
+				/* TODO:
+				 * its a local request, we need to copy row
+				 * for reapply it after rollback all operations
+				 */
+				abort();
 			}
 			fiber_call(s->owner);
 		}
@@ -594,6 +608,7 @@ bsync_send_data(struct bsync_host_data *host, struct bsync_host_info *elem)
 	/* TODO : check all send ops for memory leak case */
 	if (host->connected < 2) return;
 	rlist_add_tail_entry(&host->send_queue, elem, list);
+	++host->send_queue_size;
 	if ((host->flags & bsync_host_active_write) == 0) {
 		fiber_call(host->fiber_out);
 	}
@@ -623,7 +638,7 @@ bsync_wal_write(struct xrow_header *row)
 	} else {
 		assert(row->rollback_sn == 0);
 	}
-	return wal_write(wal_local_writer, row);
+	return wal_write(recovery_state, row);
 }
 
 static void
@@ -711,10 +726,15 @@ bsync_wait_slow(struct bsync_operation *oper)
 static void
 bsync_queue_leader(struct bsync_operation *oper, bool proxy)
 {BSYNC_TRACE
+	if (!proxy) {
+		oper->row = (struct xrow_header *)
+			region_alloc0(&fiber()->gc, sizeof(struct xrow_header));
+		xrow_copy(oper->txn_data->row, oper->row);
+	}
 	oper->status = bsync_op_status_init;
 	oper->gsn = ++BSYNC_LOCAL.gsn;
 	say_debug("start to proceed request %ld", oper->gsn);
-	oper->server_id = oper->txn_data->row->server_id;
+	oper->server_id = oper->row->server_id;
 	oper->rejected = bsync_state.num_hosts - bsync_state.num_connected;
 	oper->accepted = 0;
 	for (uint8_t host_id = 0; host_id < bsync_state.num_hosts; ++host_id) {
@@ -725,12 +745,12 @@ bsync_queue_leader(struct bsync_operation *oper, bool proxy)
 		elem->op = oper;
 		if (oper->server_id == (host_id + 1)) {
 			elem->code = bsync_mtype_proxy_accept;
-			oper->txn_data->row->lsn = oper->lsn;
+			oper->row->lsn = oper->lsn;
 			oper->txn_data->row->server_id = oper->server_id;
 		} else {
 			elem->code = bsync_mtype_body;
-			oper->txn_data->row->lsn = oper->gsn;
-			oper->txn_data->row->server_id = BSYNC_SERVER_ID;
+			oper->row->lsn = oper->gsn;
+			oper->row->server_id = BSYNC_SERVER_ID;
 		}
 		say_debug("********** send accept/body from fiber %ld",
 			  (ptrdiff_t)elem->op->owner);
@@ -754,6 +774,7 @@ bsync_queue_leader(struct bsync_operation *oper, bool proxy)
 	}
 	oper->txn_data->result =
 		(2 * oper->accepted > bsync_state.num_hosts ? 0 : -1);
+	assert(oper->txn_data->result >= 0);
 	if (!proxy) {
 		SWITCH_TO_TXN
 		bsync_wait_slow(oper);
@@ -782,6 +803,7 @@ bsync_proxy_processor()
 	oper->txn_data->proxy = true;
 	xrow_header_decode(oper->txn_data->row, bsync_state.iproxy_pos,
 			   bsync_state.iproxy_end);
+	oper->txn_data->row->commit_sn = oper->txn_data->row->rollback_sn = 0;
 	struct iovec xrow_body[XROW_BODY_IOVMAX];
 	memcpy(xrow_body, oper->txn_data->row->body,
 		sizeof(oper->txn_data->row->body));
@@ -791,6 +813,7 @@ bsync_proxy_processor()
 		memcpy(oper->txn_data->row->body[i].iov_base,
 			xrow_body[i].iov_base, xrow_body[i].iov_len);
 	}
+	oper->row = oper->txn_data->row;
 	bsync_state.iproxy_pos = NULL;
 	bsync_state.iproxy_end = NULL;
 	oper->server_id = oper->txn_data->row->server_id;
@@ -799,16 +822,17 @@ bsync_proxy_processor()
 	bool slave_proxy = (bsync_state.leader_id != bsync_state.local_id);
 	if (slave_proxy) {
 		oper->status = bsync_op_status_wal;
+		say_debug("[%p] start to apply request %ld from %d to WAL",
+			fiber(), oper->txn_data->row->lsn, oper->txn_data->row->server_id);
 		oper->gsn = bsync_update_gsn(oper->txn_data->row->lsn);
-		say_debug("start to apply request %ld to WAL", oper->gsn);
 		oper->txn_data->result = bsync_wal_write(oper->txn_data->row);
 		say_debug("submit request %ld", oper->gsn);
 		send->code = (oper->txn_data->result < 0 ? bsync_mtype_reject :
 							   bsync_mtype_submit);
-		bsync_send_data(&BSYNC_LEADER, send);
 		if (oper->txn_data->result >= 0) {
 			rlist_add_tail_entry(&bsync_state.commit_queue, oper, list);
 		}
+		bsync_send_data(&BSYNC_LEADER, send);
 	}
 	if (oper->txn_data->result >= 0) {
 		say_debug("start to apply request %ld to TXN", oper->gsn);
@@ -879,8 +903,9 @@ bsync_body(uint8_t host_id, const char **ipos, const char *iend)
 	bsync_state.iproxy_pos = ipos;
 	bsync_state.iproxy_end = iend;
 	fiber_call(
-		bsync_fiber(&bsync_state.bsync_fiber_cache, bsync_process_fiber)
+		bsync_fiber(&bsync_state.bsync_fibers, bsync_process_fiber)
 	);
+	assert(*ipos == iend);
 }
 
 static void
@@ -938,8 +963,9 @@ bsync_proxy_request(uint8_t host_id, const char **ipos, const char *iend)
 	bsync_state.iproxy_pos = ipos;
 	bsync_state.iproxy_end = iend;
 	fiber_call(
-		bsync_fiber(&bsync_state.bsync_fiber_cache, bsync_process_fiber)
+		bsync_fiber(&bsync_state.bsync_fibers, bsync_process_fiber)
 	);
+	assert(*ipos == iend);
 }
 
 static void
@@ -1038,12 +1064,11 @@ bsync_ping(uint8_t host_id, const char **ipos, const char *iend)
 static void
 bsync_txn_proceed_request(struct bsync_txn_info *info)
 {BSYNC_TRACE
-	struct request *req = (struct request *)
-		region_alloc(&fiber()->gc, sizeof(struct request));
-	request_create(req, info->row->type);
-	request_decode(req, (const char*)info->row->body[0].iov_base,
+	struct request req;
+	request_create(&req, info->row->type);
+	request_decode(&req, (const char*)info->row->body[0].iov_base,
 			info->row->body[0].iov_len);
-	req->header = info->row;
+	req.header = info->row;
 	info->op->common->region = bsync_new_region();
 	struct bsync_parse_data data;
 	request_header_decode(info->row, bsync_space_cb, bsync_tuple_cb, &data);
@@ -1056,22 +1081,22 @@ bsync_txn_proceed_request(struct bsync_txn_info *info)
 		tuple = tuple_new(space->format, data.data, data.end);
 		space_validate_tuple(space, tuple);
 	} else {
-		const char *key = req->key;
+		const char *key = req.key;
 		uint32_t part_count = mp_decode_array(&key);
 		tuple = space->index[0]->findByKey(key, part_count);
 	}
 	TupleGuard guard(tuple);
 	bsync_parse_dup_key(info->common, space->index[0]->key_def, tuple);
-	assert(cord_is_main());
 	if (bsync_begin_op(info->common->dup_key, info->op->server_id)) {
 		rlist_add_tail_entry(&bsync_state.txn_queue, info, list);
 		try {
-			box_process(req, &null_port);
+			box_process(&req, &null_port);
 		} catch (Exception *e) {
 			if (info->op->server_id == BSYNC_SERVER_ID) {
 				if (!bsync_state.rollback) {
 					rlist_del_entry(info, list);
 				}
+				e->log();
 				goto error;
 			}
 			throw;
@@ -1111,7 +1136,9 @@ restart:BSYNC_TRACE
 		}
 	}
 	fiber_gc();
-	rlist_add_tail_entry(&bsync_state.txn_fiber_cache, fiber(), state);
+	assert(bsync_state.txn_fibers.active > 0);
+	--bsync_state.txn_fibers.active;
+	rlist_add_tail_entry(&bsync_state.txn_fibers.data, fiber(), state);
 	fiber_yield();BSYNC_TRACE
 	goto restart;
 }
@@ -1136,8 +1163,8 @@ bsync_txn_process(ev_loop *loop, ev_async *watcher, int event)
 				  fiber(), info->op->gsn);
 			fiber_call(info->owner);
 		} else {BSYNC_TRACE
-			fiber_call(bsync_fiber(&bsync_state.txn_fiber_cache,
-				bsync_txn_process_fiber));
+			fiber_call(bsync_fiber(&bsync_state.txn_fibers,
+						bsync_txn_process_fiber));
 		}
 	}
 	if (bsync_state.is_proceed_system) {
@@ -1150,50 +1177,47 @@ static void
 bsync_process_fiber(va_list /* ap */)
 {
 restart:BSYNC_TRACE
+	struct bsync_txn_info *info = NULL;
+	struct bsync_operation *oper = NULL;
 	if (bsync_state.iproxy_end) {
 		assert(bsync_state.state == bsync_state_ready);
 		bsync_proxy_processor();
-	} else {
-		struct bsync_txn_info *info =
-			STAILQ_FIRST(&bsync_state.bsync_proxy_input);
-		STAILQ_REMOVE_HEAD(&bsync_state.bsync_proxy_input, fifo);
-		if (info->op) {BSYNC_TRACE
-			if (bsync_state.state != bsync_state_ready)
-				return;
-			fiber_call(info->op->owner);
-		} else {BSYNC_TRACE
-			struct bsync_operation *oper = (struct bsync_operation *)
-				region_alloc(&fiber()->gc, sizeof(struct bsync_operation));
-			oper->common = (struct bsync_common *)
-				region_alloc(&fiber()->gc, sizeof(struct bsync_common));
-			oper->txn_data = info;
-			oper->txn_data->op = oper;
-			oper->common->dup_key = oper->txn_data->common->dup_key;
-			oper->common->region = oper->txn_data->common->region;
-			oper->lsn = oper->txn_data->row->lsn = ++bsync_state.lsn;
-			oper->owner = fiber();
-			if (bsync_state.state != bsync_state_ready) {
-				rlist_add_tail_entry(&bsync_state.election_ops,
-						     oper, list);
-				fiber_yield_timeout(bsync_state.election_timeout);
-				if (bsync_state.state != bsync_state_ready) {
-					BSYNC_TRACE
-					info->result = -1;
-					SWITCH_TO_TXN
-					goto exit;
-				}
-			}
-			if (bsync_state.leader_id == bsync_state.local_id) {
-				oper->server_id = 0;
-				bsync_queue_leader(oper, false);
-			} else {
-				oper->server_id = (bsync_state.local_id + 1);
-				bsync_queue_slave(oper);
-			}
+		goto exit;
+	}
+	info = STAILQ_FIRST(&bsync_state.bsync_proxy_input);
+	STAILQ_REMOVE_HEAD(&bsync_state.bsync_proxy_input, fifo);
+	oper = (struct bsync_operation *)
+		region_alloc(&fiber()->gc, sizeof(struct bsync_operation));
+	oper->common = (struct bsync_common *)
+		region_alloc(&fiber()->gc, sizeof(struct bsync_common));
+	oper->txn_data = info;
+	oper->txn_data->op = oper;
+	oper->common->dup_key = oper->txn_data->common->dup_key;
+	oper->common->region = oper->txn_data->common->region;
+	oper->lsn = oper->txn_data->row->lsn = ++bsync_state.lsn;
+	oper->owner = fiber();
+	if (bsync_state.state != bsync_state_ready) {
+		rlist_add_tail_entry(&bsync_state.election_ops,
+				     oper, list);
+		fiber_yield_timeout(bsync_state.election_timeout);
+		if (bsync_state.state != bsync_state_ready) {
+			BSYNC_TRACE
+			info->result = -1;
+			SWITCH_TO_TXN
+			goto exit;
 		}
 	}
+	if (bsync_state.leader_id == bsync_state.local_id) {
+		oper->server_id = 0;
+		bsync_queue_leader(oper, false);
+	} else {
+		oper->row = oper->txn_data->row;
+		oper->server_id = (bsync_state.local_id + 1);
+		bsync_queue_slave(oper);
+	}
 exit:	fiber_gc();
-	rlist_add_tail_entry(&bsync_state.bsync_fiber_cache, fiber(), state);
+	--bsync_state.bsync_fibers.active;
+	rlist_add_tail_entry(&bsync_state.bsync_fibers.data, fiber(), state);
 	fiber_yield();
 	goto restart;
 }
@@ -1232,9 +1256,18 @@ bsync_process(struct ev_loop *loop, struct ev_async *watcher, int event)
 	STAILQ_CONCAT(&bsync_state.bsync_proxy_input,
 			&bsync_state.bsync_proxy_queue);
 	tt_pthread_mutex_unlock(&bsync_state.mutex);
+	struct bsync_txn_info *info = NULL;
 	while (!STAILQ_EMPTY(&bsync_state.bsync_proxy_input)) {BSYNC_TRACE
-		fiber_call(bsync_fiber(&bsync_state.bsync_fiber_cache,
-					bsync_process_fiber));
+		info = STAILQ_FIRST(&bsync_state.bsync_proxy_input);
+		if (info->op) {BSYNC_TRACE
+			STAILQ_REMOVE_HEAD(&bsync_state.bsync_proxy_input, fifo);
+			if (bsync_state.state != bsync_state_ready)
+				return;
+			fiber_call(info->op->owner);
+		} else {
+			fiber_call(bsync_fiber(&bsync_state.bsync_fibers,
+						bsync_process_fiber));
+		}
 	}
 }
 
@@ -1324,6 +1357,7 @@ bsync_disconnected(uint8_t host_id)
 			break;
 		}
 	}
+	BSYNC_REMOTE.send_queue_size = 0;
 	rlist_create(&BSYNC_REMOTE.send_queue);
 	rlist_create(&BSYNC_REMOTE.op_queue);
 	if (host_id == bsync_state.leader_id) {
@@ -1576,7 +1610,8 @@ bsync_accept_handler(va_list ap)
 	}
 	try {
 		bsync_incoming(&coio, iobuf, host_id);
-	} catch(...) {
+	} catch(Exception *e) {
+		e->log();
 		if (--BSYNC_REMOTE.connected == 1) {BSYNC_TRACE
 			bsync_disconnected(host_id);
 			BSYNC_REMOTE.connected = 0;
@@ -1631,7 +1666,7 @@ encode_request(uint8_t host_id, struct bsync_host_info *elem, struct iovec *iov)
 	if (elem->code == bsync_mtype_body ||
 		elem->code == bsync_mtype_proxy_request)
 	{
-		iovcnt += xrow_header_encode(elem->op->txn_data->row, iov + 1);
+		iovcnt += xrow_header_encode(elem->op->row, iov + 1);
 		for (int i = 1; i < iovcnt; ++i) {
 			bsize += iov[i].iov_len;
 		}
@@ -1652,18 +1687,25 @@ encode_request(uint8_t host_id, struct bsync_host_info *elem, struct iovec *iov)
 	return iovcnt;
 }
 
+static ssize_t bytes = 0, count = 0, iovsum = 0;
 static void
 bsync_writev(struct ev_io *coio, struct iovec *iov, int iovcnt, uint8_t host_id)
 {
 	BSYNC_REMOTE.flags |= bsync_host_active_write;
-	coio_writev_timeout(coio, iov, iovcnt, -1, bsync_state.write_timeout);
+	bytes += coio_writev_timeout(coio, iov, iovcnt, -1, bsync_state.write_timeout);
+	iovsum += iovcnt;
 	BSYNC_REMOTE.flags &= !bsync_host_active_write;
+	if (++count == 10000) {
+//		say_info("send %ld bytes and %ld chunks per system call",
+//			bytes / count, iovsum / count);
+		iovsum = bytes = count = 0;
+	}
 	if (errno == ETIMEDOUT) {
 		tnt_raise(SocketError, coio->fd, "timeout");
 	}
 }
 
-#define BUFV_IOVMAX 10*XROW_IOVMAX
+#define BUFV_IOVMAX 200*XROW_IOVMAX
 static void
 bsync_send_queue(struct ev_io *coio, uint8_t host_id)
 {BSYNC_TRACE
@@ -1675,6 +1717,7 @@ bsync_send_queue(struct ev_io *coio, uint8_t host_id)
 			struct bsync_host_info *elem =
 				rlist_shift_entry(&BSYNC_REMOTE.send_queue,
 					struct bsync_host_info, list);
+			--BSYNC_REMOTE.send_queue_size;
 			if (elem->code == bsync_mtype_body ||
 				elem->code == bsync_mtype_proxy_accept)
 			{
@@ -1761,6 +1804,7 @@ bsync_outgoing(struct ev_io *coio, uint8_t host_id)
 			bsync_connected(host_id);
 		}
 	}
+	ev_tstamp prev = ev_now(loop());
 	while(!bsync_state.is_shutdown && BSYNC_REMOTE.fiber_out == fiber()) {
 		if (bsync_extended_header_size(host_id) > 0 &&
 			rlist_empty(&BSYNC_REMOTE.send_queue) &&
@@ -1768,7 +1812,16 @@ bsync_outgoing(struct ev_io *coio, uint8_t host_id)
 		{
 			fiber_yield_timeout(bsync_state.submit_timeout);
 		}
+		ev_tstamp now = ev_now(loop());
+		while (BSYNC_REMOTE.send_queue_size &&
+			BSYNC_REMOTE.send_queue_size < 200 &&
+			(now - prev) < 0.001)
+		{
+			fiber_yield_timeout(0.001 + prev - now);
+			now = ev_now(loop());
+		}
 		bsync_send(coio, host_id);
+		prev = ev_now(loop());
 		fiber_gc();
 		fiber_yield_timeout(bsync_state.ping_timeout);
 	}
@@ -1813,7 +1866,8 @@ bsync_out_fiber(va_list ap)
 	BSYNC_TRACE
 	try {
 		bsync_outgoing(&coio, host_id);
-	} catch (...) {
+	} catch (Exception *e) {
+		e->log();
 	}
 	BSYNC_TRACE
 	if (BSYNC_REMOTE.fiber_out != fiber()) return;
@@ -1850,6 +1904,7 @@ bsync_cfg_push_host(uint8_t host_id, const char *ibegin,
 	BSYNC_REMOTE.flags = 0;
 	rlist_create(&BSYNC_REMOTE.op_queue);
 	rlist_create(&BSYNC_REMOTE.send_queue);
+	BSYNC_REMOTE.send_queue_size = 0;
 	BSYNC_REMOTE.active_ops = mh_bsync_new();
 	if (BSYNC_REMOTE.active_ops == NULL)
 		panic("out of memory");
@@ -1905,15 +1960,15 @@ bsync_init_state(const struct vclock* vclock)
 		BSYNC_LOCAL.gsn = vclock->lsn[BSYNC_SERVER_ID];
 }
 
-ev_loop *
-bsync_init(wal_writer* initial, ev_loop *loop, struct vclock *vclock)
+void
+bsync_init(struct recovery_state *r)
 {BSYNC_TRACE
-	assert (initial != NULL);
+	assert (r != NULL);
 	if (cfg_geti("bsync_enable") <= 0) {
 		say_info("bsync_enable=%d\n", cfg_geti("bsync_enable"));
-		return loop;
+		return;
 	}
-	wal_local_writer = initial;
+	recovery_state = r;
 	bsync_state.iproxy_end = NULL;
 	bsync_state.iproxy_pos = NULL;
 	bsync_state.rollback = false;
@@ -1941,8 +1996,12 @@ bsync_init(wal_writer* initial, ev_loop *loop, struct vclock *vclock)
 	STAILQ_INIT(&bsync_state.txn_proxy_queue);
 	STAILQ_INIT(&bsync_state.bsync_proxy_input);
 	STAILQ_INIT(&bsync_state.bsync_proxy_queue);
-	rlist_create(&bsync_state.txn_fiber_cache);
-	rlist_create(&bsync_state.bsync_fiber_cache);
+	bsync_state.txn_fibers.size = 0;
+	bsync_state.txn_fibers.active = 0;
+	bsync_state.bsync_fibers.size = 0;
+	bsync_state.bsync_fibers.active = 0;
+	rlist_create(&bsync_state.txn_fibers.data);
+	rlist_create(&bsync_state.bsync_fibers.data);
 	rlist_create(&bsync_state.proxy_queue);
 	rlist_create(&bsync_state.commit_queue);
 	rlist_create(&bsync_state.txn_queue);
@@ -1964,20 +2023,25 @@ bsync_init(wal_writer* initial, ev_loop *loop, struct vclock *vclock)
 
 	/* II. Start the thread. */
 	bsync_cfg_read();
-	bsync_init_state(vclock);
+	bsync_init_state(&recovery_state->vclock);
 	tt_pthread_mutex_lock(&bsync_state.mutex);
-	if (cord_start(&bsync_state.cord, "bsync", bsync_thread, NULL)) {
-		wal_local_writer = NULL;
-		return loop;
+	if (!cord_start(&bsync_state.cord, "bsync", bsync_thread, NULL)) {
+		tt_pthread_cond_wait(&bsync_state.cond, &bsync_state.mutex);
+		tt_pthread_mutex_unlock(&bsync_state.mutex);
+		recovery_state->writer->txn_loop = bsync_loop;
+	} else {
+		recovery_state = NULL;
 	}
-	tt_pthread_cond_wait(&bsync_state.cond, &bsync_state.mutex);
-	tt_pthread_mutex_unlock(&bsync_state.mutex);
-	return bsync_loop;
 }
 
 static void*
 bsync_thread(void*)
 {BSYNC_TRACE
+	char thread_name[64];
+	pthread_getname_np(bsync_state.cord.id, thread_name, sizeof(thread_name));
+	int name_len = strlen(thread_name);
+	snprintf(thread_name + name_len, 64 - name_len, " bsync");
+	pthread_setname_np(bsync_state.cord.id, thread_name);
 	tt_pthread_mutex_lock(&bsync_state.mutex);
 	iobuf_init();
 	coio_service_init(&bsync_coio, "bsync", bsync_accept_handler, NULL);
@@ -2013,11 +2077,11 @@ bsync_thread(void*)
 void
 bsync_writer_stop(struct recovery_state *r)
 {BSYNC_TRACE
-	if (wal_local_writer == NULL) {
+	assert(recovery_state == NULL || recovery_state == r);
+	if (recovery_state == NULL) {
 		recovery_delete(r);
 		return;
 	}
-	recovery_state = r;
 	bsync_state.is_shutdown = true;
 	tt_pthread_mutex_lock(&bsync_state.mutex);
 	ev_async_send(bsync_loop, &bsync_process_event);
@@ -2026,18 +2090,20 @@ bsync_writer_stop(struct recovery_state *r)
 		panic_syserror("BSYNC writer: thread join failed");
 	}
 	ev_async_stop(txn_loop, &txn_process_event);
-	wal_local_writer = NULL;
-	rlist_del(&bsync_state.txn_fiber_cache);
-	rlist_del(&bsync_state.bsync_fiber_cache);
-	rlist_del(&bsync_state.proxy_queue);
-	rlist_del(&bsync_state.commit_queue);
-	rlist_del(&bsync_state.txn_queue);
-	rlist_del(&bsync_state.execute_queue);
-	rlist_del(&bsync_state.election_ops);
-	rlist_del(&bsync_state.region_free);
-	rlist_del(&bsync_state.region_gc);
+	bsync_state.txn_fibers.size = bsync_state.txn_fibers.active = 0;
+	bsync_state.bsync_fibers.size = bsync_state.bsync_fibers.active = 0;
+	rlist_create(&bsync_state.txn_fibers.data);
+	rlist_create(&bsync_state.bsync_fibers.data);
+	rlist_create(&bsync_state.proxy_queue);
+	rlist_create(&bsync_state.commit_queue);
+	rlist_create(&bsync_state.txn_queue);
+	rlist_create(&bsync_state.execute_queue);
+	rlist_create(&bsync_state.election_ops);
+	rlist_create(&bsync_state.region_free);
+	rlist_create(&bsync_state.region_gc);
 	for (uint8_t host_id = 0; host_id < bsync_state.num_hosts; ++host_id) {
-		rlist_del(&BSYNC_REMOTE.send_queue);
+		rlist_create(&BSYNC_REMOTE.send_queue);
+		BSYNC_REMOTE.send_queue_size = 0;
 		rlist_del(&BSYNC_REMOTE.op_queue);
 		mh_bsync_delete(BSYNC_REMOTE.active_ops);
 	}

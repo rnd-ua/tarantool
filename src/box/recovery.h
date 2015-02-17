@@ -58,7 +58,27 @@ typedef void (apply_row_f)(struct recovery_state *, void *,
  * LSN makes it to disk.
  */
 
-struct wal_writer;
+struct wal_write_request;
+/* Context of the WAL writer thread. */
+STAILQ_HEAD(wal_fifo, wal_write_request);
+
+struct wal_writer
+{
+	struct wal_fifo input;
+	struct wal_fifo commit;
+	struct cord cord;
+	pthread_mutex_t mutex;
+	pthread_cond_t cond;
+	ev_async write_event;
+	int rows_per_wal;
+	struct fio_batch *batch;
+	bool is_shutdown;
+	bool is_rollback;
+	ev_loop *txn_loop;
+	struct vclock vclock;
+	bool is_started;
+};
+
 struct wal_watcher;
 
 enum wal_mode { WAL_NONE = 0, WAL_WRITE, WAL_FSYNC, WAL_MODE_MAX };
@@ -141,7 +161,7 @@ void recovery_stop_local(struct recovery_state *r);
 void recovery_finalize(struct recovery_state *r, int rows_per_wal);
 
 int64_t wal_write_lsn(struct recovery_state *r, struct xrow_header *row);
-int64_t wal_write(struct wal_writer *writer, struct xrow_header *row);
+int64_t wal_write(struct recovery_state *r, struct xrow_header *row);
 
 void recovery_setup_panic(struct recovery_state *r, bool on_snap_error, bool on_wal_error);
 void recovery_apply_row(struct recovery_state *r, struct xrow_header *packet);

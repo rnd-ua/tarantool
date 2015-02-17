@@ -625,26 +625,6 @@ struct wal_write_request {
 	struct xrow_header *row;
 };
 
-/* Context of the WAL writer thread. */
-STAILQ_HEAD(wal_fifo, wal_write_request);
-
-struct wal_writer
-{
-	struct wal_fifo input;
-	struct wal_fifo commit;
-	struct cord cord;
-	pthread_mutex_t mutex;
-	pthread_cond_t cond;
-	ev_async write_event;
-	int rows_per_wal;
-	struct fio_batch *batch;
-	bool is_shutdown;
-	bool is_rollback;
-	ev_loop *txn_loop;
-	struct vclock vclock;
-	bool is_started;
-};
-
 static struct wal_writer wal_writer;
 
 /**
@@ -804,7 +784,7 @@ wal_writer_start(struct recovery_state *r, int rows_per_wal)
 	/* I. Initialize the state. */
 	wal_writer_init(&wal_writer, &r->vclock, rows_per_wal);
 	r->writer = &wal_writer;
-	r->writer->txn_loop = bsync_init(r->writer, r->writer->txn_loop, &r->vclock);
+	bsync_init(r);
 	ev_async_start(wal_writer.txn_loop, &wal_writer.write_event);
 
 	/* II. Start the thread. */
@@ -1037,15 +1017,15 @@ wal_write_lsn(struct recovery_state *r, struct xrow_header *row)
 	 * snapshots still works with WAL turned off.
 	 */
 	fill_lsn(r, row);
-	if (r->wal_mode == WAL_NONE)
-		return 0;
-	return wal_write(r->writer, row);
+	return wal_write(r, row);
 }
 
 int64_t
-wal_write(struct wal_writer *writer, struct xrow_header *row)
+wal_write(struct recovery_state *r, struct xrow_header *row)
 {
-
+	if (r->wal_mode == WAL_NONE)
+		return 0;
+	struct wal_writer *writer = r->writer;
 	ERROR_INJECT_RETURN(ERRINJ_WAL_IO);
 
 	struct wal_write_request *req = (struct wal_write_request *)
