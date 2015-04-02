@@ -282,7 +282,7 @@ matras_delete_version(struct matras *m, matras_id_t ver_id);
  * Returns true if ok, and false if failed to allocate memory.
  * Only needed (and does any work) if some versions are used.
  */
-bool
+void *
 matras_before_change(struct matras *m, matras_id_t id);
 
 /*

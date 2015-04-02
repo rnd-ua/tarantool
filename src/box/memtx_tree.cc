@@ -85,6 +85,9 @@ tree_iterator(struct iterator *it)
 static void
 tree_iterator_free(struct iterator *iterator)
 {
+	struct tree_iterator *it = tree_iterator(iterator);
+	struct bps_tree_index *tree = (struct bps_tree_index *)it->tree;
+	bps_tree_index_itr_destroy(tree, &it->bps_tree_iter);
 	free(iterator);
 }
 
@@ -285,6 +288,8 @@ MemtxTree::initIterator(struct iterator *iterator, enum iterator_type type,
 {
 	assert(part_count == 0 || key != NULL);
 	struct tree_iterator *it = tree_iterator(iterator);
+	struct bps_tree_index *mtree = (struct bps_tree_index *)it->tree;
+	bps_tree_index_itr_destroy(mtree, &it->bps_tree_iter);
 
 	if (part_count == 0) {
 		/*
@@ -346,6 +351,14 @@ MemtxTree::initIterator(struct iterator *iterator, enum iterator_type type,
 		tnt_raise(ClientError, ER_UNSUPPORTED,
 			  "Tree index", "requested iterator type");
 	}
+}
+
+void
+MemtxTree::freezeIterator(struct iterator *iterator)
+{
+	struct tree_iterator *it = tree_iterator(iterator);
+	struct bps_tree_index *tree = (struct bps_tree_index *)it->tree;
+	bps_tree_index_itr_freeze(tree, &it->bps_tree_iter);
 }
 
 void

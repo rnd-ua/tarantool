@@ -470,7 +470,7 @@ matras_delete_version(struct matras *m, matras_id_t ver_id)
  * Notify matras that memory at given ID will be changed.
  * Returns true if ok, and false if failed to allocate memory.
  */
-bool
+void *
 matras_before_change(struct matras *m, matras_id_t id)
 {
 	assert(id < m->block_counts[0]);
@@ -478,6 +478,7 @@ matras_before_change(struct matras *m, matras_id_t id)
 	/* see "Shifts and masks explanation" for details */
 	matras_id_t n1 = id >> m->shift1;
 	matras_id_t n2 = (id & m->mask1) >> m->shift2;
+	matras_id_t n3 = id & m->mask2;
 
 	struct matras_record *l1 = &m->roots[0];
 	struct matras_record *l2 = &l1->ptr[n1];
@@ -485,12 +486,12 @@ matras_before_change(struct matras *m, matras_id_t id)
 	matras_version_tag_t owner_mask3 = l3->tag & m->ver_occ_mask;
 	assert(owner_mask3 & 1);
 	if (owner_mask3 == 1)
-		return true; /* private page */
+		return &((char *)(l3->ptr))[n3 * m->block_size]; /* private page */
 
 	struct matras_record *new_extent3 =
 		(struct matras_record *)m->alloc_func();
 	if (!new_extent3)
-		return false;
+		return 0;
 
 	matras_version_tag_t owner_mask1 = l1->tag & m->ver_occ_mask;
 	assert(owner_mask1 & 1);
@@ -501,7 +502,7 @@ matras_before_change(struct matras *m, matras_id_t id)
 		new_extent1 = (struct matras_record *)m->alloc_func();
 		if (!new_extent1) {
 			m->free_func(new_extent3);
-			return false;
+			return 0;
 		}
 	}
 	if (owner_mask2 != 1) {
@@ -510,7 +511,7 @@ matras_before_change(struct matras *m, matras_id_t id)
 			m->free_func(new_extent3);
 			if (owner_mask1 != 1)
 				m->free_func(new_extent1);
-			return false;
+			return 0;
 		}
 	}
 	matras_version_tag_t new_tag = ~(m->ver_occ_mask ^ 1);
@@ -518,41 +519,43 @@ matras_before_change(struct matras *m, matras_id_t id)
 	if (owner_mask1 != 1) {
 		memcpy(new_extent1, l1->ptr, m->extent_size);
 		l1->tag = new_tag;
+		l1->ptr = new_extent1;
 		matras_version_tag_t run = owner_mask1 ^ 1;
 		matras_version_tag_t oth_tag = run & m->ver_occ_mask;
 		do {
 			uint32_t ver = __builtin_ctzl(run);
 			run ^= ((matras_version_tag_t)1) << ver;
-			m->roots[ver].ptr = new_extent1;
 			m->roots[ver].tag = oth_tag;
 		} while (run);
+		l2 = &l1->ptr[n1];
 	}
 
 	if (owner_mask2 != 1) {
 		memcpy(new_extent2, l2->ptr, m->extent_size);
 		l2->tag = new_tag;
+		l2->ptr = new_extent2;
 		matras_version_tag_t run = owner_mask2 ^ 1;
-		matras_version_tag_t oth_tag =run & m->ver_occ_mask;
+		matras_version_tag_t oth_tag = run & m->ver_occ_mask;
 		do {
 			uint32_t ver = __builtin_ctzl(run);
 			run ^= ((matras_version_tag_t)1) << ver;
-			m->roots[ver].ptr[n1].ptr = new_extent2;
 			m->roots[ver].ptr[n1].tag = oth_tag;
 		} while (run);
+		l3 = &l2->ptr[n2];
 	}
 
 	memcpy(new_extent3, l3->ptr, m->extent_size);
 	l3->tag = new_tag;
+	l3->ptr = new_extent3;
 	matras_version_tag_t run = owner_mask3 ^ 1;
 	matras_version_tag_t oth_tag = run & m->ver_occ_mask;
 	do {
 		uint32_t ver = __builtin_ctzl(run);
 		run ^= ((matras_version_tag_t)1) << ver;
-		m->roots[ver].ptr[n1].ptr[n2].ptr = new_extent3;
 		m->roots[ver].ptr[n1].ptr[n2].tag = oth_tag;
 	} while (run);
 
-	return true;
+	return &((char *)new_extent3)[n3 * m->block_size]; ;
 }
 
 /*

@@ -156,6 +156,8 @@
  * bps_tree_elem_t *bps_tree_itr_get_elem(tree, itr);
  * bool bps_tree_itr_next(tree, itr);
  * bool bps_tree_itr_prev(tree, itr);
+ * bool bps_tree_itr_freeze(tree, itr);
+ * void bps_tree_itr_destroy(tree, itr);
  */
 /* }}} */
 
@@ -354,6 +356,8 @@ typedef uint32_t bps_tree_block_id_t;
 #define bps_tree_itr_get_elem _bps_tree(itr_get_elem)
 #define bps_tree_itr_next _bps_tree(itr_next)
 #define bps_tree_itr_prev _bps_tree(itr_prev)
+#define bps_tree_itr_freeze _bps_tree(itr_freeze)
+#define bps_tree_itr_destroy _bps_tree(itr_destroy)
 #define bps_tree_debug_check _bps_tree(debug_check)
 #define bps_tree_print _bps_tree(print)
 #define bps_tree_debug_check_internal_functions \
@@ -369,6 +373,9 @@ typedef uint32_t bps_tree_block_id_t;
 #define BPS_TREE_BT_LEAF _BPS_TREE(BT_LEAF)
 
 #define bps_tree_restore_block _bps_tree(restore_block)
+#define bps_tree_restore_block_ver _bps_tree(restore_block_ver)
+#define bps_tree_root _bps_tree(root)
+#define bps_tree_before_change_block _bps_tree(before_change_block)
 #define bps_tree_find_ins_point_key _bps_tree(find_ins_point_key)
 #define bps_tree_find_ins_point_elem _bps_tree(find_ins_point_elem)
 #define bps_tree_find_after_ins_point_key _bps_tree(find_after_ins_point_key)
@@ -450,8 +457,6 @@ typedef uint32_t bps_tree_block_id_t;
 	_bps_tree(debug_check_insert_and_move_to_right_inner)
 #define bps_tree_debug_check_insert_and_move_to_left_inner \
 	_bps_tree(debug_check_insert_and_move_to_left_inner)
-#define bps_tree_debug_check_insert_and_move_to_left_inner \
-	_bps_tree(debug_check_insert_and_move_to_left_inner)
 /* }}} */
 
 /* {{{ BPS-tree interface (declaration) */
@@ -472,9 +477,7 @@ typedef uint32_t bps_tree_block_id_t;
  * Main tree struct. One instance - one tree.
  */
 struct bps_tree {
-	/* Pointer to root block. Is NULL in empty tree. */
-	struct bps_block *root;
-	/* ID of root block. Undefined in empty tree. */
+	/* ID of root block. (bps_tree_block_id_t)-1 in empty tree. */
 	bps_tree_block_id_t root_id;
 	/* IDs of first and last block. (-1) in empty tree. */
 	bps_tree_block_id_t first_id, last_id;
@@ -485,7 +488,7 @@ struct bps_tree {
 	/* Number of elements in tree */
 	size_t size;
 	/* Head of list of garbaged blocks */
-	struct bps_garbage *garbage_head;
+	bps_tree_block_id_t garbage_head_id;
 	/* User-provided argument for comparator */
 	bps_tree_arg_t arg;
 	/* Copy of maximal element in tree. Used for beauty */
@@ -521,6 +524,8 @@ struct bps_tree_iterator {
 	bps_tree_block_id_t block_id;
 	/* Position of an element in the block. Could be -1 for last in block*/
 	bps_tree_pos_t pos;
+	/* Version of matras memory. 0 for main version, nonzero for MVCC */
+	bps_tree_pos_t matras_version;
 };
 
 /**
@@ -546,8 +551,8 @@ typedef void (*bps_tree_extent_free_f)(void *);
  */
 void
 bps_tree_create(struct bps_tree *tree, bps_tree_arg_t arg,
-		bps_tree_extent_alloc_f extent_alloc_func,
-		bps_tree_extent_free_f extent_free_func);
+	bps_tree_extent_alloc_f extent_alloc_func,
+	bps_tree_extent_free_f extent_free_func);
 
 /**
  * @brief Fills a new (asserted) tree with values from sorted array.
@@ -559,7 +564,7 @@ bps_tree_create(struct bps_tree *tree, bps_tree_arg_t arg,
  */
 bool
 bps_tree_build(struct bps_tree *tree, bps_tree_elem_t *sorted_array,
-	       size_t array_size);
+	size_t array_size);
 
 /**
  * @brief Tree destruction. Frees allocated memory.
@@ -591,7 +596,7 @@ bps_tree_find(const struct bps_tree *tree, bps_tree_key_t key);
  */
 bool
 bps_tree_insert(struct bps_tree *tree, bps_tree_elem_t new_elem,
-			   bps_tree_elem_t *replaced);
+	bps_tree_elem_t *replaced);
 
 /**
  * @brief Delete an element from a tree.
@@ -654,8 +659,7 @@ bps_tree_itr_is_invalid(struct bps_tree_iterator *itr);
  */
 bool
 bps_tree_itr_are_equal(const struct bps_tree *tree,
-		       struct bps_tree_iterator itr1,
-		       struct bps_tree_iterator itr2);
+	struct bps_tree_iterator itr1, struct bps_tree_iterator itr2);
 
 /**
  * @brief Get an iterator to the first element of the tree
@@ -685,7 +689,7 @@ bps_tree_itr_last(const struct bps_tree *tree);
  */
 struct bps_tree_iterator
 bps_tree_lower_bound(const struct bps_tree *tree, bps_tree_key_t key,
-		     bool *exact);
+bool *exact);
 
 /**
  * @brief Get an iterator to the first element that is greater than key
@@ -699,7 +703,7 @@ bps_tree_lower_bound(const struct bps_tree *tree, bps_tree_key_t key,
  */
 struct bps_tree_iterator
 bps_tree_upper_bound(const struct bps_tree *tree, bps_tree_key_t key,
-		     bool *exact);
+bool *exact);
 
 /**
  * @brief Get a pointer to the element pointed by iterator.
@@ -710,7 +714,7 @@ bps_tree_upper_bound(const struct bps_tree *tree, bps_tree_key_t key,
  */
 bps_tree_elem_t *
 bps_tree_itr_get_elem(const struct bps_tree *tree,
-		      struct bps_tree_iterator itr);
+	struct bps_tree_iterator itr);
 
 /**
  * @brief Increments an iterator, makes it point to the next element
@@ -737,6 +741,26 @@ bool
 bps_tree_itr_prev(const struct bps_tree *tree, struct bps_tree_iterator *itr);
 
 /**
+ * @brief Freezes tree state for given iterator. All following tree modification
+ * will not apply to that iterator iteration. That iterator should be destroyed
+ * with a bps_tree_itr_destroy call after usage.
+ * @param tree - pointer to a tree
+ * @param itr - pointer to tree iterator
+ * @return - true on success, false if no more version is available in matras
+ */
+bool
+bps_tree_itr_freeze(struct bps_tree *tree, struct bps_tree_iterator *itr);
+
+/**
+ * @brief Destroy an iterator that was frozen before. Useless for not frozen
+ * iterators.
+ * @param tree - pointer to a tree
+ * @param itr - pointer to tree iterator
+ */
+void
+bps_tree_itr_destroy(struct bps_tree *tree, struct bps_tree_iterator *itr);
+
+/**
  * @brief Debug self-checking. Returns bitmask of found errors (0
  * on success).
  *  I hope you will not need it.
@@ -755,7 +779,6 @@ bps_tree_debug_check(const struct bps_tree *tree);
 void
 bps_tree_print(const struct bps_tree *tree, const char *elem_fmt);
 
-
 /**
  * @brief Debug print tree to output in readable form.
  *  I hope you will not need it.
@@ -767,7 +790,6 @@ int
 bps_tree_debug_check_internal_functions(bool assertme);
 
 /* }}} */
-
 
 /* {{{ BPS-tree implementation (definition) */
 
@@ -808,12 +830,11 @@ struct bps_block {
  * Calculation of max sizes (max count + 1)
  */
 enum bps_tree_max_sizes {
-	BPS_TREE_MAX_COUNT_IN_LEAF =
-		(BPS_TREE_BLOCK_SIZE - sizeof(struct bps_block)
-		 - 2 * sizeof(bps_tree_block_id_t) )
+	BPS_TREE_MAX_COUNT_IN_LEAF = (BPS_TREE_BLOCK_SIZE
+		- sizeof(struct bps_block) - 2 * sizeof(bps_tree_block_id_t))
 		/ sizeof(bps_tree_elem_t),
-	BPS_TREE_MAX_COUNT_IN_INNER =
-		(BPS_TREE_BLOCK_SIZE - sizeof(struct bps_block))
+	BPS_TREE_MAX_COUNT_IN_INNER = (BPS_TREE_BLOCK_SIZE
+		- sizeof(struct bps_block))
 		/ (sizeof(bps_tree_elem_t) + sizeof(bps_tree_block_id_t)),
 	BPS_TREE_MAX_DEPTH = 16
 };
@@ -873,10 +894,8 @@ CT_ASSERT_G(sizeof(struct bps_inner) <= BPS_TREE_BLOCK_SIZE);
 struct bps_garbage {
 	/* Block header */
 	struct bps_block header;
-	/* Stored id of this block */
-	bps_tree_block_id_t id;
-	/* Next garbaged block in single-linked list */
-	struct bps_garbage *next;
+	/* Next garbaged block id in single-linked list */
+	bps_tree_block_id_t next_id;
 };
 
 /**
@@ -931,25 +950,23 @@ struct bps_leaf_path_elem {
  * @param extent_free_func - pointer to function that allocates extents,
  *  see bps_tree_extent_free_f description for details
  */
-inline void
-bps_tree_create(struct bps_tree *tree, bps_tree_arg_t arg,
-		bps_tree_extent_alloc_f extent_alloc_func,
-		bps_tree_extent_free_f extent_free_func)
+inline void bps_tree_create(struct bps_tree *tree, bps_tree_arg_t arg,
+	bps_tree_extent_alloc_f extent_alloc_func,
+	bps_tree_extent_free_f extent_free_func)
 {
-	tree->root = 0;
-	tree->first_id = (bps_tree_block_id_t)(-1);
-	tree->last_id = (bps_tree_block_id_t)(-1);
+	tree->root_id = (bps_tree_block_id_t) (-1);
+	tree->first_id = (bps_tree_block_id_t) (-1);
+	tree->last_id = (bps_tree_block_id_t) (-1);
 	tree->leaf_count = 0;
 	tree->inner_count = 0;
 	tree->garbage_count = 0;
 	tree->depth = 0;
 	tree->size = 0;
-	tree->garbage_head = 0;
+	tree->garbage_head_id = (bps_tree_block_id_t) (-1);
 	tree->arg = arg;
 
-	matras_create(&tree->matras,
-		      BPS_TREE_EXTENT_SIZE, BPS_TREE_BLOCK_SIZE,
-		      extent_alloc_func, extent_free_func);
+	matras_create(&tree->matras, BPS_TREE_EXTENT_SIZE, BPS_TREE_BLOCK_SIZE,
+		extent_alloc_func, extent_free_func);
 
 #ifdef BPS_TREE_DEBUG_BRANCH_VISIT
 	/* Bit masks of different branches visits */
@@ -971,26 +988,25 @@ bps_tree_create(struct bps_tree *tree, bps_tree_arg_t arg,
  * @param tree - pointer to a tree
  * @param sorted_array - pointer to the sorted array
  * @param array_size - size of the array (count of elements)
-  * @return true on success, false on memory error
+ * @return true on success, false on memory error
  */
-inline bool
-bps_tree_build(struct bps_tree *tree, bps_tree_elem_t *sorted_array,
-	       size_t array_size)
+inline bool bps_tree_build(struct bps_tree *tree, bps_tree_elem_t *sorted_array,
+	size_t array_size)
 {
 	assert(tree->size == 0);
-	assert(tree->root == 0);
-	assert(tree->garbage_head == 0);
+	assert(tree->root_id == (bps_tree_block_id_t )(-1));
+	assert(tree->garbage_head_id == (bps_tree_block_id_t )(-1));
 	assert(tree->matras.block_counts[0] == 0);
 	if (array_size == 0)
 		return true;
 	bps_tree_block_id_t leaf_count = (array_size +
-		BPS_TREE_MAX_COUNT_IN_LEAF - 1) / BPS_TREE_MAX_COUNT_IN_LEAF;
+	BPS_TREE_MAX_COUNT_IN_LEAF - 1) / BPS_TREE_MAX_COUNT_IN_LEAF;
 
 	bps_tree_block_id_t depth = 1;
 	bps_tree_block_id_t level_count = leaf_count;
 	while (level_count > 1) {
 		level_count = (level_count + BPS_TREE_MAX_COUNT_IN_INNER - 1)
-			      / BPS_TREE_MAX_COUNT_IN_INNER;
+			/ BPS_TREE_MAX_COUNT_IN_INNER;
 		depth++;
 	}
 
@@ -1001,7 +1017,7 @@ bps_tree_build(struct bps_tree *tree, bps_tree_elem_t *sorted_array,
 	for (bps_tree_block_id_t i = 0; i < depth - 1; i++) {
 		level_child_count[i] = level_count;
 		level_count = (level_count + BPS_TREE_MAX_COUNT_IN_INNER - 1)
-			      / BPS_TREE_MAX_COUNT_IN_INNER;
+			/ BPS_TREE_MAX_COUNT_IN_INNER;
 		level_block_count[i] = level_count;
 		parents[i] = 0;
 	}
@@ -1010,21 +1026,20 @@ bps_tree_build(struct bps_tree *tree, bps_tree_elem_t *sorted_array,
 	size_t elems_left = array_size;
 	bps_tree_elem_t *current = sorted_array;
 	struct bps_leaf *leaf = 0;
-	bps_tree_block_id_t prev_leaf_id = (bps_tree_block_id_t)-1;
-	bps_tree_block_id_t first_leaf_id = (bps_tree_block_id_t)-1;
-	bps_tree_block_id_t last_leaf_id = (bps_tree_block_id_t)-1;
+	bps_tree_block_id_t prev_leaf_id = (bps_tree_block_id_t) -1;
+	bps_tree_block_id_t first_leaf_id = (bps_tree_block_id_t) -1;
+	bps_tree_block_id_t last_leaf_id = (bps_tree_block_id_t) -1;
 	bps_tree_block_id_t inner_count = 0;
-	bps_tree_block_id_t root_if_inner_id = (bps_tree_block_id_t)-1;
-	struct bps_inner *root_if_inner = 0;
+	bps_tree_block_id_t root_if_inner_id = (bps_tree_block_id_t) -1;
 	do {
 		bps_tree_block_id_t id;
-		struct bps_leaf *new_leaf = (struct bps_leaf *)
-			matras_alloc(&tree->matras, &id);
+		struct bps_leaf *new_leaf = (struct bps_leaf *) matras_alloc(
+			&tree->matras, &id);
 		if (!new_leaf) {
 			matras_reset(&tree->matras);
 			return false;
 		}
-		if (first_leaf_id == (bps_tree_block_id_t)-1)
+		if (first_leaf_id == (bps_tree_block_id_t) -1)
 			first_leaf_id = id;
 		last_leaf_id = id;
 		if (leaf)
@@ -1040,10 +1055,10 @@ bps_tree_build(struct bps_tree *tree, bps_tree_elem_t *sorted_array,
 
 		bps_tree_block_id_t insert_id = id;
 		for (bps_tree_block_id_t i = 0; i < depth - 1; i++) {
-			bps_tree_block_id_t new_id = (bps_tree_block_id_t)-1;
+			bps_tree_block_id_t new_id = (bps_tree_block_id_t) -1;
 			if (!parents[i]) {
-				parents[i] = (struct bps_inner *)
-					matras_alloc(&tree->matras, &new_id);
+				parents[i] = (struct bps_inner *) matras_alloc(
+					&tree->matras, &new_id);
 				if (!parents[i]) {
 					matras_reset(&tree->matras);
 					return false;
@@ -1054,11 +1069,10 @@ bps_tree_build(struct bps_tree *tree, bps_tree_elem_t *sorted_array,
 			}
 			parents[i]->child_ids[parents[i]->header.size] =
 				insert_id;
-			if (new_id == (bps_tree_block_id_t)-1)
+			if (new_id == (bps_tree_block_id_t) -1)
 				break;
 			if (i == depth - 2) {
 				root_if_inner_id = new_id;
-				root_if_inner = parents[i];
 			} else {
 				insert_id = new_id;
 			}
@@ -1067,8 +1081,8 @@ bps_tree_build(struct bps_tree *tree, bps_tree_elem_t *sorted_array,
 		bps_tree_elem_t insert_value = current[leaf->header.size - 1];
 		for (bps_tree_block_id_t i = 0; i < depth - 1; i++) {
 			parents[i]->header.size++;
-			bps_tree_block_id_t max_size = level_child_count[i] /
-						       level_block_count[i];
+			bps_tree_block_id_t max_size = level_child_count[i]
+				/ level_block_count[i];
 			if (parents[i]->header.size != max_size) {
 				parents[i]->elems[parents[i]->header.size - 1] =
 					insert_value;
@@ -1084,7 +1098,7 @@ bps_tree_build(struct bps_tree *tree, bps_tree_elem_t *sorted_array,
 		elems_left -= leaf->header.size;
 		current += leaf->header.size;
 	} while (leaf_left);
-	leaf->next_id = (bps_tree_block_id_t)-1;
+	leaf->next_id = (bps_tree_block_id_t) -1;
 
 	assert(elems_left == 0);
 	for (bps_tree_block_id_t i = 0; i < depth - 1; i++) {
@@ -1101,22 +1115,18 @@ bps_tree_build(struct bps_tree *tree, bps_tree_elem_t *sorted_array,
 	tree->size = array_size;
 	tree->max_elem = sorted_array[array_size - 1];
 	if (depth == 1) {
-		tree->root = (struct bps_block *)leaf;
 		tree->root_id = first_leaf_id;
 	} else {
-		tree->root = (struct bps_block *)root_if_inner;
 		tree->root_id = root_if_inner_id;
 	}
 	return true;
 }
 
-
 /**
  * @brief Tree destruction. Frees allocated memory.
  * @param tree - pointer to a tree
  */
-inline void
-bps_tree_destroy(struct bps_tree *tree)
+inline void bps_tree_destroy(struct bps_tree *tree)
 {
 	matras_destroy(&tree->matras);
 }
@@ -1126,8 +1136,7 @@ bps_tree_destroy(struct bps_tree *tree)
  * @param tree - pointer to a tree
  * @return - count count of elements in tree
  */
-inline size_t
-bps_tree_size(const struct bps_tree *tree)
+inline size_t bps_tree_size(const struct bps_tree *tree)
 {
 	return tree->size;
 }
@@ -1138,8 +1147,7 @@ bps_tree_size(const struct bps_tree *tree)
  * @param tree - pointer to a tree
  * @return - count count of elements in tree
  */
-inline size_t
-bps_tree_mem_used(const struct bps_tree *tree)
+inline size_t bps_tree_mem_used(const struct bps_tree *tree)
 {
 	size_t res = matras_extents_count(&tree->matras);
 	res *= BPS_TREE_EXTENT_SIZE;
@@ -1152,7 +1160,35 @@ bps_tree_mem_used(const struct bps_tree *tree)
 static inline struct bps_block *
 bps_tree_restore_block(const struct bps_tree *tree, bps_tree_block_id_t id)
 {
-	return (struct bps_block *)matras_get(&tree->matras, id);
+	return (struct bps_block *) matras_get(&tree->matras, id);
+}
+
+/**
+ * @brief Get a pointer to block by it's ID and matras version.
+ */
+static inline struct bps_block *
+bps_tree_restore_block_ver(const struct bps_tree *tree, bps_tree_block_id_t id,
+			   bps_tree_pos_t ver)
+{
+	return (struct bps_block *) matras_getv(&tree->matras, id, ver);
+}
+
+/**
+ * @brief Get a pointer to block by it's ID.
+ */
+static inline struct bps_block *
+bps_tree_root(const struct bps_tree *tree)
+{
+	return (struct bps_block *) matras_get(&tree->matras, tree->root_id);
+}
+
+/**
+ * @brief Get a pointer to block by it's ID.
+ */
+static inline struct bps_block *
+bps_tree_before_change_block(struct bps_tree *tree, bps_tree_block_id_t id)
+{
+	return (struct bps_block *) matras_before_change(&tree->matras, id);
 }
 
 /**
@@ -1164,19 +1200,19 @@ bps_tree_restore_block(const struct bps_tree *tree, bps_tree_block_id_t id)
 inline bps_tree_elem_t *
 bps_tree_random(const struct bps_tree *tree, size_t rnd)
 {
-	if (!tree->root)
+	if (tree->root_id == (bps_tree_block_id_t) (-1))
 		return 0;
 
-	struct bps_block *block = tree->root;
+	struct bps_block *block = bps_tree_root(tree);
 
 	for (bps_tree_block_id_t i = 0; i < tree->depth - 1; i++) {
-		struct bps_inner *inner = (struct bps_inner *)block;
+		struct bps_inner *inner = (struct bps_inner *) block;
 		bps_tree_pos_t pos = rnd % inner->header.size;
 		rnd /= inner->header.size;
 		block = bps_tree_restore_block(tree, inner->child_ids[pos]);
 	}
 
-	struct bps_leaf *leaf = (struct bps_leaf *)block;
+	struct bps_leaf *leaf = (struct bps_leaf *) block;
 	bps_tree_pos_t pos = rnd % leaf->header.size;
 	return leaf->elems + pos;
 }
@@ -1193,7 +1229,7 @@ static inline bps_tree_pos_t
 bps_tree_find_ins_point_key(const struct bps_tree *tree, bps_tree_elem_t *arr,
 			    size_t size, bps_tree_key_t key, bool *exact)
 {
-	(void)tree;
+	(void) tree;
 	bps_tree_elem_t *begin = arr;
 	bps_tree_elem_t *end = arr + size;
 	*exact = false;
@@ -1221,7 +1257,7 @@ bps_tree_find_ins_point_key(const struct bps_tree *tree, bps_tree_elem_t *arr,
 			/* Equal found, continue search for lowest equal */
 		}
 	}
-	return (bps_tree_pos_t)(end - arr);
+	return (bps_tree_pos_t) (end - arr);
 #endif
 }
 
@@ -1236,9 +1272,9 @@ bps_tree_find_ins_point_key(const struct bps_tree *tree, bps_tree_elem_t *arr,
  */
 static inline bps_tree_pos_t
 bps_tree_find_ins_point_elem(const struct bps_tree *tree, bps_tree_elem_t *arr,
-			     size_t size, bps_tree_elem_t elem, bool *exact)
+			    size_t size, bps_tree_elem_t elem, bool *exact)
 {
-	(void)tree;
+	(void) tree;
 	bps_tree_elem_t *begin = arr;
 	bps_tree_elem_t *end = arr + size;
 	*exact = false;
@@ -1263,10 +1299,10 @@ bps_tree_find_ins_point_elem(const struct bps_tree *tree, bps_tree_elem_t *arr,
 		} else {
 			*exact = true;
 			/* Since elements are unique in array, stop search */
-			return (bps_tree_pos_t)(mid - arr);
+			return (bps_tree_pos_t) (mid - arr);
 		}
 	}
-	return (bps_tree_pos_t)(end - arr);
+	return (bps_tree_pos_t) (end - arr);
 #endif
 }
 
@@ -1285,7 +1321,7 @@ bps_tree_find_after_ins_point_key(const struct bps_tree *tree,
 				  bps_tree_elem_t *arr, size_t size,
 				  bps_tree_key_t key, bool *exact)
 {
-	(void)tree;
+	(void) tree;
 	bps_tree_elem_t *begin = arr;
 	bps_tree_elem_t *end = arr + size;
 	*exact = false;
@@ -1293,9 +1329,9 @@ bps_tree_find_after_ins_point_key(const struct bps_tree *tree,
 	while (begin != end) {
 		int res = BPS_TREE_COMPARE_KEY(*begin, key, tree->arg);
 		if (res == 0)
-			*exact = true;
+		*exact = true;
 		else if (res > 0)
-			return (bps_tree_pos_t)(begin - arr);
+		return (bps_tree_pos_t)(begin - arr);
 		++begin;
 	}
 	return (bps_tree_pos_t)(begin - arr);
@@ -1312,7 +1348,7 @@ bps_tree_find_after_ins_point_key(const struct bps_tree *tree,
 			begin = mid + 1;
 		}
 	}
-	return (bps_tree_pos_t)(end - arr);
+	return (bps_tree_pos_t) (end - arr);
 #endif
 }
 
@@ -1324,8 +1360,9 @@ inline struct bps_tree_iterator
 bps_tree_invalid_iterator()
 {
 	struct bps_tree_iterator res;
-	res.block_id = (bps_tree_block_id_t)(-1);
+	res.block_id = (bps_tree_block_id_t) (-1);
 	res.pos = 0;
+	res.matras_version = 0;
 	return res;
 }
 
@@ -1338,7 +1375,7 @@ bps_tree_invalid_iterator()
 inline bool
 bps_tree_itr_is_invalid(struct bps_tree_iterator *itr)
 {
-	return itr->block_id == (bps_tree_block_id_t)(-1);
+	return itr->block_id == (bps_tree_block_id_t) (-1);
 }
 
 /**
@@ -1349,23 +1386,25 @@ bps_tree_itr_is_invalid(struct bps_tree_iterator *itr)
  */
 static inline struct bps_leaf *
 bps_tree_get_leaf_safe(const struct bps_tree *tree,
-		       struct bps_tree_iterator *itr)
+	struct bps_tree_iterator *itr)
 {
-	if (itr->block_id == (bps_tree_block_id_t)(-1))
+	if (itr->block_id == (bps_tree_block_id_t) (-1))
 		return 0;
 
-	struct bps_block *block = bps_tree_restore_block(tree, itr->block_id);
+	struct bps_block *block =
+		bps_tree_restore_block_ver(tree, itr->block_id,
+					   itr->matras_version);
 	if (block->type != BPS_TREE_BT_LEAF) {
-		itr->block_id = (bps_tree_block_id_t)(-1);
+		itr->block_id = (bps_tree_block_id_t) (-1);
 		return 0;
 	}
-	if (itr->pos == (bps_tree_pos_t)(-1)) {
+	if (itr->pos == (bps_tree_pos_t) (-1)) {
 		itr->pos = block->size - 1;
 	} else if (itr->pos >= block->size) {
-		itr->block_id = (bps_tree_block_id_t)(-1);
+		itr->block_id = (bps_tree_block_id_t) (-1);
 		return 0;
 	}
-	return (struct bps_leaf *)block;
+	return (struct bps_leaf *) block;
 }
 
 /**
@@ -1381,8 +1420,7 @@ bps_tree_get_leaf_safe(const struct bps_tree *tree,
  */
 inline bool
 bps_tree_itr_are_equal(const struct bps_tree *tree,
-		       struct bps_tree_iterator *itr1,
-		       struct bps_tree_iterator *itr2)
+	struct bps_tree_iterator *itr1, struct bps_tree_iterator *itr2)
 {
 	if (bps_tree_itr_is_invalid(itr1) && bps_tree_itr_is_invalid(itr2))
 		return true;
@@ -1390,7 +1428,7 @@ bps_tree_itr_are_equal(const struct bps_tree *tree,
 		return false;
 	if (itr1->block_id == itr2->block_id && itr1->pos == itr2->pos)
 		return true;
-	if (itr1->pos == (bps_tree_pos_t)(-1)) {
+	if (itr1->pos == (bps_tree_pos_t) (-1)) {
 		struct bps_leaf *leaf = bps_tree_get_leaf_safe(tree, itr1);
 		if (!leaf)
 			return false;
@@ -1398,7 +1436,7 @@ bps_tree_itr_are_equal(const struct bps_tree *tree,
 		if (itr1->block_id == itr2->block_id && itr1->pos == itr2->pos)
 			return true;
 	}
-	if (itr2->pos == (bps_tree_pos_t)(-1)) {
+	if (itr2->pos == (bps_tree_pos_t) (-1)) {
 		struct bps_leaf *leaf = bps_tree_get_leaf_safe(tree, itr2);
 		if (!leaf)
 			return false;
@@ -1420,6 +1458,7 @@ bps_tree_itr_first(const struct bps_tree *tree)
 	struct bps_tree_iterator itr;
 	itr.block_id = tree->first_id;
 	itr.pos = 0;
+	itr.matras_version = 0;
 	return itr;
 }
 
@@ -1433,7 +1472,8 @@ bps_tree_itr_last(const struct bps_tree *tree)
 {
 	struct bps_tree_iterator itr;
 	itr.block_id = tree->last_id;
-	itr.pos = (bps_tree_pos_t)(-1);
+	itr.pos = (bps_tree_pos_t) (-1);
+	itr.matras_version = 0;
 	return itr;
 }
 
@@ -1452,31 +1492,31 @@ bps_tree_lower_bound(const struct bps_tree *tree, bps_tree_key_t key,
 		     bool *exact)
 {
 	struct bps_tree_iterator res;
+	res.matras_version = 0;
 	bool local_result;
 	if (!exact)
 		exact = &local_result;
 	*exact = false;
-	if (!tree->root) {
-		res.block_id = (bps_tree_block_id_t)(-1);
+	if (tree->root_id == (bps_tree_block_id_t) (-1)) {
+		res.block_id = (bps_tree_block_id_t) (-1);
 		res.pos = 0;
 		return res;
 	}
-	struct bps_block *block = tree->root;
+	struct bps_block *block = bps_tree_root(tree);
 	bps_tree_block_id_t block_id = tree->root_id;
 	for (bps_tree_block_id_t i = 0; i < tree->depth - 1; i++) {
-		struct bps_inner *inner = (struct bps_inner *)block;
+		struct bps_inner *inner = (struct bps_inner *) block;
 		bps_tree_pos_t pos;
 		pos = bps_tree_find_ins_point_key(tree, inner->elems,
-						  inner->header.size - 1,
-						  key, exact);
+			inner->header.size - 1, key, exact);
 		block_id = inner->child_ids[pos];
 		block = bps_tree_restore_block(tree, block_id);
 	}
 
-	struct bps_leaf *leaf = (struct bps_leaf *)block;
+	struct bps_leaf *leaf = (struct bps_leaf *) block;
 	bps_tree_pos_t pos;
 	pos = bps_tree_find_ins_point_key(tree, leaf->elems, leaf->header.size,
-					  key, exact);
+		key, exact);
 	if (pos >= leaf->header.size) {
 		res.block_id = leaf->next_id;
 		res.pos = 0;
@@ -1502,35 +1542,34 @@ bps_tree_upper_bound(const struct bps_tree *tree, bps_tree_key_t key,
 		     bool *exact)
 {
 	struct bps_tree_iterator res;
+	res.matras_version = 0;
 	bool local_result;
 	if (!exact)
 		exact = &local_result;
 	*exact = false;
 	bool exact_test;
-	if (!tree->root) {
-		res.block_id = (bps_tree_block_id_t)(-1);
+	if (tree->root_id == (bps_tree_block_id_t) (-1)) {
+		res.block_id = (bps_tree_block_id_t) (-1);
 		res.pos = 0;
 		return res;
 	}
-	struct bps_block *block = tree->root;
+	struct bps_block *block = bps_tree_root(tree);
 	bps_tree_block_id_t block_id = tree->root_id;
 	for (bps_tree_block_id_t i = 0; i < tree->depth - 1; i++) {
-		struct bps_inner *inner = (struct bps_inner *)block;
+		struct bps_inner *inner = (struct bps_inner *) block;
 		bps_tree_pos_t pos;
 		pos = bps_tree_find_after_ins_point_key(tree, inner->elems,
-							inner->header.size - 1,
-							key, &exact_test);
+			inner->header.size - 1, key, &exact_test);
 		if (exact_test)
 			*exact = true;
 		block_id = inner->child_ids[pos];
 		block = bps_tree_restore_block(tree, block_id);
 	}
 
-	struct bps_leaf *leaf = (struct bps_leaf *)block;
+	struct bps_leaf *leaf = (struct bps_leaf *) block;
 	bps_tree_pos_t pos;
 	pos = bps_tree_find_after_ins_point_key(tree, leaf->elems,
-						leaf->header.size,
-						key, &exact_test);
+		leaf->header.size, key, &exact_test);
 	if (exact_test)
 		*exact = true;
 	if (pos >= leaf->header.size) {
@@ -1552,7 +1591,7 @@ bps_tree_upper_bound(const struct bps_tree *tree, bps_tree_key_t key,
  */
 inline bps_tree_elem_t *
 bps_tree_itr_get_elem(const struct bps_tree *tree,
-		      struct bps_tree_iterator *itr)
+	struct bps_tree_iterator *itr)
 {
 	struct bps_leaf *leaf = bps_tree_get_leaf_safe(tree, itr);
 	if (!leaf)
@@ -1570,12 +1609,15 @@ bps_tree_itr_get_elem(const struct bps_tree *tree,
  * @return - true on success, false if a resulted iterator is set to invalid
  */
 inline bool
-bps_tree_itr_next(const struct bps_tree *tree, struct bps_tree_iterator *itr)
+bps_tree_itr_next(const struct bps_tree *tree,
+		  struct bps_tree_iterator *itr)
 {
-	if (itr->block_id == (bps_tree_block_id_t)(-1)) {
+	if (itr->block_id == (bps_tree_block_id_t) (-1)) {
+		if (itr->matras_version)
+			return false;
 		itr->block_id = tree->first_id;
 		itr->pos = 0;
-		return itr->block_id != (bps_tree_block_id_t)(-1);
+		return itr->block_id != (bps_tree_block_id_t) (-1);
 	}
 	struct bps_leaf *leaf = bps_tree_get_leaf_safe(tree, itr);
 	if (!leaf)
@@ -1584,7 +1626,7 @@ bps_tree_itr_next(const struct bps_tree *tree, struct bps_tree_iterator *itr)
 	if (itr->pos >= leaf->header.size) {
 		itr->block_id = leaf->next_id;
 		itr->pos = 0;
-		return itr->block_id != (bps_tree_block_id_t)(-1);
+		return itr->block_id != (bps_tree_block_id_t) (-1);
 	}
 	return true;
 }
@@ -1599,24 +1641,57 @@ bps_tree_itr_next(const struct bps_tree *tree, struct bps_tree_iterator *itr)
  * @return - true on success, false if a resulted iterator is set to invalid
  */
 inline bool
-bps_tree_itr_prev(const struct bps_tree *tree, struct bps_tree_iterator *itr)
+bps_tree_itr_prev(const struct bps_tree *tree,
+		  struct bps_tree_iterator *itr)
 {
-	if (itr->block_id == (bps_tree_block_id_t)(-1)) {
+	if (itr->block_id == (bps_tree_block_id_t) (-1)) {
+		if (itr->matras_version)
+			return false;
 		itr->block_id = tree->last_id;
-		itr->pos = (bps_tree_pos_t)(-1);
-		return itr->block_id != (bps_tree_block_id_t)(-1);
+		itr->pos = (bps_tree_pos_t) (-1);
+		return itr->block_id != (bps_tree_block_id_t) (-1);
 	}
 	struct bps_leaf *leaf = bps_tree_get_leaf_safe(tree, itr);
 	if (!leaf)
 		return false;
 	if (itr->pos == 0) {
 		itr->block_id = leaf->prev_id;
-		itr->pos = (bps_tree_pos_t)(-1);
-		return itr->block_id != (bps_tree_block_id_t)(-1);
+		itr->pos = (bps_tree_pos_t) (-1);
+		return itr->block_id != (bps_tree_block_id_t) (-1);
 	} else {
 		itr->pos--;
 	}
 	return true;
+}
+
+/**
+ * @brief Freezes tree state for given iterator. All following tree modification
+ * will not apply to that iterator iteration. That iterator should be destroyed
+ * with a bps_tree_itr_destroy call after usage.
+ * @param tree - pointer to a tree
+ * @param itr - pointer to tree iterator
+ */
+inline bool
+bps_tree_itr_freeze(struct bps_tree *tree, struct bps_tree_iterator *itr)
+{
+	assert(itr->matras_version == 0);
+	itr->matras_version = matras_new_version(&tree->matras);
+	return itr->matras_version != 0;
+}
+
+/**
+ * @brief Destroy an iterator that was frozen before. Useless for not frozen
+ * iterators.
+ * @param tree - pointer to a tree
+ * @param itr - pointer to tree iterator
+ */
+inline void
+bps_tree_itr_destroy(struct bps_tree *tree, struct bps_tree_iterator *itr)
+{
+	if (itr->matras_version) {
+		matras_delete_version(&tree->matras, itr->matras_version);
+		itr->matras_version = 0;
+	}
 }
 
 /**
@@ -1628,23 +1703,22 @@ bps_tree_itr_prev(const struct bps_tree *tree, struct bps_tree_iterator *itr)
 inline bps_tree_elem_t *
 bps_tree_find(const struct bps_tree *tree, bps_tree_key_t key)
 {
-	if (!tree->root)
+	if (tree->root_id == (bps_tree_block_id_t) (-1))
 		return 0;
-	struct bps_block *block = tree->root;
+	struct bps_block *block = bps_tree_root(tree);
 	bool exact = false;
 	for (bps_tree_block_id_t i = 0; i < tree->depth - 1; i++) {
-		struct bps_inner *inner = (struct bps_inner *)block;
+		struct bps_inner *inner = (struct bps_inner *) block;
 		bps_tree_pos_t pos;
 		pos = bps_tree_find_ins_point_key(tree, inner->elems,
-						  inner->header.size - 1,
-						  key, &exact);
+			inner->header.size - 1, key, &exact);
 		block = bps_tree_restore_block(tree, inner->child_ids[pos]);
 	}
 
-	struct bps_leaf *leaf = (struct bps_leaf *)block;
+	struct bps_leaf *leaf = (struct bps_leaf *) block;
 	bps_tree_pos_t pos;
 	pos = bps_tree_find_ins_point_key(tree, leaf->elems, leaf->header.size,
-					  key, &exact);
+		key, &exact);
 	if (exact)
 		return leaf->elems + pos;
 	else
@@ -1654,16 +1728,16 @@ bps_tree_find(const struct bps_tree *tree, bps_tree_key_t key)
 /**
  * @brief Add a block to the garbage for future reuse
  */
-static inline void
-bps_tree_garbage_push(struct bps_tree *tree, struct bps_block *block,
-		      bps_tree_block_id_t id)
+static inline void bps_tree_garbage_push(struct bps_tree *tree,
+	struct bps_block *block, bps_tree_block_id_t id)
 {
 	assert(block);
-	struct bps_garbage *garbage = (struct bps_garbage *)block;
+
+	struct bps_garbage *garbage = (struct bps_garbage *)
+	bps_tree_before_change_block(tree, id);
 	garbage->header.type = BPS_TREE_BT_GARBAGE;
-	garbage->id = id;
-	garbage->next = tree->garbage_head;
-	tree->garbage_head = garbage;
+	garbage->next_id = tree->garbage_head_id;
+	tree->garbage_head_id = id;
 	tree->garbage_count++;
 }
 
@@ -1673,12 +1747,13 @@ bps_tree_garbage_push(struct bps_tree *tree, struct bps_block *block,
 static inline struct bps_block *
 bps_tree_garbage_pop(struct bps_tree *tree, bps_tree_block_id_t *id)
 {
-	if (tree->garbage_head) {
-		*id = tree->garbage_head->id;
-		struct bps_block *result = (bps_block *)tree->garbage_head;
-		tree->garbage_head = tree->garbage_head->next;
+	if (tree->garbage_head_id != (bps_tree_block_id_t) (-1)) {
+		*id = tree->garbage_head_id;
+		struct bps_garbage *result = (struct bps_garbage *)
+		bps_tree_before_change_block(tree, tree->garbage_head_id);
+		tree->garbage_head_id = result->next_id;
 		tree->garbage_count--;
-		return result;
+		return (struct bps_block *) result;
 	} else {
 		return 0;
 	}
@@ -1691,9 +1766,9 @@ static inline struct bps_leaf *
 bps_tree_create_leaf(struct bps_tree *tree, bps_tree_block_id_t *id)
 {
 	struct bps_leaf *res = (struct bps_leaf *)
-			       bps_tree_garbage_pop(tree, id);
+	bps_tree_garbage_pop(tree, id);
 	if (!res)
-		res = (struct bps_leaf *)matras_alloc(&tree->matras, id);
+		res = (struct bps_leaf *) matras_alloc(&tree->matras, id);
 	res->header.type = BPS_TREE_BT_LEAF;
 	tree->leaf_count++;
 	return res;
@@ -1706,9 +1781,9 @@ static inline struct bps_inner *
 bps_tree_create_inner(struct bps_tree *tree, bps_tree_block_id_t *id)
 {
 	struct bps_inner *res = (struct bps_inner *)
-				bps_tree_garbage_pop(tree, id);
+	bps_tree_garbage_pop(tree, id);
 	if (!res)
-		res = (struct bps_inner *)matras_alloc(&tree->matras, id);
+		res = (struct bps_inner *) matras_alloc(&tree->matras, id);
 	res->header.type = BPS_TREE_BT_INNER;
 	tree->inner_count++;
 	return res;
@@ -1717,35 +1792,33 @@ bps_tree_create_inner(struct bps_tree *tree, bps_tree_block_id_t *id)
 /**
  * @brief Dispose leaf block (to garbage and decrement counter)
  */
-static inline void
-bps_tree_dispose_leaf(struct bps_tree *tree, struct bps_leaf *leaf,
-		      bps_tree_block_id_t id)
+static inline void bps_tree_dispose_leaf(struct bps_tree *tree,
+	struct bps_leaf *leaf, bps_tree_block_id_t id)
 {
 	tree->leaf_count--;
-	bps_tree_garbage_push(tree, (struct bps_block *)leaf, id);
+	bps_tree_garbage_push(tree, (struct bps_block *) leaf, id);
 }
 
 /**
  * @brief Dispose inner block (to garbage and decrement counter)
  */
-static inline void
-bps_tree_dispose_inner(struct bps_tree *tree, struct bps_inner *inner,
-		       bps_tree_block_id_t id)
+static inline void bps_tree_dispose_inner(struct bps_tree *tree,
+	struct bps_inner *inner, bps_tree_block_id_t id)
 {
 	tree->inner_count--;
-	bps_tree_garbage_push(tree, (struct bps_block *)inner, id);
+	bps_tree_garbage_push(tree, (struct bps_block *) inner, id);
 }
 
 /**
  * @brief Reserve a number of block, return false if failed.
  */
-static inline bool
-bps_tree_reserve_blocks(struct bps_tree *tree, bps_tree_block_id_t count)
+static inline bool bps_tree_reserve_blocks(struct bps_tree *tree,
+	bps_tree_block_id_t count)
 {
 	while (tree->garbage_count < count) {
 		bps_tree_block_id_t id;
-		struct bps_block *block = (struct bps_block *)
-			matras_alloc(&tree->matras, &id);
+		struct bps_block *block = (struct bps_block *) matras_alloc(
+			&tree->matras, &id);
 		if (!block)
 			return false;
 		bps_tree_garbage_push(tree, block, id);
@@ -1756,8 +1829,8 @@ bps_tree_reserve_blocks(struct bps_tree *tree, bps_tree_block_id_t count)
 /**
  * @brief Insert first element to and empty tree.
  */
-static inline bool
-bps_tree_insert_first_elem(struct bps_tree *tree, bps_tree_elem_t new_elem)
+static inline bool bps_tree_insert_first_elem(struct bps_tree *tree,
+	bps_tree_elem_t new_elem)
 {
 	assert(tree->depth == 0);
 	assert(tree->size == 0);
@@ -1768,11 +1841,10 @@ bps_tree_insert_first_elem(struct bps_tree *tree, bps_tree_elem_t new_elem)
 		return false;
 	leaf->header.size = 1;
 	leaf->elems[0] = new_elem;
-	tree->root = (struct bps_block *)leaf;
 	tree->first_id = tree->root_id;
 	tree->last_id = tree->root_id;
-	leaf->prev_id = (bps_tree_block_id_t)(-1);
-	leaf->next_id = (bps_tree_block_id_t)(-1);
+	leaf->prev_id = (bps_tree_block_id_t) (-1);
+	leaf->next_id = (bps_tree_block_id_t) (-1);
 	tree->depth = 1;
 	tree->size = 1;
 	return true;
@@ -1781,27 +1853,26 @@ bps_tree_insert_first_elem(struct bps_tree *tree, bps_tree_elem_t new_elem)
 /**
  * @brief Collect path to an element or to the place where it can be inserted
  */
-static inline void
-bps_tree_collect_path(struct bps_tree *tree, bps_tree_elem_t new_elem,
-		      bps_inner_path_elem *path,
-		      struct bps_leaf_path_elem *leaf_path_elem, bool *exact)
+static inline void bps_tree_collect_path(struct bps_tree *tree,
+	bps_tree_elem_t new_elem,
+	bps_inner_path_elem *path, struct bps_leaf_path_elem *leaf_path_elem,
+	bool *exact)
 {
 	*exact = false;
 
 	bps_inner_path_elem *prev_ext = 0;
 	bps_tree_pos_t prev_pos = 0;
-	struct bps_block *block = tree->root;
+	struct bps_block *block = bps_tree_root(tree);
 	bps_tree_block_id_t block_id = tree->root_id;
 	bps_tree_elem_t *max_elem_copy = &tree->max_elem;
 	for (bps_tree_block_id_t i = 0; i < tree->depth - 1; i++) {
-		struct bps_inner *inner = (struct bps_inner *)block;
+		struct bps_inner *inner = (struct bps_inner *) block;
 		bps_tree_pos_t pos;
 		if (*exact)
 			pos = inner->header.size - 1;
 		else
 			pos = bps_tree_find_ins_point_elem(tree, inner->elems,
-							   inner->header.size - 1,
-							   new_elem, exact);
+				inner->header.size - 1, new_elem, exact);
 
 		path[i].block = inner;
 		path[i].block_id = block_id;
@@ -1818,14 +1889,13 @@ bps_tree_collect_path(struct bps_tree *tree, bps_tree_elem_t new_elem,
 		prev_ext = path + i;
 	}
 
-	struct bps_leaf *leaf = (struct bps_leaf *)block;
+	struct bps_leaf *leaf = (struct bps_leaf *) block;
 	bps_tree_pos_t pos;
 	if (*exact)
 		pos = leaf->header.size - 1;
 	else
 		pos = bps_tree_find_ins_point_elem(tree, leaf->elems,
-						   leaf->header.size,
-						   new_elem, exact);
+			leaf->header.size, new_elem, exact);
 
 	leaf_path_elem->block = leaf;
 	leaf_path_elem->block_id = block_id;
@@ -1838,12 +1908,12 @@ bps_tree_collect_path(struct bps_tree *tree, bps_tree_elem_t new_elem,
 /**
  * @brief Replace element by it's path and fill the *replaced argument
  */
-static inline bool
-bps_tree_process_replace(struct bps_tree *tree,
-			 struct bps_leaf_path_elem *leaf_path_elem,
-			 bps_tree_elem_t new_elem, bps_tree_elem_t *replaced)
+static inline bool bps_tree_process_replace(struct bps_tree *tree,
+	struct bps_leaf_path_elem *leaf_path_elem, bps_tree_elem_t new_elem,
+	bps_tree_elem_t *replaced)
 {
-	(void)tree;
+	leaf_path_elem->block = (struct bps_leaf *)
+	bps_tree_before_change_block(tree, leaf_path_elem->block_id);
 	struct bps_leaf *leaf = leaf_path_elem->block;
 	assert(leaf_path_elem->insertion_point < leaf->header.size);
 
@@ -1859,87 +1929,80 @@ bps_tree_process_replace(struct bps_tree *tree,
 /**
  * @brief Debug memmove, checks for overflow
  */
-static inline void
-bps_tree_debug_memmove(void *dst_arg, void *src_arg, size_t num,
-		       void *dst_block_arg, void *src_block_arg)
+static inline void bps_tree_debug_memmove(void *dst_arg, void *src_arg,
+	size_t num, void *dst_block_arg, void *src_block_arg)
 {
-	char *dst = (char *)dst_arg;
-	char *src = (char *)src_arg;
-	struct bps_block *dst_block = (bps_block *)dst_block_arg;
-	struct bps_block *src_block = (bps_block *)src_block_arg;
+	char *dst = (char *) dst_arg;
+	char *src = (char *) src_arg;
+	struct bps_block *dst_block = (bps_block *) dst_block_arg;
+	struct bps_block *src_block = (bps_block *) src_block_arg;
 
 	assert(dst_block->type == src_block->type);
-	assert(dst_block->type == BPS_TREE_BT_LEAF ||
-	       dst_block->type == BPS_TREE_BT_INNER);
+	assert(
+		dst_block->type == BPS_TREE_BT_LEAF || dst_block->type == BPS_TREE_BT_INNER);
 	if (dst_block->type == BPS_TREE_BT_LEAF) {
-		struct bps_leaf *dst_leaf = (struct bps_leaf *)dst_block_arg;
-		struct bps_leaf *src_leaf = (struct bps_leaf *)src_block_arg;
+		struct bps_leaf *dst_leaf = (struct bps_leaf *) dst_block_arg;
+		struct bps_leaf *src_leaf = (struct bps_leaf *) src_block_arg;
 		if (num) {
-			assert(dst >= ((char *)dst_leaf->elems));
-			assert(dst < ((char *)dst_leaf->elems) +
-			       BPS_TREE_MAX_COUNT_IN_LEAF *
-			       sizeof(bps_tree_elem_t));
-			assert(src >= (char *)src_leaf->elems);
-			assert(src < ((char *)src_leaf->elems) +
-			       BPS_TREE_MAX_COUNT_IN_LEAF *
-			       sizeof(bps_tree_elem_t));
+			assert(dst >= ((char * )dst_leaf->elems));
+			assert(
+				dst < ((char *)dst_leaf->elems) + BPS_TREE_MAX_COUNT_IN_LEAF * sizeof(bps_tree_elem_t));
+			assert(src >= (char * )src_leaf->elems);
+			assert(
+				src < ((char *)src_leaf->elems) + BPS_TREE_MAX_COUNT_IN_LEAF * sizeof(bps_tree_elem_t));
 		} else {
-			assert(dst >= ((char *)dst_leaf->elems));
-			assert(dst <= ((char *)dst_leaf->elems) +
-			       BPS_TREE_MAX_COUNT_IN_LEAF *
-			       sizeof(bps_tree_elem_t));
-			assert(src >= (char *)src_leaf->elems);
-			assert(src <= ((char *)src_leaf->elems) +
-			       BPS_TREE_MAX_COUNT_IN_LEAF *
-			       sizeof(bps_tree_elem_t));
+			assert(dst >= ((char * )dst_leaf->elems));
+			assert(
+				dst <= ((char *)dst_leaf->elems) + BPS_TREE_MAX_COUNT_IN_LEAF * sizeof(bps_tree_elem_t));
+			assert(src >= (char * )src_leaf->elems);
+			assert(
+				src <= ((char *)src_leaf->elems) + BPS_TREE_MAX_COUNT_IN_LEAF * sizeof(bps_tree_elem_t));
 		}
 	} else {
-		struct bps_inner *dst_inner = (struct bps_inner *)
-					      dst_block_arg;
-		struct bps_inner *src_inner = (struct bps_inner *)
-					      src_block_arg;
+		struct bps_inner *dst_inner = (struct bps_inner *) dst_block_arg;
+		struct bps_inner *src_inner = (struct bps_inner *) src_block_arg;
 		if (num) {
-			if (dst >= ((char *)dst_inner->elems) && dst <
-			    ((char *)dst_inner->elems) +
-			    (BPS_TREE_MAX_COUNT_IN_INNER - 1) *
-			    sizeof(bps_tree_elem_t)) {
-				assert(dst >= ((char *)dst_inner->elems));
-				assert(dst < ((char *)dst_inner->elems) +
-				       (BPS_TREE_MAX_COUNT_IN_INNER - 1) *
-				       sizeof(bps_tree_elem_t));
-				assert(src >= (char *)src_inner->elems);
-				assert(src < ((char *)src_inner->elems) +
-				       (BPS_TREE_MAX_COUNT_IN_INNER - 1) *
-				       sizeof(bps_tree_elem_t));
+			if (dst >= ((char *) dst_inner->elems)
+				&& dst
+					< ((char *) dst_inner->elems)
+						+ (BPS_TREE_MAX_COUNT_IN_INNER
+							- 1)
+							* sizeof(bps_tree_elem_t)) {
+				assert(dst >= ((char * )dst_inner->elems));
+				assert(
+					dst < ((char *)dst_inner->elems) + (BPS_TREE_MAX_COUNT_IN_INNER - 1) * sizeof(bps_tree_elem_t));
+				assert(src >= (char * )src_inner->elems);
+				assert(
+					src < ((char *)src_inner->elems) + (BPS_TREE_MAX_COUNT_IN_INNER - 1) * sizeof(bps_tree_elem_t));
 			} else {
-				assert(dst >= ((char *)dst_inner->child_ids));
-				assert(dst < ((char *)dst_inner->child_ids) +
-				       BPS_TREE_MAX_COUNT_IN_INNER *
-				       sizeof(bps_tree_block_id_t));
-				assert(src >= (char *)src_inner->child_ids);
-				assert(src < ((char *)src_inner->child_ids) +
-				       BPS_TREE_MAX_COUNT_IN_INNER *
-				       sizeof(bps_tree_block_id_t));
+				assert(dst >= ((char * )dst_inner->child_ids));
+				assert(
+					dst < ((char *)dst_inner->child_ids) + BPS_TREE_MAX_COUNT_IN_INNER * sizeof(bps_tree_block_id_t));
+				assert(src >= (char * )src_inner->child_ids);
+				assert(
+					src < ((char *)src_inner->child_ids) + BPS_TREE_MAX_COUNT_IN_INNER * sizeof(bps_tree_block_id_t));
 			}
 		} else {
-			if (dst >= ((char *)dst_inner->elems)
-					&& dst <= ((char *)dst_inner->elems) +
-					(BPS_TREE_MAX_COUNT_IN_INNER - 1) *
-					sizeof(bps_tree_elem_t)
-					&& src >= (char *)src_inner->elems
-					&& src <= ((char *)src_inner->elems) +
-					(BPS_TREE_MAX_COUNT_IN_INNER - 1) *
-					sizeof(bps_tree_elem_t)) {
+			if (dst >= ((char *) dst_inner->elems)
+				&& dst
+					<= ((char *) dst_inner->elems)
+						+ (BPS_TREE_MAX_COUNT_IN_INNER
+							- 1)
+							* sizeof(bps_tree_elem_t)
+				&& src >= (char *) src_inner->elems
+				&& src
+					<= ((char *) src_inner->elems)
+						+ (BPS_TREE_MAX_COUNT_IN_INNER
+							- 1)
+							* sizeof(bps_tree_elem_t)) {
 				/* nothing to do due to if condition */
 			} else {
-				assert(dst >= ((char *)dst_inner->child_ids));
-				assert(dst <= ((char *)dst_inner->child_ids) +
-				       BPS_TREE_MAX_COUNT_IN_INNER *
-				       sizeof(bps_tree_block_id_t));
-				assert(src >= (char *)src_inner->child_ids);
-				assert(src <= ((char *)src_inner->child_ids) +
-				       BPS_TREE_MAX_COUNT_IN_INNER *
-				       sizeof(bps_tree_block_id_t));
+				assert(dst >= ((char * )dst_inner->child_ids));
+				assert(
+					dst <= ((char *)dst_inner->child_ids) + BPS_TREE_MAX_COUNT_IN_INNER * sizeof(bps_tree_block_id_t));
+				assert(src >= (char * )src_inner->child_ids);
+				assert(
+					src <= ((char *)src_inner->child_ids) + BPS_TREE_MAX_COUNT_IN_INNER * sizeof(bps_tree_block_id_t));
 			}
 		}
 	}
@@ -1951,12 +2014,13 @@ bps_tree_debug_memmove(void *dst_arg, void *src_arg, size_t num,
 /**
  * @breif Insert an element into leaf block. There must be enough space.
  */
-static inline void
-bps_tree_insert_into_leaf(struct bps_tree *tree,
-			  struct bps_leaf_path_elem *leaf_path_elem,
-			  bps_tree_elem_t new_elem)
+static inline void bps_tree_insert_into_leaf(struct bps_tree *tree,
+	struct bps_leaf_path_elem *leaf_path_elem, bps_tree_elem_t new_elem)
 {
-	(void)tree;
+	/* exclusive behaviuor for debug checks */
+	if (tree->root_id != (bps_tree_block_id_t) -1)
+		leaf_path_elem->block = (struct bps_leaf *)
+		bps_tree_before_change_block(tree, leaf_path_elem->block_id);
 	struct bps_leaf *leaf = leaf_path_elem->block;
 	bps_tree_pos_t pos = leaf_path_elem->insertion_point;
 
@@ -1965,7 +2029,7 @@ bps_tree_insert_into_leaf(struct bps_tree *tree,
 	assert(leaf->header.size < BPS_TREE_MAX_COUNT_IN_LEAF);
 
 	BPS_TREE_DATAMOVE(leaf->elems + pos + 1, leaf->elems + pos,
-			  leaf->header.size - pos, leaf, leaf);
+		leaf->header.size - pos, leaf, leaf);
 	leaf->elems[pos] = new_elem;
 	*leaf_path_elem->max_elem_copy = leaf->elems[leaf->header.size];
 	leaf->header.size++;
@@ -1975,13 +2039,14 @@ bps_tree_insert_into_leaf(struct bps_tree *tree,
 /**
  * @breif Insert a child into inner block. There must be enough space.
  */
-static inline void
-bps_tree_insert_into_inner(struct bps_tree *tree,
-			   bps_inner_path_elem *inner_path_elem,
-			   bps_tree_block_id_t block_id, bps_tree_pos_t pos,
-			   bps_tree_elem_t max_elem)
+static inline void bps_tree_insert_into_inner(struct bps_tree *tree,
+bps_inner_path_elem *inner_path_elem, bps_tree_block_id_t block_id,
+	bps_tree_pos_t pos, bps_tree_elem_t max_elem)
 {
-	(void)tree;
+	/* exclusive behaviuor for debug checks */
+	if (tree->root_id != (bps_tree_block_id_t) -1)
+		inner_path_elem->block = (struct bps_inner *)
+		bps_tree_before_change_block(tree, inner_path_elem->block_id);
 	struct bps_inner *inner = inner_path_elem->block;
 
 	assert(pos >= 0);
@@ -1990,11 +2055,11 @@ bps_tree_insert_into_inner(struct bps_tree *tree,
 
 	if (pos < inner->header.size) {
 		BPS_TREE_DATAMOVE(inner->elems + pos + 1, inner->elems + pos,
-				  inner->header.size - pos - 1, inner, inner);
+			inner->header.size - pos - 1, inner, inner);
 		inner->elems[pos] = max_elem;
 		BPS_TREE_DATAMOVE(inner->child_ids + pos + 1,
-				  inner->child_ids + pos,
-				  inner->header.size - pos, inner, inner);
+			inner->child_ids + pos, inner->header.size - pos, inner,
+			inner);
 	} else {
 		if (pos > 0)
 			inner->elems[pos - 1] = *inner_path_elem->max_elem_copy;
@@ -2008,11 +2073,13 @@ bps_tree_insert_into_inner(struct bps_tree *tree,
 /**
  * @breif Delete element from leaf block.
  */
-static inline void
-bps_tree_delete_from_leaf(struct bps_tree *tree,
-			  struct bps_leaf_path_elem *leaf_path_elem)
+static inline void bps_tree_delete_from_leaf(struct bps_tree *tree,
+	struct bps_leaf_path_elem *leaf_path_elem)
 {
-	(void)tree;
+	/* exclusive behaviuor for debug checks */
+	if (tree->root_id != (bps_tree_block_id_t) -1)
+		leaf_path_elem->block = (struct bps_leaf *)
+		bps_tree_before_change_block(tree, leaf_path_elem->block_id);
 	struct bps_leaf *leaf = leaf_path_elem->block;
 	bps_tree_pos_t pos = leaf_path_elem->insertion_point;
 
@@ -2020,13 +2087,13 @@ bps_tree_delete_from_leaf(struct bps_tree *tree,
 	assert(pos < leaf->header.size);
 
 	BPS_TREE_DATAMOVE(leaf->elems + pos, leaf->elems + pos + 1,
-			  leaf->header.size - 1 - pos, leaf, leaf);
+		leaf->header.size - 1 - pos, leaf, leaf);
 
 	leaf->header.size--;
 
 	if (leaf->header.size > 0)
-		*leaf_path_elem->max_elem_copy =
-			leaf->elems[leaf->header.size - 1];
+		*leaf_path_elem->max_elem_copy = leaf->elems[leaf->header.size
+			- 1];
 
 	tree->size--;
 }
@@ -2034,11 +2101,13 @@ bps_tree_delete_from_leaf(struct bps_tree *tree,
 /**
  * @breif Delete a child from inner block.
  */
-static inline void
-bps_tree_delete_from_inner(struct bps_tree *tree,
-			   bps_inner_path_elem *inner_path_elem)
+static inline void bps_tree_delete_from_inner(struct bps_tree *tree,
+bps_inner_path_elem *inner_path_elem)
 {
-	(void)tree;
+	/* exclusive behaviuor for debug checks */
+	if (tree->root_id != (bps_tree_block_id_t) -1)
+		inner_path_elem->block = (struct bps_inner *)
+		bps_tree_before_change_block(tree, inner_path_elem->block_id);
 	struct bps_inner *inner = inner_path_elem->block;
 	bps_tree_pos_t pos = inner_path_elem->insertion_point;
 
@@ -2047,10 +2116,10 @@ bps_tree_delete_from_inner(struct bps_tree *tree,
 
 	if (pos < inner->header.size - 1) {
 		BPS_TREE_DATAMOVE(inner->elems + pos, inner->elems + pos + 1,
-				  inner->header.size - 2 - pos, inner, inner);
+			inner->header.size - 2 - pos, inner, inner);
 		BPS_TREE_DATAMOVE(inner->child_ids + pos,
-				  inner->child_ids + pos + 1,
-				  inner->header.size - 1 - pos, inner, inner);
+			inner->child_ids + pos + 1,
+			inner->header.size - 1 - pos, inner, inner);
 	} else if (pos > 0) {
 		*inner_path_elem->max_elem_copy = inner->elems[pos - 1];
 	}
@@ -2061,13 +2130,17 @@ bps_tree_delete_from_inner(struct bps_tree *tree,
 /**
  * @breif Move a number of elements from left leaf to right leaf
  */
-static inline void
-bps_tree_move_elems_to_right_leaf(struct bps_tree *tree,
-				  struct bps_leaf_path_elem *a_leaf_path_elem,
-				  struct bps_leaf_path_elem *b_leaf_path_elem,
-				  bps_tree_pos_t num)
+static inline void bps_tree_move_elems_to_right_leaf(struct bps_tree *tree,
+	struct bps_leaf_path_elem *a_leaf_path_elem,
+	struct bps_leaf_path_elem *b_leaf_path_elem, bps_tree_pos_t num)
 {
-	(void)tree;
+	/* exclusive behaviuor for debug checks */
+	if (tree->root_id != (bps_tree_block_id_t) -1) {
+		a_leaf_path_elem->block = (struct bps_leaf *)
+		bps_tree_before_change_block(tree, a_leaf_path_elem->block_id);
+		b_leaf_path_elem->block = (struct bps_leaf *)
+		bps_tree_before_change_block(tree, b_leaf_path_elem->block_id);
+	}
 	struct bps_leaf *a = a_leaf_path_elem->block;
 	struct bps_leaf *b = b_leaf_path_elem->block;
 	bool move_all = a->header.size == num;
@@ -2077,28 +2150,30 @@ bps_tree_move_elems_to_right_leaf(struct bps_tree *tree,
 	assert(b->header.size + num <= BPS_TREE_MAX_COUNT_IN_LEAF);
 
 	BPS_TREE_DATAMOVE(b->elems + num, b->elems, b->header.size, b, b);
-	BPS_TREE_DATAMOVE(b->elems, a->elems + a->header.size - num, num,
-			  b, a);
+	BPS_TREE_DATAMOVE(b->elems, a->elems + a->header.size - num, num, b, a);
 
 	a->header.size -= num;
 	b->header.size += num;
 
 	if (!move_all)
-		*a_leaf_path_elem->max_elem_copy =
-			a->elems[a->header.size - 1];
+		*a_leaf_path_elem->max_elem_copy = a->elems[a->header.size - 1];
 	*b_leaf_path_elem->max_elem_copy = b->elems[b->header.size - 1];
 }
 
 /**
  * @breif Move a number of children from left inner to right inner block
  */
-static inline void
-bps_tree_move_elems_to_right_inner(struct bps_tree *tree,
-				   bps_inner_path_elem *a_inner_path_elem,
-				   bps_inner_path_elem *b_inner_path_elem,
-				   bps_tree_pos_t num)
+static inline void bps_tree_move_elems_to_right_inner(struct bps_tree *tree,
+bps_inner_path_elem *a_inner_path_elem,
+bps_inner_path_elem *b_inner_path_elem, bps_tree_pos_t num)
 {
-	(void)tree;
+	/* exclusive behaviuor for debug checks */
+	if (tree->root_id != (bps_tree_block_id_t) -1) {
+		a_inner_path_elem->block = (struct bps_inner *)
+		bps_tree_before_change_block(tree, a_inner_path_elem->block_id);
+		b_inner_path_elem->block = (struct bps_inner *)
+		bps_tree_before_change_block(tree, b_inner_path_elem->block_id);
+	}
 	struct bps_inner *a = a_inner_path_elem->block;
 	struct bps_inner *b = b_inner_path_elem->block;
 	bool move_to_empty = b->header.size == 0;
@@ -2108,24 +2183,24 @@ bps_tree_move_elems_to_right_inner(struct bps_tree *tree,
 	assert(a->header.size >= num);
 	assert(b->header.size + num <= BPS_TREE_MAX_COUNT_IN_INNER);
 
-	BPS_TREE_DATAMOVE(b->child_ids + num, b->child_ids,
-			  b->header.size, b, b);
+	BPS_TREE_DATAMOVE(b->child_ids + num, b->child_ids, b->header.size, b,
+		b);
 	BPS_TREE_DATAMOVE(b->child_ids, a->child_ids + a->header.size - num,
-			  num, b, a);
+		num, b, a);
 
 	if (!move_to_empty)
-		BPS_TREE_DATAMOVE(b->elems + num, b->elems,
-				  b->header.size - 1, b, b);
-	BPS_TREE_DATAMOVE(b->elems, a->elems + a->header.size - num,
-			  num - 1, b, a);
+		BPS_TREE_DATAMOVE(b->elems + num, b->elems, b->header.size - 1,
+			b, b);
+	BPS_TREE_DATAMOVE(b->elems, a->elems + a->header.size - num, num - 1, b,
+		a);
 	if (move_to_empty)
 		*b_inner_path_elem->max_elem_copy =
 			*a_inner_path_elem->max_elem_copy;
 	else
 		b->elems[num - 1] = *a_inner_path_elem->max_elem_copy;
 	if (!move_all)
-		*a_inner_path_elem->max_elem_copy =
-			a->elems[a->header.size - num - 1];
+		*a_inner_path_elem->max_elem_copy = a->elems[a->header.size
+			- num - 1];
 
 	a->header.size -= num;
 	b->header.size += num;
@@ -2134,13 +2209,17 @@ bps_tree_move_elems_to_right_inner(struct bps_tree *tree,
 /**
  * @breif Move a number of elements from right leaf to left leaf
  */
-static inline void
-bps_tree_move_elems_to_left_leaf(struct bps_tree *tree,
-				 struct bps_leaf_path_elem *a_leaf_path_elem,
-				 struct bps_leaf_path_elem *b_leaf_path_elem,
-				 bps_tree_pos_t num)
+static inline void bps_tree_move_elems_to_left_leaf(struct bps_tree *tree,
+	struct bps_leaf_path_elem *a_leaf_path_elem,
+	struct bps_leaf_path_elem *b_leaf_path_elem, bps_tree_pos_t num)
 {
-	(void)tree;
+	/* exclusive behaviuor for debug checks */
+	if (tree->root_id != (bps_tree_block_id_t) -1) {
+		a_leaf_path_elem->block = (struct bps_leaf *)
+		bps_tree_before_change_block(tree, a_leaf_path_elem->block_id);
+		b_leaf_path_elem->block = (struct bps_leaf *)
+		bps_tree_before_change_block(tree, b_leaf_path_elem->block_id);
+	}
 	struct bps_leaf *a = a_leaf_path_elem->block;
 	struct bps_leaf *b = b_leaf_path_elem->block;
 
@@ -2149,8 +2228,7 @@ bps_tree_move_elems_to_left_leaf(struct bps_tree *tree,
 	assert(a->header.size + num <= BPS_TREE_MAX_COUNT_IN_LEAF);
 
 	BPS_TREE_DATAMOVE(a->elems + a->header.size, b->elems, num, a, b);
-	BPS_TREE_DATAMOVE(b->elems, b->elems + num, b->header.size - num,
-			  b, b);
+	BPS_TREE_DATAMOVE(b->elems, b->elems + num, b->header.size - num, b, b);
 
 	a->header.size += num;
 	b->header.size -= num;
@@ -2160,13 +2238,17 @@ bps_tree_move_elems_to_left_leaf(struct bps_tree *tree,
 /**
  * @breif Move a number of children from right inner to left inner block
  */
-static inline void
-bps_tree_move_elems_to_left_inner(struct bps_tree *tree,
-				  bps_inner_path_elem *a_inner_path_elem,
-				  bps_inner_path_elem *b_inner_path_elem,
-				  bps_tree_pos_t num)
+static inline void bps_tree_move_elems_to_left_inner(struct bps_tree *tree,
+bps_inner_path_elem *a_inner_path_elem,
+bps_inner_path_elem *b_inner_path_elem, bps_tree_pos_t num)
 {
-	(void)tree;
+	/* exclusive behaviuor for debug checks */
+	if (tree->root_id != (bps_tree_block_id_t) -1) {
+		a_inner_path_elem->block = (struct bps_inner *)
+		bps_tree_before_change_block(tree, a_inner_path_elem->block_id);
+		b_inner_path_elem->block = (struct bps_inner *)
+		bps_tree_before_change_block(tree, b_inner_path_elem->block_id);
+	}
 	struct bps_inner *a = a_inner_path_elem->block;
 	struct bps_inner *b = b_inner_path_elem->block;
 	bool move_to_empty = a->header.size == 0;
@@ -2176,10 +2258,10 @@ bps_tree_move_elems_to_left_inner(struct bps_tree *tree,
 	assert(b->header.size >= num);
 	assert(a->header.size + num <= BPS_TREE_MAX_COUNT_IN_INNER);
 
-	BPS_TREE_DATAMOVE(a->child_ids + a->header.size, b->child_ids,
-			  num, a, b);
+	BPS_TREE_DATAMOVE(a->child_ids + a->header.size, b->child_ids, num, a,
+		b);
 	BPS_TREE_DATAMOVE(b->child_ids, b->child_ids + num,
-			  b->header.size - num, b, b);
+		b->header.size - num, b, b);
 
 	if (!move_to_empty)
 		a->elems[a->header.size - 1] =
@@ -2191,7 +2273,7 @@ bps_tree_move_elems_to_left_inner(struct bps_tree *tree,
 	} else {
 		*a_inner_path_elem->max_elem_copy = b->elems[num - 1];
 		BPS_TREE_DATAMOVE(b->elems, b->elems + num,
-				  b->header.size - num - 1, b, b);
+			b->header.size - num - 1, b, b);
 	}
 
 	a->header.size += num;
@@ -2205,13 +2287,18 @@ bps_tree_move_elems_to_left_inner(struct bps_tree *tree,
  *  BUT(!) insertion is allowed into full block, so one can consider
  *  insertion as a virtual insertion into virtual block of greater maximum size
  */
-static inline void
-bps_tree_insert_and_move_elems_to_right_leaf(struct bps_tree *tree,
-		struct bps_leaf_path_elem *a_leaf_path_elem,
-		struct bps_leaf_path_elem *b_leaf_path_elem,
-		bps_tree_pos_t num, bps_tree_elem_t new_elem)
+static inline void bps_tree_insert_and_move_elems_to_right_leaf(
+	struct bps_tree *tree, struct bps_leaf_path_elem *a_leaf_path_elem,
+	struct bps_leaf_path_elem *b_leaf_path_elem, bps_tree_pos_t num,
+	bps_tree_elem_t new_elem)
 {
-	(void)tree;
+	/* exclusive behaviuor for debug checks */
+	if (tree->root_id != (bps_tree_block_id_t) -1) {
+		a_leaf_path_elem->block = (struct bps_leaf *)
+		bps_tree_before_change_block(tree, a_leaf_path_elem->block_id);
+		b_leaf_path_elem->block = (struct bps_leaf *)
+		bps_tree_before_change_block(tree, b_leaf_path_elem->block_id);
+	}
 	struct bps_leaf *a = a_leaf_path_elem->block;
 	struct bps_leaf *b = b_leaf_path_elem->block;
 	bps_tree_pos_t pos = a_leaf_path_elem->insertion_point;
@@ -2230,29 +2317,26 @@ bps_tree_insert_and_move_elems_to_right_leaf(struct bps_tree *tree,
 	if (mid_part_size >= num) {
 		/* In fact insert to 'a' block */
 		BPS_TREE_DATAMOVE(b->elems, a->elems + a->header.size - num,
-				  num, b, a);
+			num, b, a);
 		BPS_TREE_DATAMOVE(a->elems + pos + 1, a->elems + pos,
-				  mid_part_size - num, a, a);
+			mid_part_size - num, a, a);
 		a->elems[pos] = new_elem;
 	} else {
 		/* In fact insert to 'b' block */
 		bps_tree_pos_t new_pos = num - mid_part_size - 1;/* Can be 0 */
-		BPS_TREE_DATAMOVE(b->elems,
-				  a->elems + a->header.size - num + 1,
-				  new_pos, b, a);
+		BPS_TREE_DATAMOVE(b->elems, a->elems + a->header.size - num + 1,
+			new_pos, b, a);
 		b->elems[new_pos] = new_elem;
 		BPS_TREE_DATAMOVE(b->elems + new_pos + 1, a->elems + pos,
-				  mid_part_size, b, a);
+			mid_part_size, b, a);
 	}
 
 	a->header.size -= (num - 1);
 	b->header.size += num;
 	if (!move_all)
-		*a_leaf_path_elem->max_elem_copy =
-			a->elems[a->header.size - 1];
+		*a_leaf_path_elem->max_elem_copy = a->elems[a->header.size - 1];
 	if (move_to_empty)
-		*b_leaf_path_elem->max_elem_copy =
-			b->elems[b->header.size - 1];
+		*b_leaf_path_elem->max_elem_copy = b->elems[b->header.size - 1];
 	tree->size++;
 }
 
@@ -2263,14 +2347,20 @@ bps_tree_insert_and_move_elems_to_right_leaf(struct bps_tree *tree,
  *  BUT(!) insertion is allowed into full block, so one can consider
  *  insertion as a virtual insertion into virtual block of greater maximum size
  */
-static inline void
-bps_tree_insert_and_move_elems_to_right_inner(struct bps_tree *tree,
-		bps_inner_path_elem *a_inner_path_elem,
-		bps_inner_path_elem *b_inner_path_elem,
-		bps_tree_pos_t num, bps_tree_block_id_t block_id,
-		bps_tree_pos_t pos, bps_tree_elem_t max_elem)
+static inline void bps_tree_insert_and_move_elems_to_right_inner(
+	struct bps_tree *tree,
+	bps_inner_path_elem *a_inner_path_elem,
+	bps_inner_path_elem *b_inner_path_elem, bps_tree_pos_t num,
+	bps_tree_block_id_t block_id, bps_tree_pos_t pos,
+	bps_tree_elem_t max_elem)
 {
-	(void)tree;
+	/* exclusive behaviuor for debug checks */
+	if (tree->root_id != (bps_tree_block_id_t) -1) {
+		a_inner_path_elem->block = (struct bps_inner *)
+		bps_tree_before_change_block(tree, a_inner_path_elem->block_id);
+		b_inner_path_elem->block = (struct bps_inner *)
+		bps_tree_before_change_block(tree, b_inner_path_elem->block_id);
+	}
 	struct bps_inner *a = a_inner_path_elem->block;
 	struct bps_inner *b = b_inner_path_elem->block;
 	bool move_to_empty = b->header.size == 0;
@@ -2284,45 +2374,43 @@ bps_tree_insert_and_move_elems_to_right_inner(struct bps_tree *tree,
 
 	if (!move_to_empty) {
 		BPS_TREE_DATAMOVE(b->child_ids + num, b->child_ids,
-				  b->header.size, b, b);
-		BPS_TREE_DATAMOVE(b->elems + num, b->elems,
-				  b->header.size - 1, b, b);
+			b->header.size, b, b);
+		BPS_TREE_DATAMOVE(b->elems + num, b->elems, b->header.size - 1,
+			b, b);
 	}
 
 	bps_tree_pos_t mid_part_size = a->header.size - pos;
 	if (mid_part_size > num) {
 		/* In fact insert to 'a' block, to the internal position */
 		BPS_TREE_DATAMOVE(b->child_ids,
-				  a->child_ids + a->header.size - num,
-				  num, b, a);
+			a->child_ids + a->header.size - num, num, b, a);
 		BPS_TREE_DATAMOVE(a->child_ids + pos + 1, a->child_ids + pos,
-				  mid_part_size - num, a, a);
+			mid_part_size - num, a, a);
 		a->child_ids[pos] = block_id;
 
 		BPS_TREE_DATAMOVE(b->elems, a->elems + a->header.size - num,
-				  num - 1, b, a);
+			num - 1, b, a);
 		if (move_to_empty)
 			*b_inner_path_elem->max_elem_copy =
 				*a_inner_path_elem->max_elem_copy;
 		else
 			b->elems[num - 1] = *a_inner_path_elem->max_elem_copy;
 
-		*a_inner_path_elem->max_elem_copy =
-			a->elems[a->header.size - num - 1];
+		*a_inner_path_elem->max_elem_copy = a->elems[a->header.size
+			- num - 1];
 		BPS_TREE_DATAMOVE(a->elems + pos + 1, a->elems + pos,
-				  mid_part_size - num - 1, a, a);
+			mid_part_size - num - 1, a, a);
 		a->elems[pos] = max_elem;
 	} else if (mid_part_size == num) {
 		/* In fact insert to 'a' block, to the last position */
 		BPS_TREE_DATAMOVE(b->child_ids,
-				  a->child_ids + a->header.size - num,
-				  num, b, a);
+			a->child_ids + a->header.size - num, num, b, a);
 		BPS_TREE_DATAMOVE(a->child_ids + pos + 1, a->child_ids + pos,
-				  mid_part_size - num, a, a);
+			mid_part_size - num, a, a);
 		a->child_ids[pos] = block_id;
 
 		BPS_TREE_DATAMOVE(b->elems, a->elems + a->header.size - num,
-				  num - 1, b, a);
+			num - 1, b, a);
 		if (move_to_empty)
 			*b_inner_path_elem->max_elem_copy =
 				*a_inner_path_elem->max_elem_copy;
@@ -2334,11 +2422,10 @@ bps_tree_insert_and_move_elems_to_right_inner(struct bps_tree *tree,
 		/* In fact insert to 'b' block */
 		bps_tree_pos_t new_pos = num - mid_part_size - 1;/* Can be 0 */
 		BPS_TREE_DATAMOVE(b->child_ids,
-				  a->child_ids + a->header.size - num + 1,
-				  new_pos, b, a);
+			a->child_ids + a->header.size - num + 1, new_pos, b, a);
 		b->child_ids[new_pos] = block_id;
 		BPS_TREE_DATAMOVE(b->child_ids + new_pos + 1,
-				  a->child_ids + pos, mid_part_size, b, a);
+			a->child_ids + pos, mid_part_size, b, a);
 
 		if (pos == a->header.size) {
 			/* +1 */
@@ -2349,8 +2436,8 @@ bps_tree_insert_and_move_elems_to_right_inner(struct bps_tree *tree,
 			if (num > 1) {
 				/* +(num - 2) */
 				BPS_TREE_DATAMOVE(b->elems,
-						  a->elems + a->header.size
-						   - num + 1, num - 2, b, a);
+					a->elems + a->header.size - num + 1,
+					num - 2, b, a);
 				/* +1 */
 				b->elems[num - 2] =
 					*a_inner_path_elem->max_elem_copy;
@@ -2363,11 +2450,11 @@ bps_tree_insert_and_move_elems_to_right_inner(struct bps_tree *tree,
 			assert(num > 1);
 
 			BPS_TREE_DATAMOVE(b->elems,
-					  a->elems + a->header.size - num + 1,
-					  num - mid_part_size - 1, b, a);
+				a->elems + a->header.size - num + 1,
+				num - mid_part_size - 1, b, a);
 			b->elems[new_pos] = max_elem;
 			BPS_TREE_DATAMOVE(b->elems + new_pos + 1,
-					  a->elems + pos, mid_part_size - 1, b, a);
+				a->elems + pos, mid_part_size - 1, b, a);
 			if (move_to_empty)
 				*b_inner_path_elem->max_elem_copy =
 					*a_inner_path_elem->max_elem_copy;
@@ -2392,13 +2479,18 @@ bps_tree_insert_and_move_elems_to_right_inner(struct bps_tree *tree,
  *  BUT(!) insertion is allowed into full block, so one can consider
  *  insertion as a virtual insertion into virtual block of greater maximum size
  */
-static inline void
-bps_tree_insert_and_move_elems_to_left_leaf(struct bps_tree *tree,
-		struct bps_leaf_path_elem *a_leaf_path_elem,
-		struct bps_leaf_path_elem *b_leaf_path_elem,
-		bps_tree_pos_t num, bps_tree_elem_t new_elem)
+static inline void bps_tree_insert_and_move_elems_to_left_leaf(
+	struct bps_tree *tree, struct bps_leaf_path_elem *a_leaf_path_elem,
+	struct bps_leaf_path_elem *b_leaf_path_elem, bps_tree_pos_t num,
+	bps_tree_elem_t new_elem)
 {
-	(void)tree;
+	/* exclusive behaviuor for debug checks */
+	if (tree->root_id != (bps_tree_block_id_t) -1) {
+		a_leaf_path_elem->block = (struct bps_leaf *)
+		bps_tree_before_change_block(tree, a_leaf_path_elem->block_id);
+		b_leaf_path_elem->block = (struct bps_leaf *)
+		bps_tree_before_change_block(tree, b_leaf_path_elem->block_id);
+	}
 	struct bps_leaf *a = a_leaf_path_elem->block;
 	struct bps_leaf *b = b_leaf_path_elem->block;
 	bps_tree_pos_t pos = b_leaf_path_elem->insertion_point;
@@ -2413,32 +2505,31 @@ bps_tree_insert_and_move_elems_to_left_leaf(struct bps_tree *tree,
 	if (pos >= num) {
 		/* In fact insert to 'b' block */
 		bps_tree_pos_t new_pos = pos - num; /* Can be 0 */
-		BPS_TREE_DATAMOVE(a->elems + a->header.size, b->elems,
-				  num, a, b);
+		BPS_TREE_DATAMOVE(a->elems + a->header.size, b->elems, num, a,
+			b);
 		BPS_TREE_DATAMOVE(b->elems, b->elems + num, new_pos, b, b);
 		b->elems[new_pos] = new_elem;
 		BPS_TREE_DATAMOVE(b->elems + new_pos + 1, b->elems + pos,
-				  b->header.size - pos, b, b);
+			b->header.size - pos, b, b);
 
 	} else {
 		/* In fact insert to 'a' block */
 		bps_tree_pos_t new_pos = a->header.size + pos; /* Can be 0 */
-		BPS_TREE_DATAMOVE(a->elems + a->header.size, b->elems,
-				  pos, a, b);
+		BPS_TREE_DATAMOVE(a->elems + a->header.size, b->elems, pos, a,
+			b);
 		a->elems[new_pos] = new_elem;
 		BPS_TREE_DATAMOVE(a->elems + new_pos + 1, b->elems + pos,
-				  num - 1 - pos, a, b);
+			num - 1 - pos, a, b);
 		if (!move_all)
 			BPS_TREE_DATAMOVE(b->elems, b->elems + num - 1,
-					  b->header.size - num + 1, b, b);
+				b->header.size - num + 1, b, b);
 	}
 
 	a->header.size += num;
 	b->header.size -= (num - 1);
 	*a_leaf_path_elem->max_elem_copy = a->elems[a->header.size - 1];
 	if (!move_all)
-		*b_leaf_path_elem->max_elem_copy =
-			b->elems[b->header.size - 1];
+		*b_leaf_path_elem->max_elem_copy = b->elems[b->header.size - 1];
 	tree->size++;
 }
 
@@ -2449,14 +2540,20 @@ bps_tree_insert_and_move_elems_to_left_leaf(struct bps_tree *tree,
  *  BUT(!) insertion is allowed into full block, so one can consider
  *  insertion as a virtual insertion into virtual block of greater maximum size
  */
-static inline void
-bps_tree_insert_and_move_elems_to_left_inner(struct bps_tree *tree,
-		bps_inner_path_elem *a_inner_path_elem,
-		bps_inner_path_elem *b_inner_path_elem, bps_tree_pos_t num,
-		bps_tree_block_id_t block_id, bps_tree_pos_t pos,
-		bps_tree_elem_t max_elem)
+static inline void bps_tree_insert_and_move_elems_to_left_inner(
+	struct bps_tree *tree,
+	bps_inner_path_elem *a_inner_path_elem,
+	bps_inner_path_elem *b_inner_path_elem, bps_tree_pos_t num,
+	bps_tree_block_id_t block_id, bps_tree_pos_t pos,
+	bps_tree_elem_t max_elem)
 {
-	(void)tree;
+	/* exclusive behaviuor for debug checks */
+	if (tree->root_id != (bps_tree_block_id_t) -1) {
+		a_inner_path_elem->block = (struct bps_inner *)
+		bps_tree_before_change_block(tree, a_inner_path_elem->block_id);
+		b_inner_path_elem->block = (struct bps_inner *)
+		bps_tree_before_change_block(tree, b_inner_path_elem->block_id);
+	}
 	struct bps_inner *a = a_inner_path_elem->block;
 	struct bps_inner *b = b_inner_path_elem->block;
 	bool move_to_empty = a->header.size == 0;
@@ -2472,20 +2569,19 @@ bps_tree_insert_and_move_elems_to_left_inner(struct bps_tree *tree,
 		/* In fact insert to 'b' block */
 		bps_tree_pos_t new_pos = pos - num; /* Can be 0 */
 		BPS_TREE_DATAMOVE(a->child_ids + a->header.size, b->child_ids,
-				  num, a, b);
-		BPS_TREE_DATAMOVE(b->child_ids, b->child_ids + num,
-				  new_pos, b, b);
+			num, a, b);
+		BPS_TREE_DATAMOVE(b->child_ids, b->child_ids + num, new_pos, b,
+			b);
 		b->child_ids[new_pos] = block_id;
 		BPS_TREE_DATAMOVE(b->child_ids + new_pos + 1,
-				  b->child_ids + pos,
-				  b->header.size - pos, b, b);
+			b->child_ids + pos, b->header.size - pos, b, b);
 
 		if (!move_to_empty)
 			a->elems[a->header.size - 1] =
 				*a_inner_path_elem->max_elem_copy;
 
-		BPS_TREE_DATAMOVE(a->elems + a->header.size, b->elems,
-				  num - 1, a, b);
+		BPS_TREE_DATAMOVE(a->elems + a->header.size, b->elems, num - 1,
+			a, b);
 		if (num < b->header.size)
 			*a_inner_path_elem->max_elem_copy = b->elems[num - 1];
 		else
@@ -2495,31 +2591,29 @@ bps_tree_insert_and_move_elems_to_left_inner(struct bps_tree *tree,
 		if (pos == b->header.size) { /* arrow is righter than star */
 			if (num < b->header.size) {
 				BPS_TREE_DATAMOVE(b->elems, b->elems + num,
-						  b->header.size - num - 1,
-						  b, b);
+					b->header.size - num - 1, b, b);
 				b->elems[b->header.size - num - 1] =
 					*b_inner_path_elem->max_elem_copy;
 			}
 			*b_inner_path_elem->max_elem_copy = max_elem;
 		} else { /* star is righter than arrow */
-			BPS_TREE_DATAMOVE(b->elems, b->elems + num,
-					  new_pos, b, b);
+			BPS_TREE_DATAMOVE(b->elems, b->elems + num, new_pos, b,
+				b);
 			b->elems[new_pos] = max_elem;
 			BPS_TREE_DATAMOVE(b->elems + new_pos + 1,
-					  b->elems + pos,
-					  b->header.size - pos - 1, b, b);
+				b->elems + pos, b->header.size - pos - 1, b, b);
 		}
 	} else {
 		/* In fact insert to 'a' block */
 		bps_tree_pos_t new_pos = a->header.size + pos; /* Can be 0 */
-		BPS_TREE_DATAMOVE(a->child_ids + a->header.size,
-				  b->child_ids, pos, a, b);
+		BPS_TREE_DATAMOVE(a->child_ids + a->header.size, b->child_ids,
+			pos, a, b);
 		a->child_ids[new_pos] = block_id;
 		BPS_TREE_DATAMOVE(a->child_ids + new_pos + 1,
-				  b->child_ids + pos, num - 1 - pos, a, b);
+			b->child_ids + pos, num - 1 - pos, a, b);
 		if (!move_all)
 			BPS_TREE_DATAMOVE(b->child_ids, b->child_ids + num - 1,
-					  b->header.size - num + 1, b, b);
+				b->header.size - num + 1, b, b);
 
 		if (!move_to_empty)
 			a->elems[a->header.size - 1] =
@@ -2527,20 +2621,19 @@ bps_tree_insert_and_move_elems_to_left_inner(struct bps_tree *tree,
 
 		if (!move_all) {
 			BPS_TREE_DATAMOVE(a->elems + a->header.size, b->elems,
-					  pos, a, b);
+				pos, a, b);
 		} else {
 			if (pos == b->header.size) {
 				if (pos > 0) { /* why? */
-					BPS_TREE_DATAMOVE(a->elems +
-							  a->header.size,
-							  b->elems, pos - 1,
-							  a, b);
+					BPS_TREE_DATAMOVE(
+						a->elems + a->header.size,
+						b->elems, pos - 1, a, b);
 					a->elems[new_pos - 1] =
-					*b_inner_path_elem->max_elem_copy;
+						*b_inner_path_elem->max_elem_copy;
 				}
 			} else {
 				BPS_TREE_DATAMOVE(a->elems + a->header.size,
-						  b->elems, pos, a, b);
+					b->elems, pos, a, b);
 			}
 		}
 		if (new_pos == a->header.size + num - 1) {
@@ -2548,18 +2641,17 @@ bps_tree_insert_and_move_elems_to_left_inner(struct bps_tree *tree,
 		} else {
 			a->elems[new_pos] = max_elem;
 			BPS_TREE_DATAMOVE(a->elems + new_pos + 1,
-					  b->elems + pos, num - 1 - pos - 1,
-					  a, b);
+				b->elems + pos, num - 1 - pos - 1, a, b);
 			if (move_all)
 				*a_inner_path_elem->max_elem_copy =
 					*b_inner_path_elem->max_elem_copy;
 			else
-				*a_inner_path_elem->max_elem_copy =
-					b->elems[num - 2];
+				*a_inner_path_elem->max_elem_copy = b->elems[num
+					- 2];
 		}
 		if (!move_all)
 			BPS_TREE_DATAMOVE(b->elems, b->elems + num - 1,
-					  b->header.size - num, b, b);
+				b->header.size - num, b, b);
 	}
 
 	a->header.size += num;
@@ -2569,8 +2661,7 @@ bps_tree_insert_and_move_elems_to_left_inner(struct bps_tree *tree,
 /**
  * @brieaf Difference between maximum possible and current size of the leaf
  */
-static inline bps_tree_pos_t
-bps_tree_leaf_free_size(struct bps_leaf *leaf)
+static inline bps_tree_pos_t bps_tree_leaf_free_size(struct bps_leaf *leaf)
 {
 	return BPS_TREE_MAX_COUNT_IN_LEAF - leaf->header.size;
 }
@@ -2578,8 +2669,7 @@ bps_tree_leaf_free_size(struct bps_leaf *leaf)
 /**
  * @brieaf Difference between maximum possible and current size of the inner
  */
-static inline bps_tree_pos_t
-bps_tree_inner_free_size(struct bps_inner *inner)
+static inline bps_tree_pos_t bps_tree_inner_free_size(struct bps_inner *inner)
 {
 	return BPS_TREE_MAX_COUNT_IN_INNER - inner->header.size;
 }
@@ -2587,8 +2677,7 @@ bps_tree_inner_free_size(struct bps_inner *inner)
 /**
  * @brieaf Difference between current size of the leaf and minumum allowed
  */
-static inline bps_tree_pos_t
-bps_tree_leaf_overmin_size(struct bps_leaf *leaf)
+static inline bps_tree_pos_t bps_tree_leaf_overmin_size(struct bps_leaf *leaf)
 {
 	return leaf->header.size - BPS_TREE_MAX_COUNT_IN_LEAF * 2 / 3;
 }
@@ -2596,8 +2685,8 @@ bps_tree_leaf_overmin_size(struct bps_leaf *leaf)
  * @brieaf Difference between current size of the inner and minumum allowed
  */
 
-static inline bps_tree_pos_t
-bps_tree_inner_overmin_size(struct bps_inner *inner)
+static inline bps_tree_pos_t bps_tree_inner_overmin_size(
+	struct bps_inner *inner)
 {
 	return inner->header.size - BPS_TREE_MAX_COUNT_IN_INNER * 2 / 3;
 }
@@ -2605,10 +2694,9 @@ bps_tree_inner_overmin_size(struct bps_inner *inner)
 /**
  * @brief Fill path element structure of the left leaf
  */
-static inline bool
-bps_tree_collect_left_path_elem_leaf(struct bps_tree *tree,
-				     struct bps_leaf_path_elem *path_elem,
-				     struct bps_leaf_path_elem *new_path_elem)
+static inline bool bps_tree_collect_left_path_elem_leaf(struct bps_tree *tree,
+	struct bps_leaf_path_elem *path_elem,
+	struct bps_leaf_path_elem *new_path_elem)
 {
 	bps_inner_path_elem * parent = path_elem->parent;
 	if (!parent)
@@ -2621,9 +2709,9 @@ bps_tree_collect_left_path_elem_leaf(struct bps_tree *tree,
 	new_path_elem->block_id =
 		parent->block->child_ids[new_path_elem->pos_in_parent];
 	new_path_elem->block = (struct bps_leaf *)
-		bps_tree_restore_block(tree, new_path_elem->block_id);
-	new_path_elem->max_elem_copy =
-		parent->block->elems + new_path_elem->pos_in_parent;
+	bps_tree_restore_block(tree, new_path_elem->block_id);
+	new_path_elem->max_elem_copy = parent->block->elems
+		+ new_path_elem->pos_in_parent;
 	new_path_elem->insertion_point = bps_tree_pos_t(-1); /* unused */
 	return true;
 }
@@ -2632,10 +2720,9 @@ bps_tree_collect_left_path_elem_leaf(struct bps_tree *tree,
  * @brief Fill path element structure of the left inner
  *  almost exact copy of collect_tree_left_ext_leaf
  */
-static inline bool
-bps_tree_collect_left_path_elem_inner(struct bps_tree *tree,
-				      bps_inner_path_elem *path_elem,
-				      bps_inner_path_elem *new_path_elem)
+static inline bool bps_tree_collect_left_path_elem_inner(struct bps_tree *tree,
+bps_inner_path_elem *path_elem,
+bps_inner_path_elem *new_path_elem)
 {
 	bps_inner_path_elem * parent = path_elem->parent;
 	if (!parent)
@@ -2648,9 +2735,9 @@ bps_tree_collect_left_path_elem_inner(struct bps_tree *tree,
 	new_path_elem->block_id =
 		parent->block->child_ids[new_path_elem->pos_in_parent];
 	new_path_elem->block = (struct bps_inner *)
-		bps_tree_restore_block(tree, new_path_elem->block_id);
-	new_path_elem->max_elem_copy = parent->block->elems +
-		new_path_elem->pos_in_parent;
+	bps_tree_restore_block(tree, new_path_elem->block_id);
+	new_path_elem->max_elem_copy = parent->block->elems
+		+ new_path_elem->pos_in_parent;
 	new_path_elem->insertion_point = bps_tree_pos_t(-1); /* unused */
 	return true;
 }
@@ -2658,10 +2745,9 @@ bps_tree_collect_left_path_elem_inner(struct bps_tree *tree,
 /**
  * @brief Fill path element structure of the right leaf
  */
-static inline bool
-bps_tree_collect_right_ext_leaf(struct bps_tree *tree,
-				struct bps_leaf_path_elem *path_elem,
-				struct bps_leaf_path_elem *new_path_elem)
+static inline bool bps_tree_collect_right_ext_leaf(struct bps_tree *tree,
+	struct bps_leaf_path_elem *path_elem,
+	struct bps_leaf_path_elem *new_path_elem)
 {
 	bps_inner_path_elem *parent = path_elem->parent;
 	if (!parent)
@@ -2674,12 +2760,12 @@ bps_tree_collect_right_ext_leaf(struct bps_tree *tree,
 	new_path_elem->block_id =
 		parent->block->child_ids[new_path_elem->pos_in_parent];
 	new_path_elem->block = (struct bps_leaf *)
-		bps_tree_restore_block(tree, new_path_elem->block_id);
+	bps_tree_restore_block(tree, new_path_elem->block_id);
 	if (new_path_elem->pos_in_parent >= parent->block->header.size - 1)
 		new_path_elem->max_elem_copy = parent->max_elem_copy;
 	else
-		new_path_elem->max_elem_copy = parent->block->elems +
-			new_path_elem->pos_in_parent;
+		new_path_elem->max_elem_copy = parent->block->elems
+			+ new_path_elem->pos_in_parent;
 	new_path_elem->insertion_point = bps_tree_pos_t(-1); /* unused */
 	return true;
 }
@@ -2688,10 +2774,9 @@ bps_tree_collect_right_ext_leaf(struct bps_tree *tree,
  * @brief Fill path element structure of the right inner
  * almost exact copy of bps_tree_collect_right_ext_leaf
  */
-static inline bool
-bps_tree_collect_right_ext_inner(struct bps_tree *tree,
-				 bps_inner_path_elem *path_elem,
-				 bps_inner_path_elem *new_path_elem)
+static inline bool bps_tree_collect_right_ext_inner(struct bps_tree *tree,
+bps_inner_path_elem *path_elem,
+bps_inner_path_elem *new_path_elem)
 {
 	bps_inner_path_elem *parent = path_elem->parent;
 	if (!parent)
@@ -2704,12 +2789,12 @@ bps_tree_collect_right_ext_inner(struct bps_tree *tree,
 	new_path_elem->block_id =
 		parent->block->child_ids[new_path_elem->pos_in_parent];
 	new_path_elem->block = (struct bps_inner *)
-		bps_tree_restore_block(tree, new_path_elem->block_id);
+	bps_tree_restore_block(tree, new_path_elem->block_id);
 	if (new_path_elem->pos_in_parent >= parent->block->header.size - 1)
 		new_path_elem->max_elem_copy = parent->max_elem_copy;
 	else
-		new_path_elem->max_elem_copy = parent->block->elems +
-			new_path_elem->pos_in_parent;
+		new_path_elem->max_elem_copy = parent->block->elems
+			+ new_path_elem->pos_in_parent;
 	new_path_elem->insertion_point = bps_tree_pos_t(-1); /* unused */
 	return true;
 }
@@ -2717,12 +2802,10 @@ bps_tree_collect_right_ext_inner(struct bps_tree *tree,
 /**
  * @brief Fill path element structure of the new leaf
  */
-static inline void
-bps_tree_prepare_new_ext_leaf(struct bps_leaf_path_elem *path_elem,
-			      struct bps_leaf_path_elem *new_path_elem,
-			      struct bps_leaf* new_leaf,
-			      bps_tree_block_id_t new_leaf_id,
-			      bps_tree_elem_t *max_elem_copy)
+static inline void bps_tree_prepare_new_ext_leaf(
+	struct bps_leaf_path_elem *path_elem,
+	struct bps_leaf_path_elem *new_path_elem, struct bps_leaf* new_leaf,
+	bps_tree_block_id_t new_leaf_id, bps_tree_elem_t *max_elem_copy)
 {
 	new_path_elem->parent = path_elem->parent;
 	new_path_elem->pos_in_parent = path_elem->pos_in_parent + 1;
@@ -2735,12 +2818,10 @@ bps_tree_prepare_new_ext_leaf(struct bps_leaf_path_elem *path_elem,
 /**
  * @brief Fill path element structure of the new inner
  */
-static inline void
-bps_tree_prepare_new_ext_inner(bps_inner_path_elem *path_elem,
-			       bps_inner_path_elem *new_path_elem,
-			       struct bps_inner* new_inner,
-			       bps_tree_block_id_t new_inner_id,
-			       bps_tree_elem_t *max_elem_copy)
+static inline void bps_tree_prepare_new_ext_inner(
+	bps_inner_path_elem *path_elem,
+	bps_inner_path_elem *new_path_elem, struct bps_inner* new_inner,
+	bps_tree_block_id_t new_inner_id, bps_tree_elem_t *max_elem_copy)
 {
 	new_path_elem->parent = path_elem->parent;
 	new_path_elem->pos_in_parent = path_elem->pos_in_parent + 1;
@@ -2755,119 +2836,114 @@ bps_tree_prepare_new_ext_inner(bps_inner_path_elem *path_elem,
  */
 static bool
 bps_tree_process_insert_inner(struct bps_tree *tree,
-			      bps_inner_path_elem *inner_path_elem,
-			      bps_tree_block_id_t block_id, bps_tree_pos_t pos,
-			      bps_tree_elem_t max_elem);
+bps_inner_path_elem *inner_path_elem, bps_tree_block_id_t block_id,
+	bps_tree_pos_t pos, bps_tree_elem_t max_elem);
 
 /**
  * Basic inserted into leaf, dealing with spliting, merging and moving data
  * to neighbour blocks if necessary
  */
-static inline bool
-bps_tree_process_insert_leaf(struct bps_tree *tree,
-			     struct bps_leaf_path_elem *leaf_path_elem,
-			     bps_tree_elem_t new_elem)
+static inline bool bps_tree_process_insert_leaf(struct bps_tree *tree,
+	struct bps_leaf_path_elem *leaf_path_elem, bps_tree_elem_t new_elem)
 {
 	if (bps_tree_leaf_free_size(leaf_path_elem->block)) {
 		bps_tree_insert_into_leaf(tree, leaf_path_elem, new_elem);
 		BPS_TREE_BRANCH_TRACE(tree, insert_leaf, 1 << 0x0);
 		return true;
 	}
-	struct bps_leaf_path_elem left_ext = {0, 0, 0, 0, 0, 0},
-			right_ext = {0, 0, 0, 0, 0, 0},
-			left_left_ext = {0, 0, 0, 0, 0, 0},
-			right_right_ext = {0, 0, 0, 0, 0, 0};
+	struct bps_leaf_path_elem left_ext = { 0, 0, 0, 0, 0, 0 }, right_ext = {
+			0, 0, 0, 0, 0, 0 },
+		left_left_ext = { 0, 0, 0, 0, 0, 0 }, right_right_ext = { 0, 0,
+				0, 0, 0, 0 };
 	bool has_left_ext =
-		bps_tree_collect_left_path_elem_leaf(tree, leaf_path_elem,
-						     &left_ext);
+	bps_tree_collect_left_path_elem_leaf(tree, leaf_path_elem, &left_ext);
 	bool has_right_ext =
-		bps_tree_collect_right_ext_leaf(tree, leaf_path_elem,
-						&right_ext);
+	bps_tree_collect_right_ext_leaf(tree, leaf_path_elem, &right_ext);
 	bool has_left_left_ext = false;
 	bool has_right_right_ext = false;
 	if (has_left_ext && has_right_ext) {
 		if (bps_tree_leaf_free_size(left_ext.block) >
-		    bps_tree_leaf_free_size(right_ext.block)) {
+		bps_tree_leaf_free_size(right_ext.block)) {
 			bps_tree_pos_t move_count = 1 +
-				bps_tree_leaf_free_size(left_ext.block) / 2;
+			bps_tree_leaf_free_size(left_ext.block) / 2;
 			bps_tree_insert_and_move_elems_to_left_leaf(tree,
-					&left_ext, leaf_path_elem,
-					move_count, new_elem);
+				&left_ext, leaf_path_elem, move_count,
+				new_elem);
 			BPS_TREE_BRANCH_TRACE(tree, insert_leaf, 1 << 0x1);
 			return true;
 		} else if (bps_tree_leaf_free_size(right_ext.block) > 0) {
 			bps_tree_pos_t move_count = 1 +
-				bps_tree_leaf_free_size(right_ext.block) / 2;
+			bps_tree_leaf_free_size(right_ext.block) / 2;
 			bps_tree_insert_and_move_elems_to_right_leaf(tree,
-					leaf_path_elem, &right_ext,
-					move_count, new_elem);
+				leaf_path_elem, &right_ext, move_count,
+				new_elem);
 			BPS_TREE_BRANCH_TRACE(tree, insert_leaf, 1 << 0x2);
 			return true;
 		}
 	} else if (has_left_ext) {
 		if (bps_tree_leaf_free_size(left_ext.block) > 0) {
 			bps_tree_pos_t move_count = 1 +
-				bps_tree_leaf_free_size(left_ext.block) / 2;
+			bps_tree_leaf_free_size(left_ext.block) / 2;
 			bps_tree_insert_and_move_elems_to_left_leaf(tree,
-					&left_ext, leaf_path_elem,
-					move_count, new_elem);
+				&left_ext, leaf_path_elem, move_count,
+				new_elem);
 			BPS_TREE_BRANCH_TRACE(tree, insert_leaf, 1 << 0x3);
 			return true;
 		}
 		has_left_left_ext = bps_tree_collect_left_path_elem_leaf(tree,
-				&left_ext, &left_left_ext);
+			&left_ext, &left_left_ext);
 		if (has_left_left_ext &&
-		    bps_tree_leaf_free_size(left_left_ext.block) > 0) {
+		bps_tree_leaf_free_size(left_left_ext.block) > 0) {
 			bps_tree_pos_t move_count = 1 + (2 *
-				bps_tree_leaf_free_size(left_left_ext.block)
-				- 1) / 3;
-			bps_tree_move_elems_to_left_leaf(tree,
-					&left_left_ext, &left_ext, move_count);
+			bps_tree_leaf_free_size(left_left_ext.block) - 1) / 3;
+			bps_tree_move_elems_to_left_leaf(tree, &left_left_ext,
+				&left_ext, move_count);
 			move_count = 1 + move_count / 2;
 			bps_tree_insert_and_move_elems_to_left_leaf(tree,
-					&left_ext, leaf_path_elem,
-					move_count, new_elem);
+				&left_ext, leaf_path_elem, move_count,
+				new_elem);
 			BPS_TREE_BRANCH_TRACE(tree, insert_leaf, 1 << 0x4);
 			return true;
 		}
 	} else if (has_right_ext) {
 		if (bps_tree_leaf_free_size(right_ext.block) > 0) {
 			bps_tree_pos_t move_count = 1 +
-				bps_tree_leaf_free_size(right_ext.block) / 2;
+			bps_tree_leaf_free_size(right_ext.block) / 2;
 			bps_tree_insert_and_move_elems_to_right_leaf(tree,
-					leaf_path_elem, &right_ext,
-					move_count, new_elem);
+				leaf_path_elem, &right_ext, move_count,
+				new_elem);
 			BPS_TREE_BRANCH_TRACE(tree, insert_leaf, 1 << 0x5);
 			return true;
 		}
 		has_right_right_ext = bps_tree_collect_right_ext_leaf(tree,
-				&right_ext, &right_right_ext);
+			&right_ext, &right_right_ext);
 		if (has_right_right_ext &&
-		    bps_tree_leaf_free_size(right_right_ext.block) > 0) {
+		bps_tree_leaf_free_size(right_right_ext.block) > 0) {
 			bps_tree_pos_t move_count = 1 + (2 *
-				bps_tree_leaf_free_size(right_right_ext.block)
-				- 1) / 3;
+			bps_tree_leaf_free_size(right_right_ext.block) - 1) / 3;
 			bps_tree_move_elems_to_right_leaf(tree, &right_ext,
-					&right_right_ext, move_count);
+				&right_right_ext, move_count);
 			move_count = 1 + move_count / 2;
 			bps_tree_insert_and_move_elems_to_right_leaf(tree,
-					leaf_path_elem, &right_ext,
-					move_count, new_elem);
+				leaf_path_elem, &right_ext, move_count,
+				new_elem);
 			BPS_TREE_BRANCH_TRACE(tree, insert_leaf, 1 << 0x6);
 			return true;
 		}
 	}
-	bps_tree_block_id_t new_block_id = (bps_tree_block_id_t)(-1);
-	struct bps_leaf *new_leaf = bps_tree_create_leaf(tree, &new_block_id);
 
 	if (!bps_tree_reserve_blocks(tree, tree->depth + 1)) {
 		return false;
 	}
+	bps_tree_block_id_t new_block_id = (bps_tree_block_id_t) (-1);
+	struct bps_leaf *new_leaf = bps_tree_create_leaf(tree, &new_block_id);
 
-	if (leaf_path_elem->block->next_id != (bps_tree_block_id_t)(-1)) {
+	leaf_path_elem->block = (struct bps_leaf *)
+	bps_tree_before_change_block(tree, leaf_path_elem->block_id);
+
+	if (leaf_path_elem->block->next_id != (bps_tree_block_id_t) (-1)) {
 		struct bps_leaf *next_leaf = (struct bps_leaf *)
-			bps_tree_restore_block(tree,
-					       leaf_path_elem->block->next_id);
+		bps_tree_before_change_block(tree, leaf_path_elem->block->next_id);
 		assert(next_leaf->prev_id == leaf_path_elem->block_id);
 		next_leaf->prev_id = new_block_id;
 	} else {
@@ -2881,7 +2957,7 @@ bps_tree_process_insert_leaf(struct bps_tree *tree,
 	struct bps_leaf_path_elem new_path_elem;
 	bps_tree_elem_t new_max_elem;
 	bps_tree_prepare_new_ext_leaf(leaf_path_elem, &new_path_elem, new_leaf,
-				      new_block_id, &new_max_elem);
+		new_block_id, &new_max_elem);
 	if (has_left_ext && has_right_ext) {
 		/*
 		 * The block has MAX elems and +1 elem is inserted,
@@ -2907,11 +2983,11 @@ bps_tree_process_insert_leaf(struct bps_tree *tree,
 		const bps_tree_pos_t mc1 = nc3 - mc3;
 
 		bps_tree_insert_and_move_elems_to_right_leaf(tree,
-				leaf_path_elem, &new_path_elem, mc1, new_elem);
-		bps_tree_move_elems_to_right_leaf(tree,
-				&left_ext, leaf_path_elem, mc2);
-		bps_tree_move_elems_to_left_leaf(tree,
-				&new_path_elem, &right_ext, mc3);
+			leaf_path_elem, &new_path_elem, mc1, new_elem);
+		bps_tree_move_elems_to_right_leaf(tree, &left_ext,
+			leaf_path_elem, mc2);
+		bps_tree_move_elems_to_left_leaf(tree, &new_path_elem,
+			&right_ext, mc3);
 
 		BPS_TREE_BRANCH_TRACE(tree, insert_leaf, 1 << 0x7);
 	} else if (has_left_ext && has_left_left_ext) {
@@ -2941,11 +3017,11 @@ bps_tree_process_insert_leaf(struct bps_tree *tree,
 		const bps_tree_pos_t mc2 = max + mc3 - nc2;
 
 		bps_tree_insert_and_move_elems_to_right_leaf(tree,
-				leaf_path_elem, &new_path_elem, mc1, new_elem);
-		bps_tree_move_elems_to_right_leaf(tree,
-				&left_ext, leaf_path_elem, mc2);
-		bps_tree_move_elems_to_right_leaf(tree,
-				&left_left_ext, &left_ext, mc3);
+			leaf_path_elem, &new_path_elem, mc1, new_elem);
+		bps_tree_move_elems_to_right_leaf(tree, &left_ext,
+			leaf_path_elem, mc2);
+		bps_tree_move_elems_to_right_leaf(tree, &left_left_ext,
+			&left_ext, mc3);
 
 		BPS_TREE_BRANCH_TRACE(tree, insert_leaf, 1 << 0x8);
 	} else if (has_right_ext && has_right_right_ext) {
@@ -2974,11 +3050,11 @@ bps_tree_process_insert_leaf(struct bps_tree *tree,
 		const bps_tree_pos_t mc2 = max + mc3 - nc3;
 
 		bps_tree_insert_and_move_elems_to_right_leaf(tree,
-				leaf_path_elem, &new_path_elem, mc1, new_elem);
-		bps_tree_move_elems_to_left_leaf(tree,
-				&new_path_elem, &right_ext, mc2);
-		bps_tree_move_elems_to_left_leaf(tree,
-				&right_ext, &right_right_ext, mc3);
+			leaf_path_elem, &new_path_elem, mc1, new_elem);
+		bps_tree_move_elems_to_left_leaf(tree, &new_path_elem,
+			&right_ext, mc2);
+		bps_tree_move_elems_to_left_leaf(tree, &right_ext,
+			&right_right_ext, mc3);
 
 		BPS_TREE_BRANCH_TRACE(tree, insert_leaf, 1 << 0x9);
 	} else if (has_left_ext) {
@@ -3005,9 +3081,9 @@ bps_tree_process_insert_leaf(struct bps_tree *tree,
 		const bps_tree_pos_t mc2 = max - nc1;
 
 		bps_tree_insert_and_move_elems_to_right_leaf(tree,
-				leaf_path_elem, &new_path_elem, mc1, new_elem);
-		bps_tree_move_elems_to_right_leaf(tree,
-				&left_ext, leaf_path_elem, mc2);
+			leaf_path_elem, &new_path_elem, mc1, new_elem);
+		bps_tree_move_elems_to_right_leaf(tree, &left_ext,
+			leaf_path_elem, mc2);
 
 		BPS_TREE_BRANCH_TRACE(tree, insert_leaf, 1 << 0xA);
 	} else if (has_right_ext) {
@@ -3033,9 +3109,9 @@ bps_tree_process_insert_leaf(struct bps_tree *tree,
 		const bps_tree_pos_t mc2 = max - nc3;
 
 		bps_tree_insert_and_move_elems_to_right_leaf(tree,
-				leaf_path_elem, &new_path_elem, mc1, new_elem);
+			leaf_path_elem, &new_path_elem, mc1, new_elem);
 		bps_tree_move_elems_to_left_leaf(tree, &new_path_elem,
-				&right_ext, mc2);
+			&right_ext, mc2);
 
 		BPS_TREE_BRANCH_TRACE(tree, insert_leaf, 1 << 0xB);
 	} else {
@@ -3060,16 +3136,15 @@ bps_tree_process_insert_leaf(struct bps_tree *tree,
 		const bps_tree_pos_t mc1 = nc2;
 
 		bps_tree_insert_and_move_elems_to_right_leaf(tree,
-				leaf_path_elem, &new_path_elem, mc1, new_elem);
+			leaf_path_elem, &new_path_elem, mc1, new_elem);
 
-		bps_tree_block_id_t new_root_id = (bps_tree_block_id_t)(-1);
+		bps_tree_block_id_t new_root_id = (bps_tree_block_id_t) (-1);
 		struct bps_inner *new_root = bps_tree_create_inner(tree,
-				&new_root_id);
+			&new_root_id);
 		new_root->header.size = 2;
 		new_root->child_ids[0] = tree->root_id;
 		new_root->child_ids[1] = new_block_id;
 		new_root->elems[0] = tree->max_elem;
-		tree->root = (struct bps_block *)new_root;
 		tree->root_id = new_root_id;
 		tree->max_elem = new_max_elem;
 		tree->depth++;
@@ -3080,119 +3155,113 @@ bps_tree_process_insert_leaf(struct bps_tree *tree,
 	assert(leaf_path_elem->parent);
 	BPS_TREE_BRANCH_TRACE(tree, insert_leaf, 1 << 0xD);
 	return bps_tree_process_insert_inner(tree, leaf_path_elem->parent,
-			new_block_id, new_path_elem.pos_in_parent,
-			new_max_elem);
+		new_block_id, new_path_elem.pos_in_parent, new_max_elem);
 }
 
 /**
  * Basic inserted into inner, dealing with spliting, merging and moving data
  * to neighbour blocks if necessary
  */
-static inline bool
-bps_tree_process_insert_inner(struct bps_tree *tree,
-			      bps_inner_path_elem *inner_path_elem,
-			      bps_tree_block_id_t block_id,
-			      bps_tree_pos_t pos, bps_tree_elem_t max_elem)
+static inline bool bps_tree_process_insert_inner(struct bps_tree *tree,
+bps_inner_path_elem *inner_path_elem, bps_tree_block_id_t block_id,
+	bps_tree_pos_t pos, bps_tree_elem_t max_elem)
 {
 	if (bps_tree_inner_free_size(inner_path_elem->block)) {
-		bps_tree_insert_into_inner(tree, inner_path_elem,
-					   block_id, pos, max_elem);
+		bps_tree_insert_into_inner(tree, inner_path_elem, block_id, pos,
+			max_elem);
 		BPS_TREE_BRANCH_TRACE(tree, insert_inner, 1 << 0x0);
 		return true;
 	}
-	bps_inner_path_elem left_ext = {0, 0, 0, 0, 0, 0},
-		right_ext = {0, 0, 0, 0, 0, 0},
-		left_left_ext = {0, 0, 0, 0, 0, 0},
-		right_right_ext = {0, 0, 0, 0, 0, 0};
+	bps_inner_path_elem left_ext = { 0, 0, 0, 0, 0, 0 }, right_ext = { 0, 0,
+			0, 0, 0, 0 }, left_left_ext = { 0, 0, 0, 0, 0, 0 },
+		right_right_ext = { 0, 0, 0, 0, 0, 0 };
 	bool has_left_ext =
-		bps_tree_collect_left_path_elem_inner(tree, inner_path_elem,
-						      &left_ext);
+	bps_tree_collect_left_path_elem_inner(tree, inner_path_elem, &left_ext);
 	bool has_right_ext =
-		bps_tree_collect_right_ext_inner(tree, inner_path_elem,
-						 &right_ext);
+	bps_tree_collect_right_ext_inner(tree, inner_path_elem, &right_ext);
 	bool has_left_left_ext = false;
 	bool has_right_right_ext = false;
 	if (has_left_ext && has_right_ext) {
 		if (bps_tree_inner_free_size(left_ext.block) >
-		    bps_tree_inner_free_size(right_ext.block)) {
+		bps_tree_inner_free_size(right_ext.block)) {
 			bps_tree_pos_t move_count = 1 +
-				bps_tree_inner_free_size(left_ext.block) / 2;
+			bps_tree_inner_free_size(left_ext.block) / 2;
 			bps_tree_insert_and_move_elems_to_left_inner(tree,
-					&left_ext, inner_path_elem, move_count,
-					block_id, pos, max_elem);
+				&left_ext, inner_path_elem, move_count,
+				block_id, pos, max_elem);
 			BPS_TREE_BRANCH_TRACE(tree, insert_inner, 1 << 0x1);
 			return true;
 		} else if (bps_tree_inner_free_size(right_ext.block) > 0) {
 			bps_tree_pos_t move_count = 1 +
-				bps_tree_inner_free_size(right_ext.block) / 2;
+			bps_tree_inner_free_size(right_ext.block) / 2;
 			bps_tree_insert_and_move_elems_to_right_inner(tree,
-					inner_path_elem, &right_ext,
-					move_count, block_id, pos, max_elem);
+				inner_path_elem, &right_ext, move_count,
+				block_id, pos, max_elem);
 			BPS_TREE_BRANCH_TRACE(tree, insert_inner, 1 << 0x2);
 			return true;
 		}
 	} else if (has_left_ext) {
 		if (bps_tree_inner_free_size(left_ext.block) > 0) {
 			bps_tree_pos_t move_count = 1 +
-				bps_tree_inner_free_size(left_ext.block) / 2;
+			bps_tree_inner_free_size(left_ext.block) / 2;
 			bps_tree_insert_and_move_elems_to_left_inner(tree,
-					&left_ext, inner_path_elem,
-					move_count, block_id, pos, max_elem);
+				&left_ext, inner_path_elem, move_count,
+				block_id, pos, max_elem);
 			BPS_TREE_BRANCH_TRACE(tree, insert_inner, 1 << 0x3);
 			return true;
 		}
 		has_left_left_ext = bps_tree_collect_left_path_elem_inner(tree,
-				&left_ext, &left_left_ext);
+			&left_ext, &left_left_ext);
 		if (has_left_left_ext &&
-		    bps_tree_inner_free_size(left_left_ext.block) > 0) {
+		bps_tree_inner_free_size(left_left_ext.block) > 0) {
 			bps_tree_pos_t move_count = 1 + (2 *
-				bps_tree_inner_free_size(left_left_ext.block)
-				- 1) / 3;
+			bps_tree_inner_free_size(left_left_ext.block) - 1) / 3;
 			bps_tree_move_elems_to_left_inner(tree, &left_left_ext,
-					&left_ext, move_count);
+				&left_ext, move_count);
 			move_count = 1 + move_count / 2;
 			bps_tree_insert_and_move_elems_to_left_inner(tree,
-					&left_ext, inner_path_elem, move_count,
-					block_id, pos, max_elem);
+				&left_ext, inner_path_elem, move_count,
+				block_id, pos, max_elem);
 			BPS_TREE_BRANCH_TRACE(tree, insert_inner, 1 << 0x4);
 			return true;
 		}
 	} else if (has_right_ext) {
 		if (bps_tree_inner_free_size(right_ext.block) > 0) {
 			bps_tree_pos_t move_count = 1 +
-				bps_tree_inner_free_size(right_ext.block) / 2;
+			bps_tree_inner_free_size(right_ext.block) / 2;
 			bps_tree_insert_and_move_elems_to_right_inner(tree,
-					inner_path_elem, &right_ext,
-					move_count, block_id, pos, max_elem);
+				inner_path_elem, &right_ext, move_count,
+				block_id, pos, max_elem);
 			BPS_TREE_BRANCH_TRACE(tree, insert_inner, 1 << 0x5);
 			return true;
 		}
 		has_right_right_ext = bps_tree_collect_right_ext_inner(tree,
-					&right_ext, &right_right_ext);
+			&right_ext, &right_right_ext);
 		if (has_right_right_ext &&
-		    bps_tree_inner_free_size(right_right_ext.block) > 0) {
-			bps_tree_pos_t move_count = 1 + (2 *
+		bps_tree_inner_free_size(right_right_ext.block) > 0) {
+			bps_tree_pos_t move_count = 1
+				+ (2 *
 				bps_tree_inner_free_size(right_right_ext.block)
-				- 1) / 3;
+					- 1) / 3;
 			bps_tree_move_elems_to_right_inner(tree, &right_ext,
-					&right_right_ext, move_count);
+				&right_right_ext, move_count);
 			move_count = 1 + move_count / 2;
 			bps_tree_insert_and_move_elems_to_right_inner(tree,
-					inner_path_elem, &right_ext,
-					move_count, block_id, pos, max_elem);
+				inner_path_elem, &right_ext, move_count,
+				block_id, pos, max_elem);
 			BPS_TREE_BRANCH_TRACE(tree, insert_inner, 1 << 0x6);
 			return true;
 		}
 	}
-	bps_tree_block_id_t new_block_id = (bps_tree_block_id_t)(-1);
+	bps_tree_block_id_t new_block_id = (bps_tree_block_id_t) (-1);
 	struct bps_inner *new_inner = bps_tree_create_inner(tree,
-			&new_block_id);
+		&new_block_id);
 
 	new_inner->header.size = 0;
 	bps_inner_path_elem new_path_elem;
 	bps_tree_elem_t new_max_elem;
 	bps_tree_prepare_new_ext_inner(inner_path_elem, &new_path_elem,
-				       new_inner, new_block_id, &new_max_elem);
+		new_inner, new_block_id, &new_max_elem);
 	if (has_left_ext && has_right_ext) {
 		/*
 		 * The block has MAX elems and +1 elem is inserted,
@@ -3218,12 +3287,12 @@ bps_tree_process_insert_inner(struct bps_tree *tree,
 		const bps_tree_pos_t mc1 = nc3 - mc3;
 
 		bps_tree_insert_and_move_elems_to_right_inner(tree,
-				inner_path_elem, &new_path_elem,
-				mc1, block_id, pos, max_elem);
-		bps_tree_move_elems_to_right_inner(tree,
-				&left_ext, inner_path_elem, mc2);
-		bps_tree_move_elems_to_left_inner(tree,
-				&new_path_elem, &right_ext, mc3);
+			inner_path_elem, &new_path_elem, mc1, block_id, pos,
+			max_elem);
+		bps_tree_move_elems_to_right_inner(tree, &left_ext,
+			inner_path_elem, mc2);
+		bps_tree_move_elems_to_left_inner(tree, &new_path_elem,
+			&right_ext, mc3);
 
 		BPS_TREE_BRANCH_TRACE(tree, insert_inner, 1 << 0x7);
 	} else if (has_left_ext && has_left_left_ext) {
@@ -3253,12 +3322,12 @@ bps_tree_process_insert_inner(struct bps_tree *tree,
 		const bps_tree_pos_t mc2 = max + mc3 - nc2;
 
 		bps_tree_insert_and_move_elems_to_right_inner(tree,
-				inner_path_elem, &new_path_elem,
-				mc1, block_id, pos, max_elem);
-		bps_tree_move_elems_to_right_inner(tree,
-				&left_ext, inner_path_elem, mc2);
-		bps_tree_move_elems_to_right_inner(tree,
-				&left_left_ext, &left_ext, mc3);
+			inner_path_elem, &new_path_elem, mc1, block_id, pos,
+			max_elem);
+		bps_tree_move_elems_to_right_inner(tree, &left_ext,
+			inner_path_elem, mc2);
+		bps_tree_move_elems_to_right_inner(tree, &left_left_ext,
+			&left_ext, mc3);
 
 		BPS_TREE_BRANCH_TRACE(tree, insert_inner, 1 << 0x8);
 	} else if (has_right_ext && has_right_right_ext) {
@@ -3287,12 +3356,12 @@ bps_tree_process_insert_inner(struct bps_tree *tree,
 		const bps_tree_pos_t mc2 = max + mc3 - nc3;
 
 		bps_tree_insert_and_move_elems_to_right_inner(tree,
-				inner_path_elem, &new_path_elem,
-				mc1, block_id, pos, max_elem);
-		bps_tree_move_elems_to_left_inner(tree,
-				&new_path_elem, &right_ext, mc2);
-		bps_tree_move_elems_to_left_inner(tree,
-				&right_ext, &right_right_ext, mc3);
+			inner_path_elem, &new_path_elem, mc1, block_id, pos,
+			max_elem);
+		bps_tree_move_elems_to_left_inner(tree, &new_path_elem,
+			&right_ext, mc2);
+		bps_tree_move_elems_to_left_inner(tree, &right_ext,
+			&right_right_ext, mc3);
 
 		BPS_TREE_BRANCH_TRACE(tree, insert_inner, 1 << 0x9);
 	} else if (has_left_ext) {
@@ -3319,10 +3388,10 @@ bps_tree_process_insert_inner(struct bps_tree *tree,
 		const bps_tree_pos_t mc2 = max - nc1;
 
 		bps_tree_insert_and_move_elems_to_right_inner(tree,
-				inner_path_elem, &new_path_elem,
-				mc1, block_id, pos, max_elem);
-		bps_tree_move_elems_to_right_inner(tree,
-				&left_ext, inner_path_elem, mc2);
+			inner_path_elem, &new_path_elem, mc1, block_id, pos,
+			max_elem);
+		bps_tree_move_elems_to_right_inner(tree, &left_ext,
+			inner_path_elem, mc2);
 
 		BPS_TREE_BRANCH_TRACE(tree, insert_inner, 1 << 0xA);
 	} else if (has_right_ext) {
@@ -3348,10 +3417,10 @@ bps_tree_process_insert_inner(struct bps_tree *tree,
 		const bps_tree_pos_t mc2 = max - nc3;
 
 		bps_tree_insert_and_move_elems_to_right_inner(tree,
-				inner_path_elem, &new_path_elem,
-				mc1, block_id, pos, max_elem);
-		bps_tree_move_elems_to_left_inner(tree,
-				&new_path_elem, &right_ext, mc2);
+			inner_path_elem, &new_path_elem, mc1, block_id, pos,
+			max_elem);
+		bps_tree_move_elems_to_left_inner(tree, &new_path_elem,
+			&right_ext, mc2);
 
 		BPS_TREE_BRANCH_TRACE(tree, insert_inner, 1 << 0xB);
 	} else {
@@ -3376,17 +3445,16 @@ bps_tree_process_insert_inner(struct bps_tree *tree,
 		const bps_tree_pos_t mc1 = nc2;
 
 		bps_tree_insert_and_move_elems_to_right_inner(tree,
-				inner_path_elem, &new_path_elem,
-				mc1, block_id, pos, max_elem);
+			inner_path_elem, &new_path_elem, mc1, block_id, pos,
+			max_elem);
 
-		bps_tree_block_id_t new_root_id = (bps_tree_block_id_t)(-1);
+		bps_tree_block_id_t new_root_id = (bps_tree_block_id_t) (-1);
 		struct bps_inner *new_root =
-			bps_tree_create_inner(tree, &new_root_id);
+		bps_tree_create_inner(tree, &new_root_id);
 		new_root->header.size = 2;
 		new_root->child_ids[0] = tree->root_id;
 		new_root->child_ids[1] = new_block_id;
 		new_root->elems[0] = tree->max_elem;
-		tree->root = (struct bps_block *)new_root;
 		tree->root_id = new_root_id;
 		tree->max_elem = new_max_elem;
 		tree->depth++;
@@ -3396,8 +3464,7 @@ bps_tree_process_insert_inner(struct bps_tree *tree,
 	assert(inner_path_elem->parent);
 	BPS_TREE_BRANCH_TRACE(tree, insert_inner, 1 << 0xD);
 	return bps_tree_process_insert_inner(tree, inner_path_elem->parent,
-			new_block_id, new_path_elem.pos_in_parent,
-			new_max_elem);
+		new_block_id, new_path_elem.pos_in_parent, new_max_elem);
 }
 
 /**
@@ -3405,150 +3472,149 @@ bps_tree_process_insert_inner(struct bps_tree *tree,
  */
 static void
 bps_tree_process_delete_inner(struct bps_tree *tree,
-			      bps_inner_path_elem *inner_path_elem);
+bps_inner_path_elem *inner_path_elem);
 
 /**
  * Basic deleting from leaf, dealing with spliting, merging and moving data
  * to neighbour blocks if necessary
  */
-static inline void
-bps_tree_process_delete_leaf(struct bps_tree *tree,
-			     struct bps_leaf_path_elem *leaf_path_elem)
+static inline void bps_tree_process_delete_leaf(struct bps_tree *tree,
+	struct bps_leaf_path_elem *leaf_path_elem)
 {
 	bps_tree_delete_from_leaf(tree, leaf_path_elem);
 
 	if (leaf_path_elem->block->header.size >=
-	    BPS_TREE_MAX_COUNT_IN_LEAF * 2 / 3) {
+	BPS_TREE_MAX_COUNT_IN_LEAF * 2 / 3) {
 		BPS_TREE_BRANCH_TRACE(tree, delete_leaf, 1 << 0x0);
 		return;
 	}
 
-	struct bps_leaf_path_elem left_ext = {0, 0, 0, 0, 0, 0},
-		right_ext = {0, 0, 0, 0, 0, 0},
-		left_left_ext = {0, 0, 0, 0, 0, 0},
-		right_right_ext = {0, 0, 0, 0, 0, 0};
+	struct bps_leaf_path_elem left_ext = { 0, 0, 0, 0, 0, 0 }, right_ext = {
+			0, 0, 0, 0, 0, 0 },
+		left_left_ext = { 0, 0, 0, 0, 0, 0 }, right_right_ext = { 0, 0,
+				0, 0, 0, 0 };
 	bool has_left_ext =
-		bps_tree_collect_left_path_elem_leaf(tree, leaf_path_elem,
-						     &left_ext);
+	bps_tree_collect_left_path_elem_leaf(tree, leaf_path_elem, &left_ext);
 	bool has_right_ext =
-		bps_tree_collect_right_ext_leaf(tree, leaf_path_elem,
-						&right_ext);
+	bps_tree_collect_right_ext_leaf(tree, leaf_path_elem, &right_ext);
 	bool has_left_left_ext = false;
 	bool has_right_right_ext = false;
 	if (has_left_ext && has_right_ext) {
 		if (bps_tree_leaf_overmin_size(left_ext.block) >
-		    bps_tree_leaf_overmin_size(right_ext.block)) {
+		bps_tree_leaf_overmin_size(right_ext.block)) {
 			bps_tree_pos_t move_count = 1 +
-				bps_tree_leaf_overmin_size(left_ext.block) / 2;
+			bps_tree_leaf_overmin_size(left_ext.block) / 2;
 			bps_tree_move_elems_to_right_leaf(tree, &left_ext,
-					leaf_path_elem, move_count);
+				leaf_path_elem, move_count);
 			BPS_TREE_BRANCH_TRACE(tree, delete_leaf, 1 << 0x1);
 			return;
 		} else if (bps_tree_leaf_overmin_size(right_ext.block) > 0) {
 			bps_tree_pos_t move_count = 1 +
-				bps_tree_leaf_overmin_size(right_ext.block) / 2;
+			bps_tree_leaf_overmin_size(right_ext.block) / 2;
 			bps_tree_move_elems_to_left_leaf(tree, leaf_path_elem,
-					&right_ext, move_count);
+				&right_ext, move_count);
 			BPS_TREE_BRANCH_TRACE(tree, delete_leaf, 1 << 0x2);
 			return;
 		}
 	} else if (has_left_ext) {
 		if (bps_tree_leaf_overmin_size(left_ext.block) > 0) {
 			bps_tree_pos_t move_count = 1 +
-				bps_tree_leaf_overmin_size(left_ext.block) / 2;
+			bps_tree_leaf_overmin_size(left_ext.block) / 2;
 			bps_tree_move_elems_to_right_leaf(tree, &left_ext,
-					leaf_path_elem, move_count);
+				leaf_path_elem, move_count);
 			BPS_TREE_BRANCH_TRACE(tree, delete_leaf, 1 << 0x3);
 			return;
 		}
 		has_left_left_ext = bps_tree_collect_left_path_elem_leaf(tree,
-				&left_ext, &left_left_ext);
+			&left_ext, &left_left_ext);
 		if (has_left_left_ext &&
-		    bps_tree_leaf_overmin_size(left_left_ext.block) > 0) {
-			bps_tree_pos_t move_count2 = 1 + (2 *
+		bps_tree_leaf_overmin_size(left_left_ext.block) > 0) {
+			bps_tree_pos_t move_count2 = 1
+				+ (2 *
 				bps_tree_leaf_overmin_size(left_left_ext.block)
-				- 1) / 3;
+					- 1) / 3;
 			bps_tree_pos_t move_count1 = 1 + move_count2 / 2;
 			bps_tree_move_elems_to_right_leaf(tree, &left_ext,
-					leaf_path_elem, move_count1);
+				leaf_path_elem, move_count1);
 			bps_tree_move_elems_to_right_leaf(tree, &left_left_ext,
-					&left_ext, move_count2);
+				&left_ext, move_count2);
 			BPS_TREE_BRANCH_TRACE(tree, delete_leaf, 1 << 0x4);
 			return;
 		}
 	} else if (has_right_ext) {
 		if (bps_tree_leaf_overmin_size(right_ext.block) > 0) {
 			bps_tree_pos_t move_count = 1 +
-				bps_tree_leaf_overmin_size(right_ext.block)
-				/ 2;
+			bps_tree_leaf_overmin_size(right_ext.block) / 2;
 			bps_tree_move_elems_to_left_leaf(tree, leaf_path_elem,
-					&right_ext, move_count);
+				&right_ext, move_count);
 			BPS_TREE_BRANCH_TRACE(tree, delete_leaf, 1 << 0x5);
 			return;
 		}
 		has_right_right_ext = bps_tree_collect_right_ext_leaf(tree,
-				&right_ext, &right_right_ext);
+			&right_ext, &right_right_ext);
 		if (has_right_right_ext &&
-		    bps_tree_leaf_overmin_size(right_right_ext.block) > 0) {
-			bps_tree_pos_t move_count2 = 1 + (2 *
-				bps_tree_leaf_overmin_size(right_right_ext.block)
-				- 1) / 3;
+		bps_tree_leaf_overmin_size(right_right_ext.block) > 0) {
+			bps_tree_pos_t move_count2 = 1
+				+ (2
+					*
+					bps_tree_leaf_overmin_size(
+						right_right_ext.block) - 1) / 3;
 			bps_tree_pos_t move_count1 = 1 + move_count2 / 2;
 			bps_tree_move_elems_to_left_leaf(tree, leaf_path_elem,
-					&right_ext, move_count1);
+				&right_ext, move_count1);
 			bps_tree_move_elems_to_left_leaf(tree, &right_ext,
-					&right_right_ext, move_count2);
+				&right_right_ext, move_count2);
 			BPS_TREE_BRANCH_TRACE(tree, delete_leaf, 1 << 0x6);
 			return;
 		}
 	}
 
 	if (has_left_ext && has_right_ext) {
-		bps_tree_pos_t move_count =
-			(leaf_path_elem->block->header.size + 1) / 2;
+		bps_tree_pos_t move_count = (leaf_path_elem->block->header.size
+			+ 1) / 2;
 		bps_tree_move_elems_to_right_leaf(tree, leaf_path_elem,
-				&right_ext, move_count);
+			&right_ext, move_count);
 		move_count = leaf_path_elem->block->header.size;
 		bps_tree_move_elems_to_left_leaf(tree, &left_ext,
-				leaf_path_elem, move_count);
+			leaf_path_elem, move_count);
 		BPS_TREE_BRANCH_TRACE(tree, delete_leaf, 1 << 0x7);
 	} else if (has_left_ext && has_left_left_ext) {
-		bps_tree_pos_t move_count =
-			(leaf_path_elem->block->header.size + 1) / 2;
+		bps_tree_pos_t move_count = (leaf_path_elem->block->header.size
+			+ 1) / 2;
 		bps_tree_move_elems_to_left_leaf(tree, &left_left_ext,
-				&left_ext, move_count);
+			&left_ext, move_count);
 		move_count = leaf_path_elem->block->header.size;
 		bps_tree_move_elems_to_left_leaf(tree, &left_ext,
-				leaf_path_elem, move_count);
+			leaf_path_elem, move_count);
 		BPS_TREE_BRANCH_TRACE(tree, delete_leaf, 1 << 0x8);
 	} else if (has_right_ext && has_right_right_ext) {
-		bps_tree_pos_t move_count =
-			(leaf_path_elem->block->header.size + 1) / 2;
+		bps_tree_pos_t move_count = (leaf_path_elem->block->header.size
+			+ 1) / 2;
 		bps_tree_move_elems_to_right_leaf(tree, &right_ext,
-				&right_right_ext, move_count);
+			&right_right_ext, move_count);
 		move_count = leaf_path_elem->block->header.size;
 		bps_tree_move_elems_to_right_leaf(tree, leaf_path_elem,
-				&right_ext, move_count);
+			&right_ext, move_count);
 		BPS_TREE_BRANCH_TRACE(tree, delete_leaf, 1 << 0x9);
 	} else if (has_left_ext) {
-		if (leaf_path_elem->block->header.size +
-		    left_ext.block->header.size > BPS_TREE_MAX_COUNT_IN_LEAF) {
+		if (leaf_path_elem->block->header.size
+			+ left_ext.block->header.size> BPS_TREE_MAX_COUNT_IN_LEAF) {
 			BPS_TREE_BRANCH_TRACE(tree, delete_leaf, 1 << 0xA);
 			return;
 		}
 		bps_tree_pos_t move_count = leaf_path_elem->block->header.size;
 		bps_tree_move_elems_to_left_leaf(tree, &left_ext,
-				leaf_path_elem, move_count);
+			leaf_path_elem, move_count);
 		BPS_TREE_BRANCH_TRACE(tree, delete_leaf, 1 << 0xB);
 	} else if (has_right_ext) {
-		if (leaf_path_elem->block->header.size +
-		    right_ext.block->header.size > BPS_TREE_MAX_COUNT_IN_LEAF) {
+		if (leaf_path_elem->block->header.size
+			+ right_ext.block->header.size> BPS_TREE_MAX_COUNT_IN_LEAF) {
 			BPS_TREE_BRANCH_TRACE(tree, delete_leaf, 1 << 0xC);
 			return;
 		}
 		bps_tree_pos_t move_count = leaf_path_elem->block->header.size;
 		bps_tree_move_elems_to_right_leaf(tree, leaf_path_elem,
-				&right_ext, move_count);
+			&right_ext, move_count);
 		BPS_TREE_BRANCH_TRACE(tree, delete_leaf, 1 << 0xD);
 	} else {
 		if (leaf_path_elem->block->header.size > 0) {
@@ -3558,36 +3624,36 @@ bps_tree_process_delete_leaf(struct bps_tree *tree,
 		assert(leaf_path_elem->parent == 0);
 		assert(tree->depth == 1);
 		assert(tree->size == 0);
-		tree->root = 0;
+		tree->root_id = (bps_tree_block_id_t) (-1);
 		tree->depth = 0;
-		tree->first_id = (bps_tree_block_id_t)(-1);
-		tree->last_id = (bps_tree_block_id_t)(-1);
+		tree->first_id = (bps_tree_block_id_t) (-1);
+		tree->last_id = (bps_tree_block_id_t) (-1);
 		bps_tree_dispose_leaf(tree, leaf_path_elem->block,
-				leaf_path_elem->block_id);
+			leaf_path_elem->block_id);
 		BPS_TREE_BRANCH_TRACE(tree, delete_leaf, 1 << 0xF);
 		return;
 	}
 
 	assert(leaf_path_elem->block->header.size == 0);
 
-	struct bps_leaf *leaf = (struct bps_leaf*)leaf_path_elem->block;
-	if (leaf->prev_id == (bps_tree_block_id_t)(-1)) {
+	struct bps_leaf *leaf = (struct bps_leaf*) leaf_path_elem->block;
+	if (leaf->prev_id == (bps_tree_block_id_t) (-1)) {
 		tree->first_id = leaf->next_id;
 	} else {
 		struct bps_leaf *prev_block = (struct bps_leaf *)
-			bps_tree_restore_block(tree, leaf->prev_id);
+		bps_tree_restore_block(tree, leaf->prev_id);
 		prev_block->next_id = leaf->next_id;
 	}
-	if (leaf->next_id == (bps_tree_block_id_t)(-1)) {
+	if (leaf->next_id == (bps_tree_block_id_t) (-1)) {
 		tree->last_id = leaf->prev_id;
 	} else {
 		struct bps_leaf *next_block = (struct bps_leaf *)
-			bps_tree_restore_block(tree, leaf->next_id);
+		bps_tree_restore_block(tree, leaf->next_id);
 		next_block->prev_id = leaf->prev_id;
 	}
 
 	bps_tree_dispose_leaf(tree, leaf_path_elem->block,
-			leaf_path_elem->block_id);
+		leaf_path_elem->block_id);
 	assert(leaf_path_elem->parent);
 	bps_tree_process_delete_inner(tree, leaf_path_elem->parent);
 	BPS_TREE_BRANCH_TRACE(tree, delete_leaf, 1 << 0x10);
@@ -3597,154 +3663,147 @@ bps_tree_process_delete_leaf(struct bps_tree *tree,
  * Basic deletion from a leaf, deals with possible splitting,
  * merging and moving of elements data to neighbouring blocks.
  */
-static inline void
-bps_tree_process_delete_inner(struct bps_tree *tree,
-			      bps_inner_path_elem *inner_path_elem)
+static inline void bps_tree_process_delete_inner(struct bps_tree *tree,
+bps_inner_path_elem *inner_path_elem)
 {
 	bps_tree_delete_from_inner(tree, inner_path_elem);
 
 	if (inner_path_elem->block->header.size >=
-	    BPS_TREE_MAX_COUNT_IN_INNER * 2 / 3) {
+	BPS_TREE_MAX_COUNT_IN_INNER * 2 / 3) {
 		BPS_TREE_BRANCH_TRACE(tree, delete_inner, 1 << 0x0);
 		return;
 	}
 
-	bps_inner_path_elem left_ext = {0, 0, 0, 0, 0, 0},
-		right_ext = {0, 0, 0, 0, 0, 0},
-		left_left_ext = {0, 0, 0, 0, 0, 0},
-		right_right_ext = {0, 0, 0, 0, 0, 0};
+	bps_inner_path_elem left_ext = { 0, 0, 0, 0, 0, 0 }, right_ext = { 0, 0,
+			0, 0, 0, 0 }, left_left_ext = { 0, 0, 0, 0, 0, 0 },
+		right_right_ext = { 0, 0, 0, 0, 0, 0 };
 	bool has_left_ext =
-		bps_tree_collect_left_path_elem_inner(tree, inner_path_elem,
-						      &left_ext);
+	bps_tree_collect_left_path_elem_inner(tree, inner_path_elem, &left_ext);
 	bool has_right_ext =
-		bps_tree_collect_right_ext_inner(tree, inner_path_elem,
-						      &right_ext);
+	bps_tree_collect_right_ext_inner(tree, inner_path_elem, &right_ext);
 	bool has_left_left_ext = false;
 	bool has_right_right_ext = false;
 	if (has_left_ext && has_right_ext) {
 		if (bps_tree_inner_overmin_size(left_ext.block) >
-		    bps_tree_inner_overmin_size(right_ext.block)) {
+		bps_tree_inner_overmin_size(right_ext.block)) {
 			bps_tree_pos_t move_count = 1 +
-				bps_tree_inner_overmin_size(left_ext.block)
-				/ 2;
+			bps_tree_inner_overmin_size(left_ext.block) / 2;
 			bps_tree_move_elems_to_right_inner(tree, &left_ext,
-					inner_path_elem, move_count);
+				inner_path_elem, move_count);
 			BPS_TREE_BRANCH_TRACE(tree, delete_inner, 1 << 0x1);
 			return;
 		} else if (bps_tree_inner_overmin_size(right_ext.block) > 0) {
 			bps_tree_pos_t move_count = 1 +
-				bps_tree_inner_overmin_size(right_ext.block)
-				/ 2;
-			bps_tree_move_elems_to_left_inner(tree,
-					inner_path_elem, &right_ext,
-					move_count);
+			bps_tree_inner_overmin_size(right_ext.block) / 2;
+			bps_tree_move_elems_to_left_inner(tree, inner_path_elem,
+				&right_ext, move_count);
 			BPS_TREE_BRANCH_TRACE(tree, delete_inner, 1 << 0x2);
 			return;
 		}
 	} else if (has_left_ext) {
 		if (bps_tree_inner_overmin_size(left_ext.block) > 0) {
 			bps_tree_pos_t move_count = 1 +
-				bps_tree_inner_overmin_size(left_ext.block)
-				/ 2;
+			bps_tree_inner_overmin_size(left_ext.block) / 2;
 			bps_tree_move_elems_to_right_inner(tree, &left_ext,
-					inner_path_elem, move_count);
+				inner_path_elem, move_count);
 			BPS_TREE_BRANCH_TRACE(tree, delete_inner, 1 << 0x3);
 			return;
 		}
 		has_left_left_ext =
-			bps_tree_collect_left_path_elem_inner(tree, &left_ext,
-							      &left_left_ext);
+		bps_tree_collect_left_path_elem_inner(tree, &left_ext,
+			&left_left_ext);
 		if (has_left_left_ext &&
-		    bps_tree_inner_overmin_size(left_left_ext.block) > 0) {
-			bps_tree_pos_t move_count2 = 1 + (2 *
+		bps_tree_inner_overmin_size(left_left_ext.block) > 0) {
+			bps_tree_pos_t move_count2 = 1
+				+ (2 *
 				bps_tree_inner_overmin_size(left_left_ext.block)
-				- 1) / 3;
+					- 1) / 3;
 			bps_tree_pos_t move_count1 = 1 + move_count2 / 2;
 			bps_tree_move_elems_to_right_inner(tree, &left_ext,
-					inner_path_elem, move_count1);
-			bps_tree_move_elems_to_right_inner(tree,
-					&left_left_ext, &left_ext, move_count2);
+				inner_path_elem, move_count1);
+			bps_tree_move_elems_to_right_inner(tree, &left_left_ext,
+				&left_ext, move_count2);
 			BPS_TREE_BRANCH_TRACE(tree, delete_inner, 1 << 0x4);
 			return;
 		}
 	} else if (has_right_ext) {
 		if (bps_tree_inner_overmin_size(right_ext.block) > 0) {
 			bps_tree_pos_t move_count = 1 +
-				bps_tree_inner_overmin_size(right_ext.block)
-				/ 2;
-			bps_tree_move_elems_to_left_inner(tree,
-					inner_path_elem, &right_ext,
-					move_count);
+			bps_tree_inner_overmin_size(right_ext.block) / 2;
+			bps_tree_move_elems_to_left_inner(tree, inner_path_elem,
+				&right_ext, move_count);
 			BPS_TREE_BRANCH_TRACE(tree, delete_inner, 1 << 0x5);
 			return;
 		}
 		has_right_right_ext =
-			bps_tree_collect_right_ext_inner(tree, &right_ext,
-							 &right_right_ext);
+		bps_tree_collect_right_ext_inner(tree, &right_ext,
+			&right_right_ext);
 		if (has_right_right_ext &&
-		    bps_tree_inner_overmin_size(right_right_ext.block) > 0) {
-			bps_tree_pos_t move_count2 = 1 + (2 *
-				bps_tree_inner_overmin_size(right_right_ext.block)
-				- 1) / 3;
+		bps_tree_inner_overmin_size(right_right_ext.block) > 0) {
+			bps_tree_pos_t move_count2 = 1
+				+ (2
+					*
+					bps_tree_inner_overmin_size(
+						right_right_ext.block) - 1) / 3;
 			bps_tree_pos_t move_count1 = 1 + move_count2 / 2;
 			bps_tree_move_elems_to_left_inner(tree, inner_path_elem,
-					&right_ext, move_count1);
+				&right_ext, move_count1);
 			bps_tree_move_elems_to_left_inner(tree, &right_ext,
-					&right_right_ext, move_count2);
+				&right_right_ext, move_count2);
 			BPS_TREE_BRANCH_TRACE(tree, delete_inner, 1 << 0x6);
 			return;
 		}
 	}
 
 	if (has_left_ext && has_right_ext) {
-		bps_tree_pos_t move_count =
-			(inner_path_elem->block->header.size + 1) / 2;
+		bps_tree_pos_t move_count = (inner_path_elem->block->header.size
+			+ 1) / 2;
 		bps_tree_move_elems_to_right_inner(tree, inner_path_elem,
-				&right_ext, move_count);
+			&right_ext, move_count);
 		move_count = inner_path_elem->block->header.size;
 		bps_tree_move_elems_to_left_inner(tree, &left_ext,
-				inner_path_elem, move_count);
+			inner_path_elem, move_count);
 		BPS_TREE_BRANCH_TRACE(tree, delete_inner, 1 << 0x7);
 	} else if (has_left_ext && has_left_left_ext) {
-		bps_tree_pos_t move_count =
-			(inner_path_elem->block->header.size + 1) / 2;
+		bps_tree_pos_t move_count = (inner_path_elem->block->header.size
+			+ 1) / 2;
 		bps_tree_move_elems_to_left_inner(tree, &left_left_ext,
-				&left_ext, move_count);
+			&left_ext, move_count);
 		move_count = inner_path_elem->block->header.size;
 		bps_tree_move_elems_to_left_inner(tree, &left_ext,
-				inner_path_elem, move_count);
+			inner_path_elem, move_count);
 		BPS_TREE_BRANCH_TRACE(tree, delete_inner, 1 << 0x8);
 	} else if (has_right_ext && has_right_right_ext) {
-		bps_tree_pos_t move_count =
-			(inner_path_elem->block->header.size + 1) / 2;
+		bps_tree_pos_t move_count = (inner_path_elem->block->header.size
+			+ 1) / 2;
 		bps_tree_move_elems_to_right_inner(tree, &right_ext,
-				&right_right_ext, move_count);
+			&right_right_ext, move_count);
 		move_count = inner_path_elem->block->header.size;
 		bps_tree_move_elems_to_right_inner(tree, inner_path_elem,
-				&right_ext, move_count);
+			&right_ext, move_count);
 		BPS_TREE_BRANCH_TRACE(tree, delete_inner, 1 << 0x9);
 	} else if (has_left_ext) {
-		if (inner_path_elem->block->header.size +
-		    left_ext.block->header.size > BPS_TREE_MAX_COUNT_IN_INNER) {
+		if (inner_path_elem->block->header.size
+			+ left_ext.block->header.size> BPS_TREE_MAX_COUNT_IN_INNER) {
 			BPS_TREE_BRANCH_TRACE(tree, delete_inner, 1 << 0xA);
 			//throw 1;
 			return;
 		}
 		bps_tree_pos_t move_count = inner_path_elem->block->header.size;
 		bps_tree_move_elems_to_left_inner(tree, &left_ext,
-				inner_path_elem, move_count);
+			inner_path_elem, move_count);
 		BPS_TREE_BRANCH_TRACE(tree, delete_inner, 1 << 0xB);
 	} else if (has_right_ext) {
-		if (inner_path_elem->block->header.size +
-		    right_ext.block->header.size >
-		    BPS_TREE_MAX_COUNT_IN_INNER) {
+		if (inner_path_elem->block->header.size
+			+ right_ext.block->header.size >
+		BPS_TREE_MAX_COUNT_IN_INNER) {
 			BPS_TREE_BRANCH_TRACE(tree, delete_inner, 1 << 0xC);
 			//throw 2;
 			return;
 		}
 		bps_tree_pos_t move_count = inner_path_elem->block->header.size;
 		bps_tree_move_elems_to_right_inner(tree, inner_path_elem,
-				&right_ext, move_count);
+			&right_ext, move_count);
 		BPS_TREE_BRANCH_TRACE(tree, delete_inner, 1 << 0xD);
 	} else {
 		if (inner_path_elem->block->header.size > 1) {
@@ -3755,21 +3814,19 @@ bps_tree_process_delete_inner(struct bps_tree *tree,
 		assert(inner_path_elem->parent == 0);
 		tree->depth--;
 		tree->root_id = inner_path_elem->block->child_ids[0];
-		tree->root = bps_tree_restore_block(tree, tree->root_id);
 		bps_tree_dispose_inner(tree, inner_path_elem->block,
-				inner_path_elem->block_id);
+			inner_path_elem->block_id);
 		BPS_TREE_BRANCH_TRACE(tree, delete_inner, 1 << 0xF);
 		return;
 	}
 	assert(inner_path_elem->block->header.size == 0);
 
 	bps_tree_dispose_inner(tree, inner_path_elem->block,
-			inner_path_elem->block_id);
+		inner_path_elem->block_id);
 	assert(inner_path_elem->parent);
 	bps_tree_process_delete_inner(tree, inner_path_elem->parent);
 	BPS_TREE_BRANCH_TRACE(tree, delete_inner, 1 << 0x10);
 }
-
 
 /**
  * @brief Insert an element to the tree or replace an element in the tree
@@ -3785,11 +3842,10 @@ bps_tree_process_delete_inner(struct bps_tree *tree,
  * @replaced - optional pointer for a replaces element
  * @return - true on success or false if memory allocation failed for insert
  */
-inline bool
-bps_tree_insert(struct bps_tree *tree, bps_tree_elem_t new_elem,
-			   bps_tree_elem_t *replaced)
+inline bool bps_tree_insert(struct bps_tree *tree, bps_tree_elem_t new_elem,
+	bps_tree_elem_t *replaced)
 {
-	if (!tree->root)
+	if (tree->root_id == (bps_tree_block_id_t) (-1))
 		return bps_tree_insert_first_elem(tree, new_elem);
 
 	bps_inner_path_elem path[BPS_TREE_MAX_DEPTH];
@@ -3798,11 +3854,11 @@ bps_tree_insert(struct bps_tree *tree, bps_tree_elem_t new_elem,
 	bps_tree_collect_path(tree, new_elem, path, &leaf_path_elem, &exact);
 	if (exact) {
 		bps_tree_process_replace(tree, &leaf_path_elem, new_elem,
-					 replaced);
+			replaced);
 		return true;
 	} else {
 		return bps_tree_process_insert_leaf(tree, &leaf_path_elem,
-						    new_elem);
+			new_elem);
 	}
 }
 
@@ -3812,10 +3868,9 @@ bps_tree_insert(struct bps_tree *tree, bps_tree_elem_t new_elem,
  * @param elem - the element tot delete
  * @return - true on success or false if the element was not found in tree
  */
-inline bool
-bps_tree_delete(struct bps_tree *tree, bps_tree_elem_t elem)
+inline bool bps_tree_delete(struct bps_tree *tree, bps_tree_elem_t elem)
 {
-	if (!tree->root)
+	if (tree->root_id == (bps_tree_block_id_t) (-1))
 		return false;
 	bps_inner_path_elem path[BPS_TREE_MAX_DEPTH];
 	struct bps_leaf_path_elem leaf_path_elem;
@@ -3829,26 +3884,24 @@ bps_tree_delete(struct bps_tree *tree, bps_tree_elem_t elem)
 	return true;
 }
 
-
 /**
  * @brief Recursively find a maximum element in subtree.
  * Used only for debug purposes
  */
-static inline bps_tree_elem_t
-bps_tree_debug_find_max_elem(const struct bps_tree *tree,
-			     struct bps_block *block)
+static inline bps_tree_elem_t bps_tree_debug_find_max_elem(
+	const struct bps_tree *tree, struct bps_block *block)
 {
 	assert(block->size);
 	if (block->type == BPS_TREE_BT_LEAF) {
-		struct bps_leaf *leaf = (struct bps_leaf *)block;
+		struct bps_leaf *leaf = (struct bps_leaf *) block;
 		return leaf->elems[block->size - 1];
 	} else {
 		assert(block->type == BPS_TREE_BT_INNER);
-		struct bps_inner *inner = (struct bps_inner *)block;
-		bps_tree_block_id_t next_block_id =
-			inner->child_ids[block->size - 1];
+		struct bps_inner *inner = (struct bps_inner *) block;
+		bps_tree_block_id_t next_block_id = inner->child_ids[block->size
+			- 1];
 		struct bps_block *next_block =
-			bps_tree_restore_block(tree, next_block_id);
+		bps_tree_restore_block(tree, next_block_id);
 		return bps_tree_debug_find_max_elem(tree, next_block);
 	}
 }
@@ -3857,18 +3910,16 @@ bps_tree_debug_find_max_elem(const struct bps_tree *tree,
  * @brief Recursively checks the block and the corresponding subtree
  * Used by bps_tree_debug_check
  */
-static inline int
-bps_tree_debug_check_block(const struct bps_tree *tree, struct bps_block *block,
-			   bps_tree_block_id_t id, int level,
-			   size_t *calc_count,
-			   bps_tree_block_id_t *expected_prev_id,
-			   bps_tree_block_id_t *expected_this_id,
-			   bool check_fullness)
+static inline int bps_tree_debug_check_block(const struct bps_tree *tree,
+	struct bps_block *block, bps_tree_block_id_t id, int level,
+	size_t *calc_count, bps_tree_block_id_t *expected_prev_id,
+	bps_tree_block_id_t *expected_this_id,
+	bool check_fullness)
 {
 	if (block->type != BPS_TREE_BT_LEAF && block->type != BPS_TREE_BT_INNER)
 		return 0x10;
 	if (block->type == BPS_TREE_BT_LEAF) {
-		struct bps_leaf *leaf = (struct bps_leaf *)(block);
+		struct bps_leaf *leaf = (struct bps_leaf *) (block);
 		int result = 0;
 		if (check_fullness)
 			if (block->size < BPS_TREE_MAX_COUNT_IN_LEAF * 2 / 3)
@@ -3888,12 +3939,12 @@ bps_tree_debug_check_block(const struct bps_tree *tree, struct bps_block *block,
 		if (block->size > BPS_TREE_MAX_COUNT_IN_LEAF)
 			result |= 0x200;
 		for (bps_tree_pos_t i = 1; i < block->size; i++)
-			if (BPS_TREE_COMPARE(leaf->elems[i - 1],
-					     leaf->elems[i], tree->arg) >= 0)
+			if (BPS_TREE_COMPARE(leaf->elems[i - 1], leaf->elems[i],
+				tree->arg) >= 0)
 				result |= 0x400;
 		return result;
 	} else {
-		struct bps_inner *inner = (struct bps_inner *)(block);
+		struct bps_inner *inner = (struct bps_inner *) (block);
 		int result = 0;
 		if (check_fullness)
 			if (block->size < BPS_TREE_MAX_COUNT_IN_INNER * 2 / 3)
@@ -3904,22 +3955,21 @@ bps_tree_debug_check_block(const struct bps_tree *tree, struct bps_block *block,
 			result |= 0x1000;
 		for (bps_tree_pos_t i = 1; i < block->size - 1; i++)
 			if (BPS_TREE_COMPARE(inner->elems[i - 1],
-					     inner->elems[i], tree->arg) >= 0)
+				inner->elems[i], tree->arg) >= 0)
 				result |= 0x2000;
 		for (bps_tree_pos_t i = 0; i < block->size - 1; i++) {
 			struct bps_block *block =
-				bps_tree_restore_block(tree,
-						       inner->child_ids[i]);
+			bps_tree_restore_block(tree, inner->child_ids[i]);
 			bps_tree_elem_t calc_max_elem =
-				bps_tree_debug_find_max_elem(tree, block);
+			bps_tree_debug_find_max_elem(tree, block);
 			if (inner->elems[i] != calc_max_elem)
 				result |= 0x4000;
 		}
 		if (block->size > 1) {
 			bps_tree_elem_t calc_max_elem =
-				bps_tree_debug_find_max_elem(tree, block);
+			bps_tree_debug_find_max_elem(tree, block);
 			if (BPS_TREE_COMPARE(inner->elems[block->size - 2],
-					     calc_max_elem, tree->arg) >= 0)
+				calc_max_elem, tree->arg) >= 0)
 				result |= 0x8000;
 		}
 		bool check_fullness_next = block->size > 2;
@@ -3930,19 +3980,16 @@ bps_tree_debug_check_block(const struct bps_tree *tree, struct bps_block *block,
 			else
 				block_max_size = BPS_TREE_MAX_COUNT_IN_INNER;
 			struct bps_block *child1 =
-				bps_tree_restore_block(tree,
-						       inner->child_ids[0]);
+			bps_tree_restore_block(tree, inner->child_ids[0]);
 			struct bps_block *child2 =
-				bps_tree_restore_block(tree,
-						       inner->child_ids[1]);
+			bps_tree_restore_block(tree, inner->child_ids[1]);
 			if (child1->size + child2->size <= block_max_size)
 				result |= 0x4000000;
 		}
 
 		for (bps_tree_pos_t i = 0; i < block->size; i++)
 			result |= bps_tree_debug_check_block(tree,
-				bps_tree_restore_block(tree,
-						       inner->child_ids[i]),
+			bps_tree_restore_block(tree, inner->child_ids[i]),
 				inner->child_ids[i], level - 1, calc_count,
 				expected_prev_id, expected_this_id,
 				check_fullness_next);
@@ -3957,11 +4004,10 @@ bps_tree_debug_check_block(const struct bps_tree *tree, struct bps_block *block,
  * @param tree - pointer to a tree
  * @return - Bitwise-OR of all errors found
  */
-inline int
-bps_tree_debug_check(const struct bps_tree *tree)
+inline int bps_tree_debug_check(const struct bps_tree *tree)
 {
 	int result = 0;
-	if (!tree->root) {
+	if (tree->root_id == (bps_tree_block_id_t) (-1)) {
 		if (tree->depth != 0)
 			result |= 0x1;
 		if (tree->size != 0)
@@ -3970,19 +4016,16 @@ bps_tree_debug_check(const struct bps_tree *tree)
 			result |= 0x1;
 		return result;
 	}
-	if (tree->max_elem != bps_tree_debug_find_max_elem(tree, tree->root))
+	struct bps_block *root = bps_tree_root(tree);
+	if (tree->max_elem != bps_tree_debug_find_max_elem(tree, root))
 		result |= 0x8;
-	if (bps_tree_restore_block(tree, tree->root_id) != tree->root)
-		result |= 0x2;
 	size_t calc_count = 0;
-	bps_tree_block_id_t expected_prev_id = (bps_tree_block_id_t)(-1);
+	bps_tree_block_id_t expected_prev_id = (bps_tree_block_id_t) (-1);
 	bps_tree_block_id_t expected_this_id = tree->first_id;
-	result |= bps_tree_debug_check_block(tree, tree->root, tree->root_id,
-					     tree->depth, &calc_count,
-					     &expected_prev_id,
-					     &expected_this_id,
-					     false);
-	if (expected_this_id != (bps_tree_block_id_t)(-1))
+	result |= bps_tree_debug_check_block(tree, root, tree->root_id,
+		tree->depth, &calc_count, &expected_prev_id, &expected_this_id,
+		false);
+	if (expected_this_id != (bps_tree_block_id_t) (-1))
 		result |= 0x40000;
 	if (expected_prev_id != tree->last_id)
 		result |= 0x80000;
@@ -3995,8 +4038,7 @@ bps_tree_debug_check(const struct bps_tree *tree)
  * @brief Print an indent to distinguish levels of the tree in output.
  * @param level - current printing level of a tree.
  */
-static inline void
-bps_tree_print_indent(int level)
+static inline void bps_tree_print_indent(int level)
 {
 	for (int i = 0; i < level; i++)
 		printf("  ");
@@ -4010,9 +4052,8 @@ bps_tree_print_indent(int level)
  * @param elem_fmt - printing format of elements
  */
 static void
-bps_tree_print_block(const struct bps_tree *tree,
-		     const struct bps_block *block,
-		     int level, const char *elem_fmt);
+bps_tree_print_block(const struct bps_tree *tree, const struct bps_block *block,
+	int level, const char *elem_fmt);
 
 /**
  * @brief Print a leaf block of a tree.
@@ -4020,12 +4061,11 @@ bps_tree_print_block(const struct bps_tree *tree,
  * @param level - current printing level
  * @param elem_fmt - printing format of elements
  */
-static inline void
-bps_tree_print_leaf(const struct bps_leaf* block, int indent,
-		    const char *elem_fmt)
+static inline void bps_tree_print_leaf(const struct bps_leaf* block, int indent,
+	const char *elem_fmt)
 {
 	bps_tree_print_indent(indent);
-	printf("[(%d)", (int)block->header.size);
+	printf("[(%d)", (int) block->header.size);
 	for (bps_tree_pos_t i = 0; i < block->header.size; i++) {
 		printf(" ");
 		printf(elem_fmt, block->elems[i]);
@@ -4040,13 +4080,11 @@ bps_tree_print_leaf(const struct bps_leaf* block, int indent,
  * @param level - current printing level
  * @param elem_fmt - printing format of elements
  */
-static inline void
-bps_tree_print_inner(const struct bps_tree *tree,
-		     const struct bps_inner* block,
-		     int indent, const char *elem_fmt)
+static inline void bps_tree_print_inner(const struct bps_tree *tree,
+	const struct bps_inner* block, int indent, const char *elem_fmt)
 {
 	struct bps_block *next = bps_tree_restore_block(tree,
-							block->child_ids[0]);
+		block->child_ids[0]);
 	bps_tree_print_block(tree, next, indent + 1, elem_fmt);
 	for (bps_tree_pos_t i = 0; i < block->header.size - 1; i++) {
 		bps_tree_print_indent(indent);
@@ -4064,18 +4102,15 @@ bps_tree_print_inner(const struct bps_tree *tree,
  * @param level - current printing level
  * @param elem_fmt - printing format of elements
  */
-static inline void
-bps_tree_print_block(const struct bps_tree *tree,
-		     const struct bps_block *block,
-		     int indent, const char *elem_fmt)
+static inline void bps_tree_print_block(const struct bps_tree *tree,
+	const struct bps_block *block, int indent, const char *elem_fmt)
 {
 	if (block->type == BPS_TREE_BT_INNER)
-		bps_tree_print_inner(tree,
-				     (const struct bps_inner *)block,
-				     indent, elem_fmt);
+		bps_tree_print_inner(tree, (const struct bps_inner *) block,
+			indent, elem_fmt);
 	else
-		bps_tree_print_leaf((const struct bps_leaf *)block,
-				    indent, elem_fmt);
+		bps_tree_print_leaf((const struct bps_leaf *) block, indent,
+			elem_fmt);
 }
 
 /**
@@ -4084,14 +4119,13 @@ bps_tree_print_block(const struct bps_tree *tree,
  * @param tree - tree to print
  * @param elem_fmt - format for printing an element. "%d" or "%p" for example.
  */
-inline void
-bps_tree_print(const struct bps_tree *tree, const char *elem_fmt)
+inline void bps_tree_print(const struct bps_tree *tree, const char *elem_fmt)
 {
-	if (tree->root == 0) {
+	if (tree->root_id == (bps_tree_block_id_t) (-1)) {
 		printf("Empty\n");
 		return;
 	}
-	bps_tree_print_block(tree, tree->root, 0, elem_fmt);
+	bps_tree_print_block(tree, bps_tree_root(tree), 0, elem_fmt);
 }
 
 /*
@@ -4104,36 +4138,33 @@ bps_tree_print(const struct bps_tree *tree, const char *elem_fmt)
  * @brief Assign a value to an element.
  * Used for debug self-check
  */
-static inline void
-bps_tree_debug_set_elem(bps_tree_elem_t *elem, unsigned char c)
+static inline void bps_tree_debug_set_elem(bps_tree_elem_t *elem,
+	unsigned char c)
 {
 	memset(elem, 0, sizeof(bps_tree_elem_t));
-	*(unsigned char *)elem = c;
+	*(unsigned char *) elem = c;
 }
 
 /**
  * @brief Get previously assigned value from an element.
  * Used for debug self-check
  */
-static inline unsigned char
-bps_tree_debug_get_elem(bps_tree_elem_t *elem)
+static inline unsigned char bps_tree_debug_get_elem(bps_tree_elem_t *elem)
 {
-	return *(unsigned char *)elem;
+	return *(unsigned char *) elem;
 }
-
 
 /**
  * @brief Assign a value to an element in inner block.
  * Used for debug self-check
  */
-static inline void
-bps_tree_debug_set_elem_inner(bps_inner_path_elem *path_elem,
-			      bps_tree_pos_t pos, unsigned char c)
+static inline void bps_tree_debug_set_elem_inner(bps_inner_path_elem *path_elem,
+	bps_tree_pos_t pos, unsigned char c)
 {
 	assert(pos >= 0);
 	assert(pos < path_elem->block->header.size);
 	if (pos < path_elem->block->header.size - 1
-	    && pos < BPS_TREE_MAX_COUNT_IN_INNER - 1) /* fix gcc-4.9 warning */
+		&& pos < BPS_TREE_MAX_COUNT_IN_INNER - 1) /* fix gcc-4.9 warning */
 		bps_tree_debug_set_elem(path_elem->block->elems + pos, c);
 	else
 		bps_tree_debug_set_elem(path_elem->max_elem_copy, c);
@@ -4143,14 +4174,13 @@ bps_tree_debug_set_elem_inner(bps_inner_path_elem *path_elem,
  * @brief Get previously assigned value from an element in inner block.
  * Used for debug self-check
  */
-static inline unsigned char
-bps_tree_debug_get_elem_inner(const bps_inner_path_elem *path_elem,
-			      bps_tree_pos_t pos)
+static inline unsigned char bps_tree_debug_get_elem_inner(
+	const bps_inner_path_elem *path_elem, bps_tree_pos_t pos)
 {
 	assert(pos >= 0);
 	assert(pos < path_elem->block->header.size);
 	if (pos < path_elem->block->header.size - 1
-	    && pos < BPS_TREE_MAX_COUNT_IN_INNER - 1) /* fix gcc-4.9 warning */
+		&& pos < BPS_TREE_MAX_COUNT_IN_INNER - 1) /* fix gcc-4.9 warning */
 		return bps_tree_debug_get_elem(path_elem->block->elems + pos);
 	else
 		return bps_tree_debug_get_elem(path_elem->max_elem_copy);
@@ -4161,8 +4191,8 @@ bps_tree_debug_get_elem_inner(const bps_inner_path_elem *path_elem,
  * Used for debug self-check
  * @return 0 if OK; bit mask of errors otherwise.
  */
-static inline int
-bps_tree_debug_check_insert_into_leaf(struct bps_tree *tree, bool assertme)
+static inline int bps_tree_debug_check_insert_into_leaf(struct bps_tree *tree,
+	bool assertme)
 {
 	(void) assertme;
 	int result = 0;
@@ -4186,6 +4216,7 @@ bps_tree_debug_check_insert_into_leaf(struct bps_tree *tree, bool assertme)
 			bps_tree_debug_set_elem(&max, i + 1);
 			bps_tree_debug_set_elem(&ins, j);
 			path_elem.block = &block;
+			path_elem.block_id = 0;
 			path_elem.insertion_point = j;
 			path_elem.max_elem_copy = &max;
 
@@ -4219,8 +4250,8 @@ bps_tree_debug_check_insert_into_leaf(struct bps_tree *tree, bool assertme)
  * Used for debug self-check
  * @return 0 if OK; bit mask of errors otherwise.
  */
-static inline int
-bps_tree_debug_check_delete_from_leaf(struct bps_tree *tree, bool assertme)
+static inline int bps_tree_debug_check_delete_from_leaf(struct bps_tree *tree,
+	bool assertme)
 {
 	(void) assertme;
 	int result = 0;
@@ -4238,6 +4269,7 @@ bps_tree_debug_check_delete_from_leaf(struct bps_tree *tree, bool assertme)
 			bps_tree_debug_set_elem(&max,
 				j == i - 1 ? i - 2 : i - 1);
 			path_elem.block = &block;
+			path_elem.block_id = 0;
 			path_elem.insertion_point = j;
 			path_elem.max_elem_copy = &max;
 
@@ -4273,8 +4305,8 @@ bps_tree_debug_check_delete_from_leaf(struct bps_tree *tree, bool assertme)
  * Used for debug self-check
  * @return 0 if OK; bit mask of errors otherwise.
  */
-static inline int
-bps_tree_debug_check_move_to_right_leaf(struct bps_tree *tree, bool assertme)
+static inline int bps_tree_debug_check_move_to_right_leaf(struct bps_tree *tree,
+	bool assertme)
 {
 	(void) assertme;
 	int result = 0;
@@ -4312,6 +4344,8 @@ bps_tree_debug_check_move_to_right_leaf(struct bps_tree *tree, bool assertme)
 				a_path_elem.max_elem_copy = &ma;
 				b_path_elem.block = &b;
 				b_path_elem.max_elem_copy = &mb;
+				a_path_elem.block_id = 0;
+				b_path_elem.block_id = 0;
 
 				bps_tree_move_elems_to_right_leaf(tree,
 					&a_path_elem, &b_path_elem,
@@ -4363,8 +4397,8 @@ bps_tree_debug_check_move_to_right_leaf(struct bps_tree *tree, bool assertme)
  * Used for debug self-check
  * @return 0 if OK; bit mask of errors otherwise.
  */
-static inline int
-bps_tree_debug_check_move_to_left_leaf(struct bps_tree *tree, bool assertme)
+static inline int bps_tree_debug_check_move_to_left_leaf(struct bps_tree *tree,
+	bool assertme)
 {
 	(void) assertme;
 	int result = 0;
@@ -4403,6 +4437,8 @@ bps_tree_debug_check_move_to_left_leaf(struct bps_tree *tree, bool assertme)
 				a_path_elem.max_elem_copy = &ma;
 				b_path_elem.block = &b;
 				b_path_elem.max_elem_copy = &mb;
+				a_path_elem.block_id = 0;
+				b_path_elem.block_id = 0;
 
 				bps_tree_move_elems_to_left_leaf(tree,
 					&a_path_elem, &b_path_elem,
@@ -4454,9 +4490,9 @@ bps_tree_debug_check_move_to_left_leaf(struct bps_tree *tree, bool assertme)
  * Used for debug self-check
  * @return 0 if OK; bit mask of errors otherwise.
  */
-static inline int
-bps_tree_debug_check_insert_and_move_to_right_leaf(struct bps_tree *tree,
-						   bool assertme)
+static inline int bps_tree_debug_check_insert_and_move_to_right_leaf(
+	struct bps_tree *tree,
+	bool assertme)
 {
 	(void) assertme;
 	int result = 0;
@@ -4503,6 +4539,8 @@ bps_tree_debug_check_insert_and_move_to_right_leaf(struct bps_tree *tree,
 					b_path_elem.block = &b;
 					b_path_elem.max_elem_copy = &mb;
 					a_path_elem.insertion_point = k;
+					a_path_elem.block_id = 0;
+					b_path_elem.block_id = 0;
 					bps_tree_elem_t ins;
 					bps_tree_debug_set_elem(&ins, ic);
 
@@ -4566,9 +4604,9 @@ bps_tree_debug_check_insert_and_move_to_right_leaf(struct bps_tree *tree,
  * Used for debug self-check
  * @return 0 if OK; bit mask of errors otherwise.
  */
-static inline int
-bps_tree_debug_check_insert_and_move_to_left_leaf(struct bps_tree *tree,
-						  bool assertme)
+static inline int bps_tree_debug_check_insert_and_move_to_left_leaf(
+	struct bps_tree *tree,
+	bool assertme)
 {
 	(void) assertme;
 	int result = 0;
@@ -4613,6 +4651,8 @@ bps_tree_debug_check_insert_and_move_to_left_leaf(struct bps_tree *tree,
 					b_path_elem.block = &b;
 					b_path_elem.max_elem_copy = &mb;
 					b_path_elem.insertion_point = k;
+					a_path_elem.block_id = 0;
+					b_path_elem.block_id = 0;
 					bps_tree_elem_t ins;
 					bps_tree_debug_set_elem(&ins, ic);
 
@@ -4676,8 +4716,8 @@ bps_tree_debug_check_insert_and_move_to_left_leaf(struct bps_tree *tree,
  * Used for debug self-check
  * @return 0 if OK; bit mask of errors otherwise.
  */
-static inline int
-bps_tree_debug_check_insert_into_inner(struct bps_tree *tree, bool assertme)
+static inline int bps_tree_debug_check_insert_into_inner(struct bps_tree *tree,
+	bool assertme)
 {
 	(void) assertme;
 	int result = 0;
@@ -4698,6 +4738,7 @@ bps_tree_debug_check_insert_into_inner(struct bps_tree *tree, bool assertme)
 
 			bps_inner_path_elem path_elem;
 			path_elem.block = &block;
+			path_elem.block_id = 0;
 			path_elem.max_elem_copy = &max;
 
 			for (unsigned int k = 0; k < i; k++) {
@@ -4743,8 +4784,8 @@ bps_tree_debug_check_insert_into_inner(struct bps_tree *tree, bool assertme)
  * Used for debug self-check
  * @return 0 if OK; bit mask of errors otherwise.
  */
-static inline int
-bps_tree_debug_check_delete_from_inner(struct bps_tree *tree, bool assertme)
+static inline int bps_tree_debug_check_delete_from_inner(struct bps_tree *tree,
+	bool assertme)
 {
 	(void) assertme;
 	int result = 0;
@@ -4762,6 +4803,7 @@ bps_tree_debug_check_delete_from_inner(struct bps_tree *tree, bool assertme)
 			bps_tree_elem_t max;
 			bps_tree_debug_set_elem(&max, i - 1);
 			path_elem.block = &block;
+			path_elem.block_id = 0;
 			path_elem.insertion_point = j;
 			path_elem.max_elem_copy = &max;
 
@@ -4794,8 +4836,8 @@ bps_tree_debug_check_delete_from_inner(struct bps_tree *tree, bool assertme)
  * Used for debug self-check
  * @return 0 if OK; bit mask of errors otherwise.
  */
-static inline int
-bps_tree_debug_check_move_to_right_inner(struct bps_tree *tree, bool assertme)
+static inline int bps_tree_debug_check_move_to_right_inner(
+	struct bps_tree *tree, bool assertme)
 {
 	(void) assertme;
 	int result = 0;
@@ -4824,6 +4866,8 @@ bps_tree_debug_check_move_to_right_inner(struct bps_tree *tree, bool assertme)
 				a_path_elem.max_elem_copy = &ma;
 				b_path_elem.block = &b;
 				b_path_elem.max_elem_copy = &mb;
+				a_path_elem.block_id = 0;
+				b_path_elem.block_id = 0;
 
 				unsigned char c = 0;
 				bps_tree_block_id_t kk = 0;
@@ -4888,8 +4932,8 @@ bps_tree_debug_check_move_to_right_inner(struct bps_tree *tree, bool assertme)
  * Used for debug self-check
  * @return 0 if OK; bit mask of errors otherwise.
  */
-static inline int
-bps_tree_debug_check_move_to_left_inner(struct bps_tree *tree, bool assertme)
+static inline int bps_tree_debug_check_move_to_left_inner(struct bps_tree *tree,
+	bool assertme)
 {
 	(void) assertme;
 	int result = 0;
@@ -4918,6 +4962,8 @@ bps_tree_debug_check_move_to_left_inner(struct bps_tree *tree, bool assertme)
 				a_path_elem.max_elem_copy = &ma;
 				b_path_elem.block = &b;
 				b_path_elem.max_elem_copy = &mb;
+				a_path_elem.block_id = 0;
+				b_path_elem.block_id = 0;
 
 				unsigned char c = 0;
 				bps_tree_block_id_t kk = 0;
@@ -4982,9 +5028,9 @@ bps_tree_debug_check_move_to_left_inner(struct bps_tree *tree, bool assertme)
  * Used for debug self-check
  * @return 0 if OK; bit mask of errors otherwise.
  */
-static inline int
-bps_tree_debug_check_insert_and_move_to_right_inner(struct bps_tree *tree,
-						    bool assertme)
+static inline int bps_tree_debug_check_insert_and_move_to_right_inner(
+	struct bps_tree *tree,
+	bool assertme)
 {
 	(void) assertme;
 	int result = 0;
@@ -5018,6 +5064,8 @@ bps_tree_debug_check_insert_and_move_to_right_inner(struct bps_tree *tree,
 					a_path_elem.max_elem_copy = &ma;
 					b_path_elem.block = &b;
 					b_path_elem.max_elem_copy = &mb;
+					a_path_elem.block_id = 0;
+					b_path_elem.block_id = 0;
 
 					unsigned char c = 0;
 					bps_tree_block_id_t kk = 0;
@@ -5108,9 +5156,9 @@ bps_tree_debug_check_insert_and_move_to_right_inner(struct bps_tree *tree,
  * Used for debug self-check
  * @return 0 if OK; bit mask of errors otherwise.
  */
-static inline int
-bps_tree_debug_check_insert_and_move_to_left_inner(struct bps_tree *tree,
-						   bool assertme)
+static inline int bps_tree_debug_check_insert_and_move_to_left_inner(
+	struct bps_tree *tree,
+	bool assertme)
 {
 	(void) assertme;
 	int result = 0;
@@ -5144,6 +5192,8 @@ bps_tree_debug_check_insert_and_move_to_left_inner(struct bps_tree *tree,
 					a_path_elem.max_elem_copy = &ma;
 					b_path_elem.block = &b;
 					b_path_elem.max_elem_copy = &mb;
+					a_path_elem.block_id = 0;
+					b_path_elem.block_id = 0;
 
 					unsigned char c = 0;
 					bps_tree_block_id_t kk = 0;
@@ -5231,29 +5281,30 @@ bps_tree_debug_check_insert_and_move_to_left_inner(struct bps_tree *tree,
  *  if false, just error code will be returned.
  * @return 0 if OK; bit mask of errors otherwise.
  */
-inline int
-bps_tree_debug_check_internal_functions(bool assertme)
+inline int bps_tree_debug_check_internal_functions(bool assertme)
 {
 	int result = 0;
+
 	bps_tree tree;
+	tree.root_id = (bps_tree_block_id_t) -1;
 
 	result |= bps_tree_debug_check_insert_into_leaf(&tree, assertme);
 	result |= bps_tree_debug_check_delete_from_leaf(&tree, assertme);
 	result |= bps_tree_debug_check_move_to_right_leaf(&tree, assertme);
 	result |= bps_tree_debug_check_move_to_left_leaf(&tree, assertme);
 	result |= bps_tree_debug_check_insert_and_move_to_right_leaf(&tree,
-								     assertme);
+		assertme);
 	result |= bps_tree_debug_check_insert_and_move_to_left_leaf(&tree,
-								    assertme);
+		assertme);
 
 	result |= bps_tree_debug_check_insert_into_inner(&tree, assertme);
 	result |= bps_tree_debug_check_delete_from_inner(&tree, assertme);
 	result |= bps_tree_debug_check_move_to_right_inner(&tree, assertme);
 	result |= bps_tree_debug_check_move_to_left_inner(&tree, assertme);
 	result |= bps_tree_debug_check_insert_and_move_to_right_inner(&tree,
-								     assertme);
+		assertme);
 	result |= bps_tree_debug_check_insert_and_move_to_left_inner(&tree,
-								     assertme);
+		assertme);
 	return result;
 }
 /* }}} */
@@ -5297,6 +5348,8 @@ bps_tree_debug_check_internal_functions(bool assertme)
 #undef bps_tree_itr_get_elem
 #undef bps_tree_itr_next
 #undef bps_tree_itr_prev
+#undef bps_tree_itr_freeze
+#undef bps_tree_itr_destroy
 #undef bps_tree_debug_check
 #undef bps_tree_print
 #undef bps_tree_debug_check_internal_functions
@@ -5311,6 +5364,9 @@ bps_tree_debug_check_internal_functions(bool assertme)
 #undef BPS_TREE_BT_LEAF
 
 #undef bps_tree_restore_block
+#undef bps_tree_restore_block_ver
+#undef bps_tree_root
+#undef bps_tree_before_change_block
 #undef bps_tree_find_ins_point_key
 #undef bps_tree_find_ins_point_elem
 #undef bps_tree_find_after_ins_point_key
@@ -5373,6 +5429,5 @@ bps_tree_debug_check_internal_functions(bool assertme)
 #undef bps_tree_debug_check_move_to_right_inner
 #undef bps_tree_debug_check_move_to_left_inner
 #undef bps_tree_debug_check_insert_and_move_to_right_inner
-#undef bps_tree_debug_check_insert_and_move_to_left_inner
 #undef bps_tree_debug_check_insert_and_move_to_left_inner
 /* }}} */

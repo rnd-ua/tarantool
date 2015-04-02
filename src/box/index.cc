@@ -173,6 +173,15 @@ Index::findByTuple(struct tuple *tuple) const
 }
 
 void
+Index::freezeIterator(struct iterator *iterator)
+{
+	(void) iterator;
+	tnt_raise(ClientError, ER_UNSUPPORTED,
+		  index_type_strs[key_def->type],
+		  "freezeIterator()");
+}
+
+void
 index_build(Index *index, Index *pk)
 {
 	uint32_t n_tuples = pk->size();

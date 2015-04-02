@@ -47,6 +47,8 @@
 #include "coeio_file.h"
 #include "coio.h"
 #include "errinj.h"
+#include "scoped_guard.h"
+
 
 /** For all memory used by all indexes. */
 extern struct quota memtx_quota;
@@ -350,6 +352,7 @@ snapshot_write_tuple(struct xlog *l,
 	snapshot_write_row(recovery, l, &row);
 }
 
+/*
 static void
 snapshot_space(struct space *sp, void *udata)
 {
@@ -368,6 +371,72 @@ snapshot_space(struct space *sp, void *udata)
 	while ((tuple = it->next(it)))
 		snapshot_write_tuple(l, space_id(sp), tuple);
 }
+*/
+
+struct snap_space_data {
+	int count;
+	int alloc_count;
+	struct iterator **iterators;
+	struct space **spaces;
+};
+
+static void
+snap_space_data_init(struct snap_space_data *data)
+{
+	data->count = 0;
+	data->alloc_count = 0;
+	data->iterators = 0;
+	data->spaces = 0;
+}
+
+static void
+snap_space_data_destroy(struct snap_space_data *data)
+{
+	for (int i = 0; i < data->count; i++) {
+		data->iterators[i]->free(data->iterators[i]);
+	}
+	free(data->iterators);
+	free(data->spaces);
+	data->count = 0;
+	data->alloc_count = 0;
+	data->iterators = 0;
+	data->spaces = 0;
+}
+
+static void
+snap_space_data_add_space(struct space *sp, void *udata)
+{
+	if (space_is_temporary(sp))
+		return;
+	if (space_is_sophia(sp))
+		return;
+	struct snap_space_data *data = (struct snap_space_data *)udata;
+	if (data->count == data->alloc_count) {
+		int new_alloc_count = data->alloc_count * 2 + 1;
+		data->iterators = (struct iterator **)
+			realloc(data->iterators, new_alloc_count * sizeof(struct iterator *));
+		data->spaces = (struct space **)
+			realloc(data->spaces, new_alloc_count * sizeof(struct space *));
+		/* TODO: check realloc result */
+		data->alloc_count = new_alloc_count;
+	}
+	data->spaces[data->count] = sp;
+	Index *pk = space_index(sp, 0);
+	data->iterators[data->count] = pk->allocIterator();
+	data->count++;
+	pk->initIterator(data->iterators[data->count - 1], ITER_ALL, NULL, 0);
+	pk->freezeIterator(data->iterators[data->count - 1]);
+}
+
+static void
+snap_space_data_snapshot_all(struct snap_space_data *data, struct xlog *l)
+{
+	struct tuple *tuple;
+	for (int i = 0; i < data->count; i++) {
+		while ((tuple = data->iterators[i]->next(data->iterators[i])))
+			snapshot_write_tuple(l, space_id(data->spaces[i]), tuple);
+	}
+}
 
 static void
 snapshot_save(struct recovery_state *r)
@@ -382,7 +451,11 @@ snapshot_save(struct recovery_state *r)
 	 */
 	say_info("saving snapshot `%s'", snap->filename);
 
-	space_foreach(snapshot_space, snap);
+	struct snap_space_data snap_space_data;
+	snap_space_data_init(&snap_space_data);
+	auto scoped_guard = make_scoped_guard([&] { snap_space_data_destroy(&snap_space_data); });
+	space_foreach(snap_space_data_add_space, &snap_space_data);
+	snap_space_data_snapshot_all(&snap_space_data, snap);
 
 	/** suppress rename */
 	snap->is_inprogress = false;
@@ -408,6 +481,7 @@ MemtxEngine::begin_checkpoint(int64_t lsn)
 	 * multi-threaded engine.
 	 */
 	snapshot_pid = fork();
+
 	switch (snapshot_pid) {
 	case -1:
 		say_syserror("fork");
